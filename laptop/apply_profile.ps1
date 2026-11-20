@@ -20,6 +20,37 @@ if (Get-Process -Name melee_source, melee_port, melee_source_compat, melee_port_
   throw 'Melee Unlocked is running. Close it first, or it will write its old settings back on exit.'
 }
 
+# --- Laptop power checks (read-only: nothing here changes Windows or MSI settings) ---------
+# This laptop's frame cost is on the CPU, so its power limits decide the frame times more than
+# any game setting. These checks only warn.
+$warnings = @()
+try {
+  $battery = Get-CimInstance Win32_Battery -ErrorAction Stop | Select-Object -First 1
+  if ($battery -and $battery.BatteryStatus -ne 2) {
+    $warnings += 'Running on battery. Plug in: on battery the CPU and GPU power limits drop and frame times spike.'
+  }
+} catch { }
+try {
+  $scheme = (powercfg /getactivescheme) -join ' '
+  # Windows 11's Power mode slider sits on top of the Balanced plan, so only Power saver is a
+  # clear sign of trouble here; the slider itself is checked by hand.
+  if ($scheme -match 'Power saver') {
+    $warnings += 'Windows power plan is Power saver. Switch it to Balanced or High performance, and set Settings > System > Power > Power mode to Best performance.'
+  }
+} catch { }
+$msi = @('Dragon Center', 'MSI Center', 'MSI Center Pro') | Where-Object {
+  Get-Process -Name ($_ -replace ' ', '') -ErrorAction SilentlyContinue
+}
+if (-not $msi) {
+  $msi = Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+    ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName } |
+    Where-Object { $_ -match 'Dragon Center|MSI Center' } | Select-Object -First 1
+}
+if ($msi) {
+  $warnings += "$msi is installed: set its mode to Extreme Performance (or High Performance) and turn Cooler Boost on while you play. Its mode cannot be read from a script, so check it by hand."
+}
+if ($warnings.Count) { Write-Host 'Before you play:' -ForegroundColor Yellow; $warnings | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow } }
+
 # Profile: "key value" lines; # starts a comment.
 $wanted = [ordered]@{}
 foreach ($line in Get-Content $Profile) {

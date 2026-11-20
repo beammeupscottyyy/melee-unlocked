@@ -33,7 +33,26 @@ upstream release shows a specific problem worth carrying a patch for.
    ```
 
    It backs up `port-settings.ini` first and changes only the keys in the profile.
-3. Windows: play plugged in, power mode Best performance.
+3. Before playing, every time:
+   - Plug in. On battery the GF75 drops its CPU and GPU power limits.
+   - MSI Dragon Center (or MSI Center): **Extreme Performance** with **Cooler Boost** on. This laptop's
+     frame cost is CPU draw submission, so the CPU's sustained clock under Dragon Center's limit
+     matters more than any game setting. Balanced or Silent lowers that limit and the GF75 also
+     throttles when hot, which shows up as the frame spikes measured in the audit.
+   - Windows: Settings > System > Power > Power mode: Best performance.
+
+   The script checks battery, power plan and whether Dragon Center is installed, and warns. It
+   changes none of them, and Dragon Center's current mode cannot be read from a script.
+
+## Video backend
+
+`backend d3d12` is pinned. Direct3D 12 is the only backend in this build with NVIDIA Reflex
+(Vulkan only reads the latency report, and D3D11 has no Reflex), and Reflex is the profile's main
+latency gain. The game already picks the GTX 1650 over the Intel GPU on its own (`Graphics: use the
+dedicated GPU on a laptop that has two`), and this laptop's log confirms it: `d3d12: using NVIDIA
+GeForce GTX 1650`.
+
+Measure in the same Dragon Center mode you play in, or the numbers will not compare.
 
 If you hear crackling, raise `audio_buffer_ms` to 30 (F1 > Audio).
 
