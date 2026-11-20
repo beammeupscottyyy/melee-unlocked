@@ -1,0 +1,36 @@
+name: Sync from upstream
+
+# Keeps this fork's main branch level with hero88go/melee-unlocked, which ships several
+# releases a day. The fork's own changes live in laptop/ and this file, which upstream never
+# touches, so the merge does not conflict. If it ever does, the run fails and nothing is pushed.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.repository != 'hero88go/melee-unlocked'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Merge upstream main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/hero88go/melee-unlocked.git
+          git fetch upstream main --tags
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date."
+            exit 0
+          fi
+          git merge --no-edit upstream/main
+          git push origin main
+          git push origin --tags
