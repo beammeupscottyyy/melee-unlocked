@@ -190,6 +190,8 @@ BOOL CloseHandle(HANDLE handle);
 DWORD WaitForSingleObject(HANDLE handle, DWORD ms);
 BOOL GetExitCodeProcess(HANDLE process, LPDWORD code);
 BOOL TerminateProcess(HANDLE process, UINT code);
+// Ends the process at once with this code, without running static destructors (as on Windows).
+[[noreturn]] inline void ExitProcess(UINT code) { std::fflush(nullptr); _exit((int)code); }
 // A path argument given as a wide string, a narrow one (std::filesystem::path::c_str() is char here)
 // or nullptr, so one signature serves every call.
 struct LinuxPathArg {

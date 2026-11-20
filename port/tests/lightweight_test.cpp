@@ -187,6 +187,11 @@ int main() {
   check(in_match(0x21, 0x01) && in_match(0x26, 0x01) && in_match(0x20, 0x01) && !in_match(0x21, 0x00), "Multi-Man and Home-Run: the stage");
   check(in_match(0x1F, 0x02) && !in_match(0x1F, 0x01), "Special Melee: match from minor 2");
   check(in_match(0x08, 0x02) && in_match(0x2B, 0x01) && !in_match(0x01, 0x00), "online, events and menus as before");
+  // What the app hears as a match (yg {"match":1}): the fight and sudden death, not VS results.
+  auto app_match = [](uint8_t major, uint8_t minor) { gx::Frame s; s.scene_major = major; s.scene_minor = minor; return gx::frame_in_app_match(s); };
+  check(app_match(0x02, 0x02) && app_match(0x02, 0x03) && !app_match(0x02, 0x04) && !app_match(0x02, 0x00), "app match: VS fight and sudden death, not results or CSS");
+  check(app_match(0x08, 0x02) && !app_match(0x08, 0x00) && app_match(0x03, 0x01) && app_match(0x2B, 0x01), "app match: online, 1P and events as frame_in_match");
+  check(!app_match(0x1F, 0x04) && app_match(0x1F, 0x02), "app match: Special Melee results are a menu");
 
   // Looks: texture treatments and presets.
   {

@@ -16,10 +16,21 @@
 #include <sysdolphin/baselib/jobj.h>
 #include <sysdolphin/baselib/mobj.h>
 
+int mu_online_active(void);
+int mu_online_pending(void);
+int mu_console_rollback_active(void);
+
+/* Off in an online match: HQ FoD reflections allocates a bigger image in the game heap and the
+ * V-cancel sound takes a voice inside the simulation, so either could differ between two peers. */
+#define MU_CODES_OFFLINE_ONLY (MU_DISPLAY_HQ_FOD_REFLECTIONS | MU_DISPLAY_VCANCEL_SOUND)
+
 int mu_code_feature(unsigned int bit)
 {
     static unsigned int logged = ~0u;
-    const unsigned int on = mu_display_options() & MU_DISPLAY_CODES_ALL;
+    unsigned int on = mu_display_options() & MU_DISPLAY_CODES_ALL;
+    if (mu_online_active() || mu_online_pending() || mu_console_rollback_active()) {
+        on &= ~MU_CODES_OFFLINE_ONLY;
+    }
     if (on != logged) {
         logged = on;
         OSReport("[codes] community codes %06X\n", on);

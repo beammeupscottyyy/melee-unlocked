@@ -201,6 +201,7 @@ int
 enet_socket_bind (ENetSocket socket, const ENetAddress * address)
 {
     if (yg_enet_is_socket (socket)) return yg_enet_bind (socket, address);
+    if (yg_native_adopted_bind (socket, address)) return 0;
 
     struct sockaddr_in sin;
 
@@ -252,7 +253,14 @@ enet_socket_listen (ENetSocket socket, int backlog)
 ENetSocket
 enet_socket_create (ENetSocketType type)
 {
-    if (yg_enet_selected ()) return type == ENET_SOCKET_TYPE_DATAGRAM ? yg_enet_create () : ENET_SOCKET_NULL;
+    ENetSocket adopted;
+    if (yg_enet_selected ())
+    {
+        yg_native_adopt_next (0);
+        return type == ENET_SOCKET_TYPE_DATAGRAM ? yg_enet_create () : ENET_SOCKET_NULL;
+    }
+    adopted = yg_native_take_parked (type);   /* the own-UDP punch socket (yg_native_park) */
+    if (adopted != ENET_SOCKET_NULL) return adopted;
 
     return socket (PF_INET, type == ENET_SOCKET_TYPE_DATAGRAM ? SOCK_DGRAM : SOCK_STREAM, 0);
 }
@@ -475,18 +483,17 @@ enet_socket_receive (ENetSocket socket,
        return -1;
     }
 
-#ifdef HAS_MSGHDR_FLAGS
-    if (msgHdr.msg_flags & MSG_TRUNC)
-      return -1;
-#endif
-
     if (address != NULL)
     {
         address -> host = (enet_uint32) sin.sin_addr.s_addr;
         address -> port = ENET_NET_TO_HOST_16 (sin.sin_port);
     }
 
-    return recvLength;
+#ifdef HAS_MSGHDR_FLAGS
+    if (msgHdr.msg_flags & MSG_TRUNC)
+      return ENET_SOCKET_RECEIVE_TRUNCATED;
+#endif
+    return recvLength == 0 ? ENET_SOCKET_RECEIVE_EMPTY : recvLength;
 }
 
 int

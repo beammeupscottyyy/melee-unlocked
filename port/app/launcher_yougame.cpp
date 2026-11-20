@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "launcher_yougame.h"
+#include "launcher_yougame_app.h"
+#include "launcher_yougame_web.h"
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -41,19 +43,23 @@ namespace {
 constexpr const char* kSlug = "melee-unlocked";
 constexpr size_t kMaxRequest = 1u << 20;
 
-// The two YouGame sites. The public keys are the ones each site's own page sends to its sign-in
-// service (anonymous role; they identify the project, they are not secrets).
-const Env kProduction{"production", "https://yougame.co", "https://auth.yougame.co",
-                      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhwbWlwcmhhdXRud2NobXBoenN4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg1NDc1ODgsImV4cCI6MjEwNDEyMzU4OH0.bB3FxRSroYA9CV5snhfptc57EtQlbKZdBRzJ1pJ87_A",
-                      "sb-hpmiprhautnwchmphzsx-auth-token"};
-const Env kStaging{"staging", "https://staging.yougame.co", "https://ibhaehthpikxpoappztk.supabase.co",
-                   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImliaGFlaHRocGlreHBvYXBwenRrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTEwNjUwODQsImV4cCI6MjEwNjY0MTA4NH0.JtMaUvaE8ijc2ntwg6Ji-WBoxjZLjUWJg6UK_6_lAKw",
-                   "sb-ibhaehthpikxpoappztk-auth-token"};
+const Env kProduction{"production", "https://yougame.co"};
+const Env kStaging{"staging", "https://staging.yougame.co"};
 
 struct Session {
-  std::string access, refresh, user_id, email, name, code;
-  int64_t expires_at = 0;   // seconds since 1970
+  // Signed in on YouGame's own page in the launcher's browser view (launcher_yougame_web.h): the view
+  // holds the session and makes the requests. The launcher keeps no password, token or cookie: only who
+  // it is (the account's id, name and connect code).
+  bool web = false;
+  // Signed in through the YouGame app (sign_in_app): who the app's player is, as the app said. The session
+  // is the app's; this launcher can make no request with it (the game asks the app itself).
+  bool app = false;
+  std::string user_id, name, code;
 };
+std::wstring g_web_base;   // the browser view's folder; each YouGame site has its own under it
+// launcher.ini yougame_app: 1 this launcher connected through the YouGame app (it then starts the app quietly
+// when it starts), 0 Disconnect from an account the app gave, -1 neither.
+int g_app_choice = -1;
 
 std::mutex g_mutex;
 // Staging until Melee Unlocked is listed on the production site; launcher.ini yougame_env=production
@@ -61,6 +67,8 @@ std::mutex g_mutex;
 Env g_env = kStaging;
 Session g_session;
 std::string g_build_json = "{}";
+// The first GitHub release whose YouGame rows play in YouGame's pools: none older can be restarted into.
+const char* const kFirstYouGameRelease = "0.9.212";
 std::vector<Allowed> g_allowed;     // the builds YouGame allows, as last read
 Allowed g_behind;                    // the release to offer, version empty when none
 std::function<std::string(const Allowed&, const std::string&)> g_restart_older;
@@ -79,11 +87,10 @@ std::wstring wide(const std::string& s) {
   return w;
 }
 
-// Tests only (MELEE_LAUNCHER_TEST): the site and sign-in service may be a local stand-in.
+// Tests only (MELEE_LAUNCHER_TEST): the site may be a local stand-in.
 Env effective_env(Env e) {
   if (!std::getenv("MELEE_LAUNCHER_TEST")) return e;
   if (const char* v = std::getenv("MELEE_YOUGAME_SITE")) e.site = v;
-  if (const char* v = std::getenv("MELEE_YOUGAME_AUTH")) e.auth = v;
   return e;
 }
 
@@ -211,51 +218,35 @@ json parse_or_empty(const std::string& s) {
 
 // ---- the account
 
-std::string auth_headers_json(const Env& e) { return "apikey: " + e.anon_key; }
-
-void apply_tokens(Session& s, const json& j) {
-  s.access = j.value("access_token", "");
-  s.refresh = j.value("refresh_token", s.refresh);
-  const int64_t expires_in = j.value("expires_in", 3600);
-  s.expires_at = j.count("expires_at") && j["expires_at"].is_number() ? j["expires_at"].get<int64_t>() : now_s() + expires_in;
-  if (j.count("user") && j["user"].is_object()) {
-    const json& u = j["user"];
-    s.user_id = u.value("id", s.user_id);
-    s.email = u.value("email", s.email);
-    if (u.count("user_metadata") && u["user_metadata"].is_object()) {
-      const json& m = u["user_metadata"];
-      for (const char* key : {"display_name", "name", "user_name", "full_name"})
-        if (m.count(key) && m[key].is_string() && !m[key].get<std::string>().empty()) { s.name = m[key]; break; }
-    }
-  }
-}
-
-std::function<void()> g_on_change;   // launcher.cpp: save launcher.ini (tokens rotate on every refresh)
+std::function<void()> g_on_change;   // launcher.cpp: save launcher.ini
+std::atomic<bool> g_expired{false};   // YouGame said the browser view's session ended: the launcher asks for a new sign-in
+bool g_old_session_line = false;      // launcher.ini still held a session of the removed password sign-in: saved again without it
 void changed() { if (g_on_change) g_on_change(); }
 
-// A fresh access token when the saved one is near its end. False: signed out (refresh refused).
-bool ensure_fresh(Session& s, const Env& e) {
-  if (s.refresh.empty()) return false;
-  if (!s.access.empty() && s.expires_at - now_s() > 90) return true;
-  const Reply r = http("POST", e.auth + "/auth/v1/token?grant_type=refresh_token",
-                       {auth_headers_json(e), "Content-Type: application/json"}, json{{"refresh_token", s.refresh}}.dump());
-  if (r.status != 200) return false;
-  apply_tokens(s, parse_or_empty(r.body));
-  return !s.access.empty();
+void use_web_folder() {
+  std::wstring folder;
+  { std::lock_guard<std::mutex> lock(g_mutex); if (!g_web_base.empty()) folder = g_web_base + L"\\" + wide(g_env.id); }
+  web::set_folder(folder);
 }
 
-// The site's session cookie, as its own page holds it (base64 JSON, split past 3180 characters).
-std::string session_cookie(const Session& s, const Env& e) {
-  const json session{{"access_token", s.access}, {"token_type", "bearer"}, {"expires_at", s.expires_at},
-                     {"expires_in", std::max<int64_t>(0, s.expires_at - now_s())}, {"refresh_token", s.refresh},
-                     {"user", {{"id", s.user_id}, {"email", s.email}}}};
-  const std::string value = "base64-" + b64(session.dump(), true);
-  constexpr size_t kChunk = 3180;
-  if (value.size() <= kChunk) return e.cookie + "=" + value;
-  std::string out;
-  for (size_t i = 0, n = 0; i < value.size(); i += kChunk, ++n)
-    out += (out.empty() ? "" : "; ") + e.cookie + "." + std::to_string(n) + "=" + value.substr(i, kChunk);
-  return out;
+// A request made by a page of YouGame's site in the launcher's browser view, with that page's session.
+Reply web_site(const Env& e, const std::string& method, const std::string& path, const std::string& body) {
+  use_web_folder();
+  web::Reply r = web::request(e.site, method, path, body);
+  // 401 right after the view opened can be the site's page still renewing its session: once more.
+  if (r.status == 401) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    r = web::request(e.site, method, path, body);
+  }
+  if (r.status == 0) throw std::runtime_error("|YouGame is not answering. Check your connection.");
+  if (r.status == 401) {
+    // The site says this browser view is signed out (signed out on the site, or the session ended).
+    bool was;
+    { std::lock_guard<std::mutex> lock(g_mutex); was = g_session.web; if (was) g_session = Session{}; }
+    if (was) { g_expired = true; changed(); }
+    throw std::runtime_error("signed_out|Connect YouGame in the launcher to play YouGame modes.");
+  }
+  return Reply{r.status, r.body};
 }
 
 Reply site(const std::string& method, const std::string& path, const std::string& body) {
@@ -266,26 +257,18 @@ Reply site(const std::string& method, const std::string& path, const std::string
     s = g_session;
     e = effective_env(g_env);
   }
-  if (!ensure_fresh(s, e)) throw std::runtime_error("signed_out|Connect YouGame in the launcher to play YouGame modes.");
-  bool rotated = false;
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_session.user_id == s.user_id && g_session.refresh != s.refresh) { g_session = s; rotated = true; }
-    else if (g_session.user_id == s.user_id) g_session.access = s.access, g_session.expires_at = s.expires_at;
-  }
-  if (rotated) changed();
-  std::vector<std::string> headers{"Authorization: Bearer " + s.access, "Cookie: " + session_cookie(s, e),
-                                   "Origin: " + e.site, "Referer: " + e.site + "/g/" + kSlug, "Accept: application/json"};
-  if (!body.empty()) headers.push_back("Content-Type: application/json");
-  return http(method, e.site + path, headers, body);
+  if (!s.web) throw std::runtime_error("signed_out|Connect YouGame in the launcher to play YouGame modes.");
+  return web_site(e, method, path, body);
 }
 
-std::string fetch_code() {
+// {"code": the connect code, "account": the account's id (the site's own page gets both)}
+json fetch_identity() {
   const Reply r = site("GET", "/api/multiplayer/code", "");
   const json j = parse_or_empty(r.body);
   if (r.status != 200 || !j.count("code") || !j["code"].is_string()) site_error(r, "YouGame did not give a connect code");
-  return j["code"];
+  return j;
 }
+std::string fetch_code() { return fetch_identity()["code"]; }
 
 std::string hex(const uint8_t* p, size_t n) {
   static const char* d = "0123456789abcdef";
@@ -335,17 +318,25 @@ Backend real_backend() {
     std::function<std::string(const Allowed&, const std::string&)> handler;
     { std::lock_guard<std::mutex> lock(g_mutex); target = g_behind; handler = g_restart_older; }
     if (target.version.empty()) return std::string("YouGame allows this version now. Search again.");
+    if (!target.restart) return std::string("That version cannot be started from here.");
     return handler ? handler(target, mode) : std::string("This launcher cannot switch versions.");
   };
-  b.account = [] { return account(); };
+  // The bridge asks YouGame with the launcher's own (web) session only: an account the YouGame app gave can make
+  // no request here, so the game hears "not signed in" and says to connect in the launcher.
+  b.account = [] { Account a = account(); if (a.app) a.signed_in = false; return a; };
   b.player_id = [] { std::lock_guard<std::mutex> lock(g_mutex); return g_session.user_id; };
   b.code = [] {
     {
       std::lock_guard<std::mutex> lock(g_mutex);
       if (!g_session.code.empty()) return json{{"code", g_session.code}}.dump();
     }
-    const std::string code = fetch_code();
-    { std::lock_guard<std::mutex> lock(g_mutex); g_session.code = code; }
+    const json identity = fetch_identity();
+    const std::string code = identity["code"];
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_session.code = code;
+      if (g_session.user_id.empty()) g_session.user_id = identity.value("account", std::string());
+    }
     changed();
     return json{{"code", code}}.dump();
   };
@@ -432,23 +423,38 @@ void set_env(const std::string& id) {
   g_env = next;
 }
 
+bool g_extension = false;
+bool extension() { std::lock_guard<std::mutex> lock(g_mutex); return g_extension; }
+void set_extension(bool on) { std::lock_guard<std::mutex> lock(g_mutex); g_extension = on; }
+
 bool load_line(const std::string& line) {
+  if (line.rfind("yougame_extension=", 0) == 0) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_extension = line.substr(18) == "1";
+    return true;
+  }
   if (line.rfind("yougame_env=", 0) == 0) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_env = line.substr(12) == "production" ? kProduction : kStaging;
     return true;
   }
+  if (line.rfind("yougame_app=", 0) == 0) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_app_choice = line.substr(12) == "0" ? 0 : line.substr(12) == "1" ? 1 : -1;
+    return true;
+  }
   if (line.rfind("yougame_session=", 0) == 0) {
     const json j = parse_or_empty(unprotect(line.substr(16)));
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (j.is_object() && j.value("env", "") == g_env.id) {
-      g_session.access = j.value("access", "");
-      g_session.refresh = j.value("refresh", "");
+    // Only a browser-view sign-in is a session. A line saved by the removed password sign-in (its tokens)
+    // is not used and is not written back: the next save of launcher.ini drops it.
+    if (j.is_object() && j.value("web", false) && j.value("env", "") == g_env.id) {
+      g_session.web = true;
       g_session.user_id = j.value("user", "");
-      g_session.email = j.value("email", "");
       g_session.name = j.value("name", "");
       g_session.code = j.value("code", "");
-      g_session.expires_at = j.value("expires_at", (int64_t)0);
+    } else {
+      g_old_session_line = true;
     }
     return true;
   }
@@ -459,9 +465,12 @@ std::string ini_lines() {
   std::lock_guard<std::mutex> lock(g_mutex);
   std::string out;
   if (g_env.id != "staging") out += "yougame_env=" + g_env.id + "\n";
-  if (!g_session.refresh.empty()) {
-    const json j{{"env", g_env.id}, {"access", g_session.access}, {"refresh", g_session.refresh}, {"user", g_session.user_id},
-                 {"email", g_session.email}, {"name", g_session.name}, {"code", g_session.code}, {"expires_at", g_session.expires_at}};
+  if (g_extension) out += "yougame_extension=1\n";
+  if (g_app_choice >= 0) out += "yougame_app=" + std::to_string(g_app_choice) + "\n";
+  // An account the YouGame app gave is not kept: the launcher asks the app again when it starts.
+  if (g_session.web) {
+    // The browser view holds the session: only who it is goes here.
+    const json j{{"env", g_env.id}, {"web", true}, {"user", g_session.user_id}, {"name", g_session.name}, {"code", g_session.code}};
     const std::string sealed = protect(j.dump());
     if (!sealed.empty()) out += "yougame_session=" + sealed + "\n";
   }
@@ -471,65 +480,214 @@ std::string ini_lines() {
 Account account() {
   std::lock_guard<std::mutex> lock(g_mutex);
   Account a;
-  a.signed_in = !g_session.refresh.empty();
-  a.email = g_session.email;
+  a.signed_in = g_session.web || g_session.app;
+  a.app = g_session.app && !g_session.web;
   a.code = g_session.code;
-  // The name opponents see: the account's own, else the tag of its connect code. Never the email.
+  // The name opponents see: the account's own, else the tag of its connect code.
   a.name = !g_session.name.empty() ? g_session.name
          : !g_session.code.empty() ? g_session.code.substr(0, g_session.code.find('#')) : std::string("Player");
   return a;
 }
 
-bool sign_in(const std::string& email, const std::string& password, std::string* error) {
+void set_web_folder(const std::wstring& base) {
+  { std::lock_guard<std::mutex> lock(g_mutex); g_web_base = base; }
+  use_web_folder();
+}
+
+bool web_sign_in_available() { return web::supported(); }
+
+bool take_expired() { return g_expired.exchange(false); }
+
+bool sign_in_web(void* owner_window, std::string* error, const std::string& test_script, bool again,
+                 const std::wstring& title) {
+  Env e;
+  { std::lock_guard<std::mutex> lock(g_mutex); e = effective_env(g_env); }
+  use_web_folder();
+  g_expired = false;
+  // Signed in is what the site's own page is told: the connect code route answers it.
+  if (!web::sign_in(owner_window, e.site, "/api/multiplayer/code", error, test_script,
+                    !title.empty() ? title : again ? L"Your YouGame sign-in ended. Sign in again" : L"Sign in to YouGame")) return false;
   try {
-    Env e;
-    { std::lock_guard<std::mutex> lock(g_mutex); e = effective_env(g_env); }
-    const Reply r = http("POST", e.auth + "/auth/v1/token?grant_type=password", {auth_headers_json(e), "Content-Type: application/json"},
-                         json{{"email", email}, {"password", password}}.dump());
-    if (r.status != 200) {
-      const json j = parse_or_empty(r.body);
-      std::string why = j.value("error_description", j.value("msg", j.value("error", std::string())));
-      const std::string code = j.value("error_code", std::string());
-      if (code == "email_not_confirmed")
-        why = "Confirm your email first: open the link YouGame emailed you, then sign in again.";
-      else if (why.empty() || r.status == 400)
-        why = "Wrong email or password. Signed up with Google or Apple? Use Forgot password to set one.";
-      if (error) *error = why;
+    const web::Reply r = web::request(e.site, "GET", "/api/multiplayer/code", "");
+    const json j = parse_or_empty(r.body);
+    if (r.status != 200 || !j.count("code") || !j["code"].is_string()) {
+      if (error) *error = "YouGame did not sign you in. Try again.";
       return false;
     }
     Session s;
-    apply_tokens(s, parse_or_empty(r.body));
-    if (s.access.empty() || s.user_id.empty()) { if (error) *error = "YouGame did not sign you in. Try again."; return false; }
+    s.web = true;
+    s.code = j["code"];
+    s.user_id = j.value("account", std::string());
     { std::lock_guard<std::mutex> lock(g_mutex); g_session = s; }
-    try {
-      const std::string code = fetch_code();
-      std::lock_guard<std::mutex> lock(g_mutex);
-      g_session.code = code;
-    } catch (const std::exception&) {
-      // Signed in; the connect code comes with the first hello or ticket instead.
-    }
     changed();
     return true;
-  } catch (const std::exception& ex) {
-    const std::string m = ex.what();
-    if (error) *error = m.substr(m.find('|') == std::string::npos ? 0 : m.find('|') + 1);
+  } catch (const std::exception&) {
+    if (error) *error = "YouGame did not sign you in. Try again.";
     return false;
   }
 }
 
-void sign_out() {
-  { std::lock_guard<std::mutex> lock(g_mutex); g_session = Session{}; }
-  changed();
+void warm() {
+  { std::lock_guard<std::mutex> lock(g_mutex); if (!g_session.web) return; }
+  use_web_folder();
+  std::thread([] {
+    try {
+      // The site's own answer for this session: the connect code (it also says when the session ended).
+      const json identity = fetch_identity();
+      bool differs;
+      {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_session.web) return;
+        const std::string code = identity["code"];
+        differs = g_session.code != code;
+        g_session.code = code;
+        if (identity.count("account") && identity["account"].is_string()) g_session.user_id = identity["account"];
+      }
+      if (differs) changed();
+    } catch (const std::exception&) {
+    }
+  }).detach();
 }
 
-void set_on_session_change(std::function<void()> callback) { g_on_change = std::move(callback); }
+bool start_app_quietly(std::string* detail) {
+  auto say = [&](const std::string& s) { if (detail) *detail = s; };
+  if (std::getenv("MELEE_LAUNCHER_TEST") && !std::getenv("MELEE_LAUNCHER_TEST_YOUGAME_APP")) { say("test run: the YouGame app is not started"); return false; }
+  bool staging;
+  { std::lock_guard<std::mutex> lock(g_mutex); staging = g_env.id == "staging"; }
+  const std::string name = staging ? "YouGame Staging" : "YouGame";
+  if (app::running(staging)) { say("the " + name + " app is running"); return true; }
+  if (!app::installed(staging)) { say("the " + name + " app is not installed, so the extension has nothing to show"); return false; }
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool up = app::start(staging, 25000);
+  const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+  say("the " + name + " app was started quietly (tray); its channel " + (up ? "came up after " : "did not come up in ") + std::to_string(ms) + " ms");
+  return up;
+}
 
-std::string signup_page() { return kProduction.site + "/login?mode=signup"; }
-std::string reset_page() { return kProduction.site + "/reset-password"; }
+bool app_declined() { std::lock_guard<std::mutex> lock(g_mutex); return g_app_choice == 0; }
+bool app_used_before() { std::lock_guard<std::mutex> lock(g_mutex); return g_app_choice == 1; }
+
+bool resume_web() {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_session.web || g_session.app) return false;
+  }
+  use_web_folder();
+  if (!web::supported() || !web::remembered()) return false;
+  Env e;
+  { std::lock_guard<std::mutex> lock(g_mutex); e = effective_env(g_env); }
+  // The site's own answer for the view's saved session (as warm() asks it): 200 with a code is signed in.
+  const web::Reply r = web::request(e.site, "GET", "/api/multiplayer/code", "");
+  const json j = parse_or_empty(r.body);
+  if (r.status != 200 || !j.is_object() || !j.count("code") || !j["code"].is_string()) return false;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_session.web || g_session.app) return true;
+    g_session = Session{};
+    g_session.web = true;
+    g_session.code = j["code"];
+    g_session.user_id = j.value("account", std::string());
+  }
+  changed();
+  return true;
+}
+
+AppSignIn sign_in_app(bool may_start, const std::string& version, std::string* detail) {
+  // Every step goes into *detail ("; " between), for the launcher's log.
+  std::string steps;
+  auto step = [&](const std::string& s) { steps += (steps.empty() ? "" : "; ") + s; if (detail) *detail = steps; };
+  Env e;
+  { std::lock_guard<std::mutex> lock(g_mutex); e = g_env; }
+  // Test runs (MELEE_LAUNCHER_TEST) never ask the player's own app unless MELEE_LAUNCHER_TEST_YOUGAME_APP=1.
+  if (std::getenv("MELEE_LAUNCHER_TEST") && !std::getenv("MELEE_LAUNCHER_TEST_YOUGAME_APP")) { step("test run"); return AppSignIn::kNoApp; }
+  const bool staging = e.id == "staging";
+  const char* app_name = staging ? "YouGame Staging" : "YouGame";
+  if (app::running(staging)) {
+    step(std::string(app_name) + " app running");
+  } else {
+    if (!app::installed(staging)) { step(std::string(app_name) + " app not installed"); return AppSignIn::kNoApp; }
+    if (!may_start) { step(std::string(app_name) + " app installed, not running (not started)"); return AppSignIn::kNoApp; }
+    step(std::string(app_name) + " app installed, not running: starting it quietly (tray)");
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool up = app::start(staging, 25000);
+    const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!up) { step("its channel did not come up in " + std::to_string(ms) + " ms"); return AppSignIn::kNoAnswer; }
+    step("its channel came up after " + std::to_string(ms) + " ms");
+  }
+  const app::Answer a = app::ask(staging, version);
+  switch (a.state) {
+    case app::Answer::kSignedIn: {
+      Session s;
+      s.app = true;
+      s.user_id = a.player_id;
+      s.name = a.name;
+      s.code = a.code;
+      {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_session.web || g_env.id != e.id) { step("signed in on this launcher meanwhile"); return AppSignIn::kSignedIn; }
+        g_session = s;
+        g_app_choice = 1;   // the launcher starts the app quietly next time, to take this account again
+      }
+      changed();
+      step(std::string("the app says signed in") + (a.code.empty() ? " (no connect code)" : ""));
+      return AppSignIn::kSignedIn;
+    }
+    case app::Answer::kSignedOut: step("the app says signed out"); return AppSignIn::kSignedOut;
+    case app::Answer::kNotRunning: step("the app's channel is gone"); return AppSignIn::kNoApp;
+    case app::Answer::kRefused: step("the app refused (" + a.why + ")"); return AppSignIn::kNoAnswer;
+    case app::Answer::kNoAnswer: break;
+  }
+  step("the app did not answer (" + a.why + ")");
+  return AppSignIn::kNoAnswer;
+}
+
+void sign_out() {
+  bool web_session, app_session;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    web_session = g_session.web;
+    app_session = g_session.app && !g_session.web;
+    // An account the app gave: the launcher stops taking it by itself (Connect takes it again).
+    if (app_session) g_app_choice = 0;
+    g_session = Session{};
+  }
+  changed();
+  if (app_session) return;   // the app keeps its own sign-in; this launcher held nothing of it
+  // The browser view's session goes with its folder (only when this launcher has one).
+  use_web_folder();
+  if (web_session || web::remembered()) web::sign_out();
+}
+
+void set_on_session_change(std::function<void()> callback) {
+  g_on_change = std::move(callback);
+  // launcher.ini is written again at once when it still held the removed password sign-in's session.
+  bool old;
+  { std::lock_guard<std::mutex> lock(g_mutex); old = g_old_session_line; g_old_session_line = false; }
+  if (old) changed();
+}
 
 std::string game_page() {
   std::lock_guard<std::mutex> lock(g_mutex);
   return g_env.site + "/g/" + kSlug;   // always the real site, never a test stand-in
+}
+
+// Open YouGame (owner 11-19: the app, not the site): the installed YouGame app for this environment
+// (YouGame Staging for staging), at the Melee Unlocked page; without that app, the same site's desktop
+// page, where the app downloads (staging.yougame.co/desktop for staging, as the game's Get YouGame).
+std::string open_target() {
+  std::string id, site;
+  { std::lock_guard<std::mutex> lock(g_mutex); id = g_env.id; site = g_env.site; }
+  const std::string scheme = id == "staging" ? "yougame-staging" : "yougame";
+#ifdef _WIN32
+  const std::string user = "Software\\Classes\\" + scheme + "\\shell\\open\\command", root = scheme + "\\shell\\open\\command";
+  HKEY h = nullptr;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, user.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS ||
+      RegOpenKeyExA(HKEY_CLASSES_ROOT, root.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS) {
+    RegCloseKey(h);
+    return scheme + "://g/" + kSlug;
+  }
+#endif
+  return site + "/desktop";   // Linux: the site's desktop page (no app registry to ask)
 }
 
 bool start_bridge(std::string* error) {
@@ -601,20 +759,225 @@ std::vector<Allowed> allowed_builds() {
   return out;
 }
 
+// Until the site has that route: the release YouGame's own Melee Unlocked build sits on, read from its
+// public source releases (tags "v<our version>-yg<its build>", newest first). One entry, no hashes:
+// the version alone says whether this build shares YouGame's pool (the pool key carries it).
+// YouGame's own record of this release (its listing's buildId): the site takes a Doubles home only from a build
+// it lists (native_build). Its passive sync lists every Melee Unlocked GitHub release; the public listing page
+// names each record as {"buildId","version","platform"}, the version being ours or ours with a suffix
+// ("0.9.217-online-test.122.24"). Empty until the listing has this release.
+// The page's build records, read once: {"buildId","version","platform"} each, escaped inside its script.
+std::vector<ListedBuild> listed_builds(const std::string& page) {
+  std::string b;
+  b.reserve(page.size());
+  for (char c : page) if (c != '\\') b += c;
+  std::vector<ListedBuild> out;
+  static const std::string kId = "\"buildId\":\"", kVersion = "\",\"version\":\"", kPlatform = "\",\"platform\":\"";
+  for (size_t at = b.find(kId); at != std::string::npos; at = b.find(kId, at + kId.size())) {
+    const size_t id = at + kId.size();
+    if (id + 36 + kVersion.size() > b.size()) break;
+    if (b.compare(id + 36, kVersion.size(), kVersion) != 0) continue;
+    const size_t v = id + 36 + kVersion.size(), v_end = b.find('"', v);
+    if (v_end == std::string::npos || v_end - v > 48 || b.compare(v_end, kPlatform.size(), kPlatform) != 0) continue;
+    const size_t p = v_end + kPlatform.size(), p_end = b.find('"', p);
+    if (p_end == std::string::npos || p_end - p > 16) continue;
+    out.push_back({b.substr(id, 36), b.substr(v, v_end - v), b.substr(p, p_end - p)});
+  }
+  return out;
+}
+// The native_build a ticket names, as the YouGame app's page names it: YouGame's record of this release for
+// this platform, so app players and launcher players on one release meet in one queue. Never another
+// build's record: a release YouGame does not list yet names none and meets launcher players only. "" then.
+std::string native_build_from_listing(const std::string& page, const std::string& version, const char* platform) {
+  std::string found;
+  for (const ListedBuild& r : listed_builds(page))   // the page lists oldest first: keep the newest
+    if (r.platform == platform && (r.version == version || r.version.rfind(version + "-", 0) == 0)) found = r.id;
+  return found;
+}
+std::string listed_build_id(const std::string& version) {
+  static std::mutex m;
+  static std::string cached_for, cached_id;
+  static uint64_t cached_at = 0;
+  const uint64_t now = (uint64_t)GetTickCount64();
+  {
+    std::lock_guard<std::mutex> lock(m);
+    if (cached_for == version && now - cached_at < 60000) return cached_id;   // read again once a minute
+  }
+  std::string found;
+  bool read = false;
+  try {
+    Env e;
+    { std::lock_guard<std::mutex> lock(g_mutex); e = effective_env(g_env); }
+    const Reply r = http("GET", e.site + "/g/" + kSlug, {"Accept: text/html", "User-Agent: MeleeUnlocked-Launcher"}, "", 8000);
+    if (r.status == 200) {
+#ifdef _WIN32
+      found = native_build_from_listing(r.body, version, "windows");
+#else
+      found = native_build_from_listing(r.body, version, "linux");
+#endif
+      read = true;
+    }
+  } catch (const std::exception&) {
+  }
+  std::lock_guard<std::mutex> lock(m);
+  if (read || cached_for != version) { cached_id = found; }   // a failed read keeps the last answer
+  cached_for = version; cached_at = now;
+  return cached_id;
+}
+
+// The release whose pool this build's YouGame rows search (owner 11-19: a new release plays YouGame at once,
+// with whoever is on the build YouGame hands out). YouGame's own builds before 0.9.990 key their rooms by
+// their release ("mu-0.9.218-p2" for 0.9.218-online-test.122.31), so while the newest Windows build the site lists is one
+// of those, this build searches under that version. From 0.9.990 on every release shares one key
+// (yougame_compatibility.h pool_version): "" here, as when the page cannot be read.
+// Test launchers only (MELEE_LAUNCHER_TEST): MELEE_LAUNCHER_TEST_YOUGAME_POOL names the version, "any" the shared key.
+std::vector<int> version_numbers(const std::string& v) {
+  std::vector<int> out;
+  for (size_t i = 0; i < v.size();) {
+    if (!std::isdigit((unsigned char)v[i])) { ++i; continue; }
+    int n = 0;
+    for (; i < v.size() && std::isdigit((unsigned char)v[i]); ++i) n = n * 10 + (v[i] - '0');
+    out.push_back(n);
+  }
+  return out;
+}
+std::string pool_from_listing(const std::string& b) {
+  std::string newest;
+  for (size_t at = b.find("buildId"); at != std::string::npos; at = b.find("buildId", at + 7)) {
+    std::string w;
+    for (size_t i = at; i < b.size() && w.size() < 260; ++i) if (b[i] != '\\') w += b[i];
+    auto field = [&](const char* key) {
+      const std::string k = std::string("\"") + key + "\":\"";
+      const size_t p = w.find(k);
+      if (p == std::string::npos) return std::string();
+      const size_t s = p + k.size(), e2 = w.find('"', s);
+      return e2 == std::string::npos ? std::string() : w.substr(s, e2 - s);
+    };
+    const std::string v = field("version");
+    // One pool for every platform of this build: the Windows listing names it.
+    // (The window starts inside this record's "buildId" key, so only the fields after it are read.)
+    if (w.find("\"version\":\"") > 60 || field("platform") != "windows" || v.empty() || v.size() > 48) continue;
+    if (v.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-") != std::string::npos) continue;
+    if (version_numbers(v).size() < 3) continue;
+    if (newest.empty() || version_numbers(newest) < version_numbers(v)) newest = v;
+  }
+  if (newest.empty()) return {};
+  const std::vector<int> n = version_numbers(newest);
+  const std::vector<int> shared{0, 9, 990};
+  if (!(std::vector<int>(n.begin(), n.begin() + 3) < shared)) return {};   // 0.9.990 on: the shared key
+  // Those builds key their rooms by the release alone ("mu-0.9.218-p2"): the label after it
+  // ("-online-test.122.31") names the build, not the pool.
+  return newest.substr(0, newest.find('-'));
+}
+// Whether the last listed_pool_version() read YouGame's page (a failed read also answers "").
+std::atomic<bool> g_listing_read{false};
+std::string listed_pool_version() {
+  g_listing_read = false;
+  if (const char* forced = std::getenv("MELEE_LAUNCHER_TEST") ? std::getenv("MELEE_LAUNCHER_TEST_YOUGAME_POOL") : nullptr) { g_listing_read = true; return std::string(forced) == "any" ? std::string() : forced; }
+  try {
+    Env e;
+    { std::lock_guard<std::mutex> lock(g_mutex); e = effective_env(g_env); }
+    const Reply r = http("GET", e.site + "/g/" + kSlug, {"Accept: text/html", "User-Agent: MeleeUnlocked-Launcher"}, "", 8000);
+    if (r.status != 200) return {};
+    g_listing_read = true;
+    return pool_from_listing(r.body);
+  } catch (const std::exception&) {
+    return {};
+  }
+}
+
+std::vector<Allowed> allowed_from_releases() {
+  std::vector<Allowed> out;
+  try {
+    const Reply r = http("GET", "https://api.github.com/repos/yougame-co/melee-unlocked-public/releases?per_page=5",
+                         {"Accept: application/vnd.github+json", "User-Agent: MeleeUnlocked-Launcher"}, "", 8000);
+    const json j = parse_or_empty(r.body);
+    if (r.status != 200 || !j.is_array()) return out;
+    for (const json& rel : j) {
+      if (!rel.is_object() || rel.value("draft", false)) continue;
+      const std::string tag = rel.value("tag_name", "");
+      const size_t cut = tag.find("-yg");
+      if (tag.size() < 2 || tag[0] != 'v' || cut == std::string::npos) continue;
+      const std::string version = tag.substr(1, cut - 1);
+      if (version.empty() || version.find_first_not_of("0123456789.") != std::string::npos) continue;
+      out.push_back({version, "", ""});
+      break;   // the newest one is the one YouGame is on
+    }
+  } catch (const std::exception&) {
+  }
+  return out;
+}
+
+void pool_refresh();
 void refresh_allowed(const std::string& current_version, const std::wstring& exe, const std::wstring& game_library) {
-  const std::vector<Allowed> allowed = allowed_builds();
+  pool_refresh();   // which pool this build's YouGame rows search
+  std::vector<Allowed> allowed = allowed_builds();
+  if (allowed.empty()) allowed = allowed_from_releases();
   const std::string exe_hash = sha256_file(exe), game_hash = sha256_file(game_library);
   Allowed offer;
-  bool current_ok = allowed.empty();
-  for (const Allowed& a : allowed) {
-    if (a.exe_sha256 == exe_hash && a.game_sha256 == game_hash) current_ok = true;
-    // Only a GitHub release this launcher can fetch with YouGame in it: 0.9.97 and later, never this version itself.
-    if (a.version != current_version && !newer("0.9.97", a.version) && (offer.version.empty() || newer(a.version, offer.version)))
-      offer = a;
+  bool current_ok = allowed.empty();   // nothing known: the search goes ahead as it is
+  // A build newer than every version YouGame names searches too (owner 11-18: a new release plays at once).
+  // The pool key carries the version, so it meets only players on this same release until YouGame's own
+  // build catches up; nothing older is offered.
+  bool newest = !allowed.empty();
+  for (const Allowed& a : allowed) if (!newer(current_version, a.version)) newest = false;
+  if (newest) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_allowed = allowed;
+    g_behind = Allowed{};
+    return;
+  }
+  for (Allowed a : allowed) {
+    // With hashes: this exact build. Without (the release list): this version.
+    if (a.exe_sha256.empty() ? a.version == current_version : (a.exe_sha256 == exe_hash && a.game_sha256 == game_hash)) current_ok = true;
+    if (a.version == current_version || !(offer.version.empty() || newer(a.version, offer.version))) continue;
+    // Restart only into a GitHub release this launcher can fetch that plays YouGame the same way
+    // (kFirstYouGameRelease and later) and is older than this one. Otherwise the game only says
+    // which version YouGame is on.
+    a.restart = !newer(kFirstYouGameRelease, a.version) && newer(current_version, a.version);
+    offer = a;
   }
   std::lock_guard<std::mutex> lock(g_mutex);
   g_allowed = allowed;
-  g_behind = current_ok ? Allowed{} : offer;
+  // Owner 11-19: every release shares one YouGame pool (yougame_compatibility.h pool_version), so a
+  // version YouGame does not list still plays: nothing is reported behind.
+  (void)current_ok; (void)offer;
+  g_behind = Allowed{};
+}
+
+// The pool the game is told (bridge hello). Read when the launcher learns its build (refresh_allowed) and
+// again in the background once a minute while hellos keep coming: YouGame can list a new build while the
+// launcher stays open. Never read before refresh_allowed (unit tests serve hellos with no network).
+std::mutex g_pool_mutex;
+std::string g_pool;
+uint64_t g_pool_at = 0;
+bool g_pool_on = false, g_pool_busy = false;
+bool g_pool_read = false;   // the pool came from a real read of YouGame's page (not a failed one)
+void pool_refresh() {
+  const std::string v = listed_pool_version();
+  const bool read = g_listing_read.load();
+  std::lock_guard<std::mutex> lock(g_pool_mutex);
+  // A failed read keeps the last real answer; without one the pool stays "" (the shared key) but unread.
+  if (read || !g_pool_read) g_pool = v;
+  g_pool_read = g_pool_read || read;
+  g_pool_at = (uint64_t)GetTickCount64(); g_pool_on = true; g_pool_busy = false;
+}
+std::string pool_now() {
+  std::lock_guard<std::mutex> lock(g_pool_mutex);
+  if (g_pool_on && !g_pool_busy && (uint64_t)GetTickCount64() - g_pool_at >= 60000) {
+    g_pool_busy = true;
+    std::thread(pool_refresh).detach();
+  }
+  return g_pool;
+}
+bool listing_known() {
+  std::lock_guard<std::mutex> lock(g_pool_mutex);
+  return g_pool_on;
+}
+bool listed_current() {
+  (void)pool_now();   // a stale answer is read again in the background, as for the bridge's hello
+  std::lock_guard<std::mutex> lock(g_pool_mutex);
+  return g_pool_on && g_pool_read && g_pool.empty();   // unread is never "listed": app-backed would be refused
 }
 
 Allowed behind() { std::lock_guard<std::mutex> lock(g_mutex); return g_behind; }
@@ -629,6 +992,16 @@ void set_build(const std::string& version, const std::wstring& exe, const std::w
   const json j{{"version", version}, {"exe_sha256", sha256_file(exe)}, {"game_sha256", sha256_file(game_library)}};
   std::lock_guard<std::mutex> lock(g_mutex);
   g_build_json = j.dump();
+}
+
+// A room code as YouGame's app makes them: 12 lowercase letters and digits, none that read alike.
+std::string new_room_code() {
+  static const char alphabet[] = "abcdefghjkmnpqrstuvwxyz23456789";
+  uint8_t bytes[12];
+  BCryptGenRandom(nullptr, bytes, sizeof bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  std::string code;
+  for (uint8_t b : bytes) code += alphabet[b % (sizeof alphabet - 1)];
+  return code;
 }
 
 // ---------------------------------------------------------------- testable parts
@@ -703,8 +1076,10 @@ BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& t
       // YouGame is on an older release than this one: the game offers to restart in it.
       if (backend.behind) {
         const Allowed older = backend.behind();
-        if (!older.version.empty()) result["behind"] = {{"version", older.version}};
+        if (!older.version.empty()) result["behind"] = {{"version", older.version}, {"restart", older.restart}};
       }
+      // The version whose rooms the game searches ("" or absent: every release's shared key).
+      if (const std::string pool = pool_now(); !pool.empty()) result["pool"] = pool;
       return reply(200, {{"ok", true}, {"result", result}});
     }
     if (!a.signed_in && (type == "mpCode" || type == "mpTicket" || type == "mpRank"))
@@ -714,6 +1089,58 @@ BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& t
       const std::string mode = q.count("mode") && q["mode"].is_string() ? q["mode"].get<std::string>() : "singles";
       return reply(200, {{"ok", true}, {"result", parse_or_empty(backend.rank(mode))}});
     }
+    // The ticket answer's parts the game reads, and nothing else of it.
+    const auto ticket_result = [](const json& answer) {
+      json result = json::object();
+      for (const char* key : {"url", "ticket", "room", "queue", "rating", "rank", "ice", "server", "direct", "player",
+                              "bestOf", "winsRequired", "rulesVersion", "reason"})
+        if (answer.is_object() && answer.count(key)) result[key] = answer[key];
+#ifdef MELEE_DOUBLES
+      if (answer.is_object() && answer.count("md")) result["md"] = answer["md"];
+#endif
+      return result;
+    };
+    // The game's room report is for the YouGame app's own page (who is in the room); nothing shows it here.
+    if (type == "mpRoom") return reply(200, {{"ok", true}, {"result", json::object()}});
+    // Hold a room of the player's own (the Friends lobby's 4 seats, the Doubles home's 2): as the YouGame
+    // app does, the launcher picks the room's 12-character code and asks YouGame for its private ticket.
+    if (type == "mpFriend" && q.value("hold", json()) == true) {
+      const int players = q.value("players", 4);
+      const std::string compatibility = q.value("compatibility", std::string());
+      if ((players != 2 && players != 4) || compatibility.empty() || compatibility.size() > 64)
+        return reply(200, {{"ok", false}, {"error", "Bad request"}});
+      const std::string code = backend.room_code ? backend.room_code() : new_room_code();
+      json body{{"slug", kSlug}, {"player_id", backend.player_id()}, {"name", a.name}, {"anonymous", false},
+                {"players", players}, {"mode", players == 2 ? "teams" : "singles"}, {"queue", "private"}, {"room", code},
+                {"lobby", {{"version", 1}, {"minPlayers", players == 2 ? 2 : 1}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}},
+                {"build", parse_or_empty(build_json)}};
+      if (const std::string nb = listed_build_id(parse_or_empty(build_json).value("version", std::string())); !nb.empty())
+        body["native_build"] = nb;
+      // Launcher copies have no YouGame links of their own (the app's): said on the ticket for YouGame, and by
+      // the game to the other seats (its word), so every seat of its match connects over direct UDP.
+      body["links"] = false;
+      if (players == 2) {
+        // The Doubles home is YouGame's native unranked home: a 4-seat teams room that starts with 2 and
+        // takes up to 2 local players (the game's own yougame_doubles.h ticket(); a 2-seat one is refused
+        // with bad_teams_lobby).
+        body["players"] = 4;
+        body["mode"] = "teams";
+        body["teams_lobby"] = 1;
+        body["mu_doubles"] = 1;
+        body["lobby"] = {{"version", 1}, {"minPlayers", 2}, {"maxLocalPlayers", 2}, {"compatibility", compatibility}};
+        // The site's native Doubles check (native-teams.ts, port/tests/doubles_wiring_test.py) names the build as native_build.
+        const std::string version = parse_or_empty(build_json).value("version", std::string());
+        body["native_build"] = listed_build_id(version);
+        if (body["native_build"].get<std::string>().empty())
+          return reply(200, {{"ok", false}, {"error", "YouGame Doubles opens once YouGame lists Melee Unlocked " + version +
+                                                      " (usually within two hours of a release). Try again later."}});
+      }
+      json result = ticket_result(parse_or_empty(backend.ticket(body.dump())));
+      if (!result.count("room") || !result["room"].is_string()) result["room"] = code;
+      return reply(200, {{"ok", true}, {"result", result}});
+    }
+    // The app's friends list has no place in the launcher: friends meet by connect code (Friends), and a
+    // Doubles partner by the home's code.
     if (type == "mpFriend") return reply(200, {{"ok", false}, {"error", "Enter a connect code"}});
     // Launcher only, never sent on to YouGame: restart in the release YouGame is on.
     if (type == "muRestartOlder") {
@@ -728,15 +1155,34 @@ BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& t
       json body{{"slug", kSlug}, {"player_id", backend.player_id()}, {"name", a.name}, {"anonymous", false},
                 {"players", q.value("players", 2)}, {"mode", q.value("mode", std::string("singles"))},
                 {"queue", ranked ? "ranked" : "casual"}, {"build", parse_or_empty(build_json)}};
+      if (const std::string nb = listed_build_id(parse_or_empty(build_json).value("version", std::string())); !nb.empty())
+        body["native_build"] = nb;
+      // Launcher copies have no YouGame links of their own (the app's): said on the ticket for YouGame, and by
+      // the game to the other seats (its word), so every seat of its match connects over direct UDP.
+      body["links"] = false;
+      // A room named by its code is a private room (a friend's room, a held lobby or home), never a queue.
+      if (!ranked && q.count("room") && q["room"].is_string() && !q.count("queue")) body["queue"] = "private";
       if (q.count("lobby")) body["lobby"] = q["lobby"];
       if (q.count("direct") && q["direct"].is_string()) body["direct"] = q["direct"];
       if (q.count("room") && q["room"].is_string()) body["room"] = q["room"];
       if (q.value("afterMatch", std::string()) == "stay") body["after_match"] = "stay";
+#ifdef MELEE_DOUBLES
+      if (q.value("teamsLobby",json())==1) {
+        body["teams_lobby"]=1;
+        body["native_build"] = listed_build_id(parse_or_empty(build_json).value("version", std::string()));
+        if (q.count("partySearch") && !q["partySearch"].is_null()) body["party_search"]=q["partySearch"];
+        for (const char* key : {"mu_doubles","party_room","party","local_players","local_partner","lobby","queue"})
+          if (q.count(key)) body[key]=q[key];
+      }
+#endif
       const json answer = parse_or_empty(backend.ticket(body.dump()));
       json result = json::object();
       for (const char* key : {"url", "ticket", "room", "queue", "rating", "rank", "ice", "server", "direct", "player",
                               "bestOf", "winsRequired", "rulesVersion", "reason"})
         if (answer.is_object() && answer.count(key)) result[key] = answer[key];
+#ifdef MELEE_DOUBLES
+      if (answer.is_object() && answer.count("md")) result["md"]=answer["md"];
+#endif
       return reply(200, {{"ok", true}, {"result", result}});
     }
   } catch (const std::exception& e) {

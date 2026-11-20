@@ -943,7 +943,7 @@ void dma_write(uint32_t addr, uint32_t size) {
 #endif
         // ReportGameQuery has no placements. Teams needs the same Game End record that
         // Source publishes; ReportGameQuery is not used for YouGame Teams.
-        if (!host::game_image && yougame::active() && online::session_mode() == 3 && !playback::enabled() && loc + payload < size)
+        if (!host::game_image && yougame::session() && online::session_mode() == 3 && !playback::enabled() && loc + payload < size)
           host::publish_lobby_result(-1, payload ? mem[loc + 1] : 0,
               payload >= 2 ? (int)(int8_t)mem[loc + 2] : -1, payload >= 6 ? &mem[loc + 3] : nullptr);
         write_to_file(&mem[loc], payload + 1, "close"); spectate::end_game(); break;

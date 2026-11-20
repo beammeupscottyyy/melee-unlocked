@@ -8,7 +8,9 @@
 #ifdef _MSC_VER
 #include <intrin.h>
 #else
+#if defined(__x86_64__) || defined(_M_X64)
 #include <x86intrin.h>
+#endif
 static inline unsigned char _BitScanForward64(unsigned long* index, unsigned long long value) {
   if (!value) return 0;
   *index = static_cast<unsigned long>(__builtin_ctzll(value));
@@ -38,11 +40,13 @@ PhaseFlipStats& subframe_phase_flips() { static PhaseFlipStats p; return p; }
 // Development measurement, off unless MELEE_AUDIT_STAGE_SPLIT is in the environment: reports how
 // far apart the solver's routes place pieces of the stage that are standing still in the world.
 // Development bisect, off unless MELEE_SUBFRAME_DIAG is set: bit 1 no stage object sampling,
-// 2 no vertex blending, 4 no camera carry, 8 no UV matrices, 16 no skinned sampling, 32 no stage lock.
+// 2 no vertex blending, 4 no camera carry, 8 no UV matrices, 16 no skinned sampling, 32 no stage lock,
+// 64 menu draws whose stream cannot blend hold their current frame (the behaviour before build 47).
 static uint32_t subframe_diag() {
   static const uint32_t bits = std::getenv("MELEE_SUBFRAME_DIAG") ? (uint32_t)std::strtoul(std::getenv("MELEE_SUBFRAME_DIAG"), nullptr, 0) : 0u;
   return bits;
 }
+bool subframe_menu_hold_diag_enabled() { return (subframe_diag() & 64) != 0; }
 // Development: MELEE_DUMP_SEQ=<simulation frame> writes every draw's pairing and route for that
 // frame to subframe_dump.txt in the working directory.
 static uint64_t dump_sequence() {
@@ -764,6 +768,7 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
   SubFrameStats* stats = &stats_;
   stats->rigid = stats->blended = stats->cuts = stats->authored = stats->carried = stats->vertex_blended = 0;
   stats->posed = stats->posed_skinned = 0;
+  stats->menu_held = stats->menu_advanced = 0;
   if (authored) {
     // Sample forward from the latest state. Unsupported/discontinuous draws hold their current
     // matrices instead of inventing motion or adding a frame of delay. Chunks run in parallel.
@@ -782,6 +787,7 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
     const int chunks = n >= 128 ? pool.chunks() : 1;
     std::vector<uint32_t> counts((size_t)chunks, 0), carries((size_t)chunks, 0), blends((size_t)chunks, 0), stages((size_t)chunks, 0);
     std::vector<uint32_t> poses((size_t)chunks, 0), skinned_poses((size_t)chunks, 0);
+    std::vector<uint32_t> menu_holds((size_t)chunks, 0), menu_advances((size_t)chunks, 0);
     // A presented frame at phase 1 in Interpolate is the current simulation frame itself, so every
     // draw must leave the solver holding exactly the matrices the game loaded. Whatever does not is
     // what jumps once per tick. Checked only on those frames.
@@ -835,6 +841,7 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
       AuthoredCache chain_cache;   // one sampled chain per object per chunk per presented frame
       size_t begin = n * (size_t)chunk / (size_t)chunks, end = n * (size_t)(chunk + 1) / (size_t)chunks;
       uint32_t count = 0, carried = 0, blended = 0, staged = 0, posed_count = 0, posed_skinned = 0;
+      uint32_t menu_held = 0, menu_advanced = 0;
       uint32_t lagged = 0, worst_kind = 0, worst_verts = 0; float worst_err = 0;
       for (size_t i = begin; i < end; ++i) {
         if (cancelled && ((i - begin) & 31) == 31) {
@@ -951,15 +958,36 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
             // every draw gets the same one.
             routes_[i] = 6;
             remap.moved = false;   // a rejected stream may have filled the map only part way
-            // In a match the current stream is drawn as it is while the matrices advance below with
-            // everything else. In the menus the whole draw holds its own current frame, which is
-            // what every rebuilt draw did before the stage work: menu text and panels are rebuilt
-            // rather than moved, and what matters there is that they are all treated the same way
-            // on every tick. One of them blending while the next holds is what flickers.
+            // The current stream is drawn as it is while the matrices advance below with
+            // everything else, in the menus too. The menus used to hold the whole draw at its own
+            // current frame, which matched the rest of the screen while menus predicted from the
+            // current frame. Since menus interpolate, the rest of the screen is drawn between the
+            // previous frame and this one, and a held draw sat up to a whole tick ahead of it: as
+            // the Online menu's rows slid in at 180 Hz, the pieces of a row that were rebuilt that
+            // tick drew ahead of the pieces that blended, and the row looked doubled sideways
+            // (tester report, Windows 1268). Only a draw whose vertices kept their matrix bindings
+            // advances: a binding that really changed means the previous rows belong to another
+            // object, and that draw still holds its current frame as before.
+            // MELEE_SUBFRAME_DIAG bit 64 restores the old hold for an A/B comparison.
             if (menus) {
-              std::memcpy(o.pos, d.posMatrices, sizeof o.pos);
-              std::memcpy(o.nrm, d.normalMatrices, sizeof o.nrm);
-              continue;
+              bool same_bindings = !(diag & 64);
+              const Vertex* pv = &prev_->vertices[pd->first_vertex];
+              const Vertex* cv = &cur_->vertices[d.first_vertex];
+              const uint32_t texgens = d.xf_regs[0x3F] & 15;
+              for (uint32_t v = 0; same_bindings && v < d.vertex_count; ++v) {
+                if (pv[v].posmtx != cv[v].posmtx) same_bindings = false;
+                // A used texture generator indexed per vertex is a binding too: its row is
+                // advanced below from the previous frame's row at the same slot.
+                for (uint32_t k = 0; same_bindings && k < texgens && k < 8; ++k)
+                  if ((d.components & (VB_HAS_TEXMTXIDX0 << k)) && pv[v].texmtx[k] != cv[v].texmtx[k]) same_bindings = false;
+              }
+              if (!same_bindings) {
+                ++menu_held;
+                std::memcpy(o.pos, d.posMatrices, sizeof o.pos);
+                std::memcpy(o.nrm, d.normalMatrices, sizeof o.nrm);
+                continue;
+              }
+              ++menu_advanced;
             }
           } else {
             o.vertices = &vertex_blend_[p.blend_offset];
@@ -1153,7 +1181,15 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
           // stage (route 4). Holding it at the latest pose while the camera carried everything
           // around it forward stepped it once per tick: on Fountain of Dreams those are the
           // fountain pieces, which jumped against the stage with every vertical camera move (B-314).
-          if (!interpolate && have_camera_step && p.pos_slots && !menus && !(diag & 32) && !cur_->discontinuous) {
+          // Only a draw seen through the world camera's projection can be standing in the world. The
+          // HUD has a perspective camera of its own that never moves, so its matrices repeat exactly
+          // each tick, and against a slow pan that repeat is within the translation tolerance below:
+          // the online name tags and the delay readout under the percents (game text, no authored
+          // pose) were carried by a share of the world camera's step on every presented frame and
+          // snapped back at the tick, which is the names vibrating while the camera moves.
+          const bool world_projection = scene_draw && d.xf_regs[0x26] == 0 &&
+              std::memcmp(&d.xf_regs[0x20], &scene_draw->xf_regs[0x20], 7 * sizeof(uint32_t)) == 0;
+          if (!interpolate && have_camera_step && p.pos_slots && !menus && !(diag & 32) && !cur_->discontinuous && world_projection) {
             bool static_in_world = true;
             uint64_t rows = p.pos_slots;
             while (rows && static_in_world) {
@@ -1329,6 +1365,8 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
       stages[(size_t)chunk] = staged;
       poses[(size_t)chunk] = posed_count;
       skinned_poses[(size_t)chunk] = posed_skinned;
+      menu_holds[(size_t)chunk] = menu_held;
+      menu_advances[(size_t)chunk] = menu_advanced;
     };
     if (chunks == 1) work(0); else pool.run(work);
     if (stop.load(std::memory_order_relaxed)) return false;   // dropped: no stats, routes or flip history from a present never shown
@@ -1338,6 +1376,8 @@ bool SubFrameSolver::build(double t, bool interpolate, std::vector<DrawMatrices>
     for (uint32_t c : stages) stats->stage_locked += c;
     for (uint32_t c : poses) stats->posed += c;
     for (uint32_t c : skinned_poses) stats->posed_skinned += c;
+    for (uint32_t c : menu_holds) stats->menu_held += c;
+    for (uint32_t c : menu_advances) stats->menu_advanced += c;
     // Two presented frames of the same simulation frame differ only in phase. A draw that takes one
     // route at one phase and another at the next is being drawn on two timelines inside a single
     // tick, which on screen is that object flashing several times per tick.

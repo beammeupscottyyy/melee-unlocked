@@ -3,6 +3,10 @@
 static int practice_pending_mode = -1, practice_origin_mode = -1;
 static int current_mode;
 static int gm_GetCurrentGameMode(void) { return current_mode; }
+/* The tournament and boot-match hooks entering a mode: not part of the handoff. */
+static void mu_tourney_enter_mode(int mode) { (void)mode; }
+static void mu_boot_match_enter_mode(int mode) { (void)mode; }
+static int mu_boot_match_resolve(int requested) { return requested; }   /* no bootMatch pending */
 #include "mu_practice_resolve_pending_mode_body.h"
 #include "mu_practice_enter_mode_body.h"
 

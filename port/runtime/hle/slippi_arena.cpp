@@ -977,7 +977,7 @@ void leave_room() {
 }
 
 void do_act(const Pending& p) {
-  if (yougame::active() && !g_test.on) return;   // not in YouGame mode
+  if (yougame::session() && !g_test.on) return;   // not on a YouGame row (the app, or one picked under the launcher)
   if (p.a == Act::OpenRoom) {
     if (!g_active && !g_code.empty()) open_room();
     return;
@@ -1437,7 +1437,7 @@ void stray_room_hello() {
     if (!get_str(m, at, code) || !get_str(m, at, name)) continue;
     const bool they_host = at + 2 <= m.size() && m[at] != 0;
     const online::ArenaMatchStatus st = online::arena_match_status();
-    if (st.in_match || !online::in_online_menus() || (yougame::active() && !g_test.on)) continue;
+    if (st.in_match || !online::in_online_menus() || (yougame::session() && !g_test.on)) continue;
     online::native_cleanup_match();
     g_next_match_ms = now_ms() + 2000;
     if (g_active || !they_host) { event("the Direct search met a room link (%s): searching again", code.c_str()); return; }
@@ -1815,6 +1815,13 @@ bool css_hand(float* x, float* y) {
   *x = (int16_t)(v >> 16) / 10.0f;
   *y = (int16_t)(v & 0xFFFF) / 10.0f;
   return true;
+}
+
+std::atomic<int> g_css_mode{-1};
+void set_css_mode(int mode) { g_css_mode.store(mode); }
+bool css_ranked_or_unranked() {
+  const int mode = g_css_mode.load();
+  return mode == Matchmaking::RANKED || mode == Matchmaking::UNRANKED;
 }
 
 void set_css_pick(uint8_t character, uint8_t costume) {

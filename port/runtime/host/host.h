@@ -69,6 +69,11 @@ void log(const char* fmt, ...);
 std::string cpu_power_line(const char* when);
 void log_guest_text(const char* data, size_t len);  // OSReport output
 void log_flush();   // writes every queued log line now (log() hands lines to a writer thread)
+// Startup timing: ms since this process was created, and the same as " (+1234 ms)" for the end of
+// a startup-phase log line (startup_clock.h).
+uint64_t startup_ms();
+std::string startup_mark();
+void startup_first_frame();   // logs "startup: first frame presented (+N ms)" once
 void log_memory();  // one line: this process's size and the memory Windows has left
 [[noreturn]] void die(const char* fmt, ...);
 // The body of a worker thread whose work the game can do without (a song, a video background, a
@@ -95,6 +100,8 @@ template <class Body> void optional_work(const char* what, Body&& body) noexcept
 void file_write_begin();
 void file_write_end();
 void wait_file_writes(unsigned max_ms = 20000);
+// A crash path calls this before it saves anything: every wait_file_writes after it waits at most 2 s.
+void mark_dying();
 // The game is ending on purpose (end_process, or the Source Port's shutdown). From here an exception
 // nobody catches on some other thread (a driver's or an overlay's, tearing down) ends the process
 // quietly instead of reporting a crash.
@@ -159,8 +166,14 @@ bool disc_music_paths(std::vector<std::string>* paths);
 
 // ---- boot ----
 void boot_setup();               // low memory, FST placement, DOL load, registers
+constexpr uint32_t kVanillaDolSize = 0x4385E0u;
+bool vanilla_dol_image(const std::vector<uint8_t>& image);
 bool disc_has_vanilla_dol();     // the disc's main.dol is retail NTSC 1.02 (modded discs are not)
 void init_state_digest();        // source path skips boot_setup but shares the digest writer
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+void squad_digest_observe(int32_t body, int32_t frontier, bool ending);
+#endif
 
 // ---- events (interrupt delivery at guest wait points) ----
 using Completion = std::function<void()>;
@@ -171,6 +184,7 @@ void wait_event();                     // one OSSleepThread step
 void pump_completions();               // deliver queued callbacks now (from HLE entry points)
 void retrace();                        // one VI retrace: time, alarms, VI interrupt
 bool retrace_due();                    // the timebase has reached the next retrace boundary
+std::function<void()> capture_native_boot_clock();
 uint64_t next_retrace_tb();            // timebase of the next retrace boundary
 // Source port: the game is native code, not the recompiled guest. When set, retrace() calls this in
 // place of the guest's alarm, audio and VI interrupt delivery (everything else, pacing, window,
@@ -206,6 +220,12 @@ void publish_lobby_result(int winner_index, int end_method, int lras = -1, const
 // Used for settings a running device cannot adopt, the graphics backend being the one that
 // matters today.
 void request_restart();
+// The graphics device was lost (a driver reset, a display change): the game starts again in a new
+// process with the same command line and this one ends quietly, with no crash report. A loss again
+// within 10 minutes of such a restart calls `switch_backend` first (Direct3D 11 in the settings), so
+// the new process starts on the other renderer. Returns false, and does nothing, after two restarts
+// within 10 minutes (or when the new process cannot start): the caller reports the loss as before.
+bool restart_after_device_loss(const char* why, bool (*switch_backend)());
 // A Gecko code only the Static Recomp can run, asked for from the Source Port: the launcher that
 // started this game (launcher.ini beside it, or two folders up from Versions\<id>) is left
 // engine-switch.request and this game closes; on seeing the game end, the launcher picks the
@@ -238,6 +258,9 @@ bool last_sim_frame_late();          // the most recent frame finished after its
 constexpr uint64_t TB_HZ = 40500000ull;   // bus clock / 4
 constexpr uint64_t TB_PER_FRAME = TB_HZ / 60;
 void advance_time(uint64_t ticks);
+// Moves the whole timebase forward: the time, the next retrace and the AI DMA clock, so nothing
+// already scheduled on it falls due early (a console session's End, source_host.cpp).
+void shift_time(uint64_t ticks);
 // Idle-wait pacing: waits until the real time of console time `tb` inside the frame now running
 // (the frame started at its tick deadline; the coming retrace is one frame later on both clocks),
 // then advances the timebase to `tb`. False, without waiting, when `tb` is not before the coming
@@ -310,6 +333,15 @@ void input_poll(PadState out[4]);
 // them, with none of input_poll's side effects (no overlay snapshot, no settings chord, no script):
 // for the early-input sampler, which reads between the game's polls on its own thread.
 void input_read_devices(PadState out[4]);
+// Console sessions: same devices, with empty routes disconnected and keyboard fallback behind
+// every connected controller (including an adapter plugged into physical port 2-4).
+// Publishes live UI/chords from this one read, before console_hardware applies capture.
+void input_read_console_devices(PadState out[4]);
+// The key bound to a GameCube button (a PAD bit, 0x0010 for Z) when the game's `port` (0-3) was fed by
+// the keyboard on the last read, for on-screen prompts: "Hold E to disconnect", not "Hold Z". Writes a
+// short name and returns true; false for a controller, an unbound button or an unusual key, when the
+// prompt keeps the GameCube name. The prompt only: what the keys do is unchanged.
+bool input_keyboard_button_label(int port, uint16_t pad_button, char* out, size_t n);
 // Scripted runs (--script): true while a script is driving the pads, and the pads the script will
 // deliver at retrace `retrace` (no state is changed by asking).
 bool input_script_active();

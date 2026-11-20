@@ -36,5 +36,17 @@ if LC_ALL=C grep -a -E -q 'present_log|present_frames|present-log v1|agent-test:
   echo "agent_test_hook_absent: $exe contains presentation test hooks" >&2
   exit 1
 fi
+if LC_ALL=C grep -a -E -q 'openMenu|phob:|rumbleTest|boxPresent|agent test: rumble pulse' "$exe"; then
+  echo "agent_test_hook_absent: $exe contains relay/present test hooks" >&2
+  exit 1
+fi
+if LC_ALL=C grep -a -E -q 'padTrace|agent-test: padTrace|port %d src %s buttons %04X stick %d,%d' "$exe"; then
+  echo "agent_test_hook_absent: $exe contains pad trace hooks" >&2
+  exit 1
+fi
+if LC_ALL=C grep -a -E -q 'YOUGAME_TEST_CSS_ORIGIN|YOUGAME_TEST_CSS_STATE|css-state roundtrip hash_before=|css-state bytes=|css-origin hash=|css-origin reset_ms=' "$exe"; then
+  echo "agent_test_hook_absent: $exe contains CSS origin proof hooks" >&2
+  exit 1
+fi
 echo "agent_test_hook_absent: ok ($exe)"
 done

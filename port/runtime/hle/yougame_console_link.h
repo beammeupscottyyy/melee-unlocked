@@ -1,0 +1,109 @@
+// Console room/link adapter. All I/O is injectable; offline tests use the real room Stream.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include "yougame_console.h"
+#include "yougame_console_request.h"
+#include "yougame_room.h"
+#include "yougame_console_notice.h"
+#include "friends_handoff_join.h"
+#include "friends_handoff_transfer.h"
+#include "yougame_css_join.h"
+#include <map>
+#include <vector>
+
+namespace yougame::console {
+using Bytes = std::vector<uint8_t>;
+constexpr size_t kHistory = 2048; // >34 seconds at 60 Hz, including reordering holes
+constexpr uint8_t kWireVersion = 1;
+struct DirectNotice {
+  unsigned link = 0;
+  int state = 0; // path updates don't change link liveness
+  std::string path;
+  std::optional<uint64_t> rtt;
+};
+inline DirectNotice direct_notice(const json& push) {
+  DirectNotice n;
+  if (!number(push,"link",1,65534)) return n;
+  const auto event = friends::text(push,"event",16);
+  if (event != "up" && event != "path" && event != "close") return n;
+  n.link = push["link"].get<unsigned>();
+  n.state = event == "up" ? 2 : event == "close" ? 3 : 0;
+  if (event != "close") {
+    const auto path = friends::text(push,"path",16);
+    n.path = path == "direct" || path == "lan" || path == "relay" ? path : "unknown";
+    if (number(push,"rttMs",0,60000)) n.rtt = push["rttMs"].get<uint64_t>();
+  }
+  return n;
+}
+struct SessionIO {
+  transport::Request request;
+  std::function<uint64_t()> clock = transport::now_ms;
+  std::function<uint64_t()> random;
+  std::function<bool(const std::string&, const std::string&, int)> open_room;
+  std::function<bool()> room_mismatch; // exact broker HTTP upgrade refusal, not every 403/1006
+  std::function<bool(json&, int)> next_room;
+  std::function<bool(const json&)> send_room;
+  std::function<bool(int)> flush_room; // finish queued card sends before the app can relaunch
+  std::function<bool()> room_closed;
+  std::function<bool()> room_rejoining = [] { return false; }; // own held-seat recovery; not a final close
+  std::function<void(const std::string&,const std::string&)> rebound; // validated held-seat identity replacement
+  std::function<int()> connection;
+  std::function<bool(int)> attach;
+  std::function<bool()> helper_missing = [] { return false; }; // the last attach was refused no_direct
+  // The room relay (yougame_room_relay.h): true once this session's datagrams go over the room instead of
+  // links (the app's helper refused or never answered the attach). relay_open(my port, every port) starts
+  // it and gives each other port its link; empty when it can't.
+  std::function<bool()> relay = [] { return false; };
+  std::function<std::map<int,unsigned>(int, const std::vector<int>&)> relay_open;
+  std::function<int(unsigned)> state;
+  std::function<std::string(unsigned)> route;
+  std::function<std::vector<uint64_t>(unsigned)> rtt; // consume app path RTT samples
+  std::function<bool()> cancelled = [] { return false; };
+  std::function<bool()> confirm_start = [] { return true; };
+  bool held_reenter = false;
+  std::function<bool()> previous_session_active = [] { return false; };
+  std::function<int()> css_scene = [] { return 1; };
+  std::function<void(bool)> css_lock;
+  std::function<void(const std::string&)> css_hold;
+  css_join::Begin css_begin;
+  std::function<void()> css_relaunch;
+  std::function<void()> css_adopted;
+#ifdef MELEE_DOUBLES
+  bool doubles = false;
+  std::function<void(const std::string&)> doubles_home; // authoritative invite profile, before ordinary Friends setup
+#endif
+  bool friends_lobby = false; // Human Friends waits in local CSS without a seat deadline/START gate.
+  bool handoff_join = false; // Only Friends entry opts in; defaults preserve all other callers.
+  handoff_join::Info handoff_info;
+  std::function<bool()> handoff_css = [] { return false; };
+  handoff_join::Begin handoff_begin;
+  std::function<void(const std::string&)> opened;
+  std::function<void(const std::string&,const json&,const std::string&,int)> roster;
+  std::function<bool()> css_ready = [] { return true; };
+  std::function<std::string(const std::string&)> freeze_pick;
+  std::function<void(const std::string&,bool)> waiting;
+  std::function<void(int)> progress; // percent of the host's state received (Friends handoff guest)
+  // Human entry freezes Rooms config, then relaunches; it never boots this running engine.
+  std::function<void(const SessionConfig&)> prepared;
+  std::function<void(const SessionConfig&)> committed;
+  // Present for Friends; four-seat callers retain their existing startup contract.
+  std::function<Bytes()> host_save;
+  std::function<bool(const SessionConfig&)> persist_card;
+  std::function<bool(SessionConfig&)> restore_card;
+  std::function<void(const SessionConfig&)> discard_card; // default final removes any staged copy
+  std::function<void(unsigned, const Bytes&)> send;
+  std::function<bool(unsigned&, Bytes&)> receive;
+  std::function<void(int)> wait;
+  std::function<void()> close;
+  std::function<void(const std::string&)> log;
+  std::string compatibility;
+  bool exclusive = false; // Production owns the one run-wide helper ring; fakes can model a mesh.
+  bool background_service = false; // Service links through boot/loading, independent of bodies.
+};
+// Exact delay formula, shared with offline checks.
+int measured_delay(uint64_t worst_rtt_ms, int minimum);
+// Same implementation as the public entry, with a fake broker/link helper in tests.
+// A host's own private room code: 12 of [a-z0-9] from a 64-bit random value.
+std::string new_room_code(uint64_t random);
+std::unique_ptr<SessionLink> start_session(const json&, SessionConfig&, std::string&, SessionIO);
+} // namespace yougame::console

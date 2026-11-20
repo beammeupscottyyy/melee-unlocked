@@ -79,17 +79,20 @@ Backend* create_render_backend(void* hwnd, int client_w, int client_h, const Ren
     // DLSS, XeSS and NVIDIA frame generation are Direct3D 12 features; AMD FSR upscaling and its
     // frame generation run on Vulkan too.
     if (!fsr::is_fsr_mode(vulkan_options.dlss_mode)) { vulkan_options.dlss_mode = 0; vulkan_options.frame_generation_mode = 0; }
-    if (Backend* backend = create_vulkan_backend(window, client_w, client_h, vulkan_options)) return backend;
+    if (Backend* backend = create_vulkan_backend(window, client_w, client_h, vulkan_options)) return record_started_backend(backend, "Vulkan");
+    if (options.prewarm_only) return nullptr;   // the lock covers only the selected backend's cache
     host::log("vulkan: falling back to Direct3D 12");
   } else if (options.api == RenderApi::D3D11) {
+    if (options.prewarm_only) throw UnsupportedPrewarmBackend("d3d11 has no startup recipe prewarm");
     RenderOptions d3d11_options = options;
     if (d3d11_options.dlss_mode) host::log("d3d11: DLSS is a Direct3D 12 feature; rendering natively");
     d3d11_options.dlss_mode = 0;
     if (Backend* backend = create_d3d11_backend(hwnd, client_w, client_h, d3d11_options)) {
-      return backend;
+      return record_started_backend(backend, "D3D11");
     }
     host::log("d3d11: falling back to Direct3D 12");
   } else if (!d3d12_usable()) {
+    if (options.prewarm_only) throw UnsupportedPrewarmBackend("d3d12 unavailable; d3d11 prewarm is unsupported");
     // A 0.8.84 report crashed inside DXGI at startup with Direct3D 12 selected: start on Direct3D 11
     // when 12 cannot, rather than stopping at the first frame.
     host::log("d3d12: cannot start on this system; starting on Direct3D 11");
@@ -99,14 +102,14 @@ Backend* create_render_backend(void* hwnd, int client_w, int client_h, const Ren
     const char* fault = host::test_env::getenv("MELEE_TEST_DXGI_FAULT");
     const bool d3d11_fault = fault && std::atoi(fault) >= 3;
     if (!d3d11_fault)
-      if (Backend* backend = create_d3d11_backend(hwnd, client_w, client_h, d3d11_options)) return backend;
+      if (Backend* backend = create_d3d11_backend(hwnd, client_w, client_h, d3d11_options)) return record_started_backend(backend, "D3D11");
     // No hardware Direct3D 11 device either: a graphics card older than DirectX 11 (a 0.9.95 report
     // ran an ATI Radeon 3000, a DirectX 10 part) or no driver for it. Direct3D 12 would only stop on
     // "no adapter" with a crash report; say what is missing instead.
     if (d3d11_fault || !d3d11_available()) no_directx11_gpu(hwnd);
     host::log("d3d11: did not start either; trying Direct3D 12 anyway");
   }
-  return create_d3d12_backend(hwnd, client_w, client_h, options);
+  return record_started_backend(create_d3d12_backend(hwnd, client_w, client_h, options), "D3D12");
 }
 
 }  // namespace gx

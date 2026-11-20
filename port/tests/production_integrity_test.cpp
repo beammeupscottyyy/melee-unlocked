@@ -39,8 +39,12 @@ static int native_ai_test(const std::string& mode) {
   host::gameplay::vanilla_only_session = mode == "--native-ai-vanilla";
   MuHostApi api{}; api.version = MU_HOST_API_VERSION; api.test_getenv = host::test_env::getenv; mu_host = &api;
   set_env("MELEE_TEST_20XX_AI", "1");
-  const bool restricted = yougame_active || host::gameplay::vanilla_only();
+  set_env("MELEE_TE_FAKE_ATTACK", "1");
+  // Only YouGame sessions blank the knobs; --vanilla-only reads them as upstream does.
+  const bool restricted = yougame_active;
   CHECK(bool(mu_20xx_ai_enabled()) == !restricted);
+  CHECK(bool(mu_test_getenv("MELEE_TE_FAKE_ATTACK")) == !restricted);
+  set_env("MELEE_TE_FAKE_ATTACK", nullptr);
   native_online = true; CHECK(!mu_20xx_ai_enabled()); native_online = false;
   native_pending = true; CHECK(!mu_20xx_ai_enabled()); native_pending = false;
   native_replay = true; CHECK(!mu_20xx_ai_enabled()); native_replay = false;
@@ -71,7 +75,7 @@ static void environment_tests() {
   yougame_active = true;
   CHECK(!host::test_env::getenv("MELEE_TEST_20XX_AI")); CHECK(!host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE"));
   yougame_active = false; host::gameplay::vanilla_only_session = true;
-  CHECK(!host::test_env::getenv("MELEE_TEST_20XX_AI")); CHECK(!host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE"));
+  CHECK(host::test_env::getenv("MELEE_TEST_20XX_AI")); CHECK(host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE"));
   host::gameplay::vanilla_only_session = false;
   CHECK(host::test_env::getenv("MELEE_TEST_20XX_AI"));
   set_env("MELEE_TEST_20XX_AI", nullptr); set_env("MELEE_SNAPSHOT_EXCLUDE", nullptr);
@@ -82,8 +86,13 @@ static void path_tests(const fs::path& root) {
   fs::create_directories(build / "sub"); fs::create_directories(data);
   std::error_code ec;
   const auto physical = resolve_ancestors(root, ec); CHECK(!ec);
+  // From the temp folder's parent: on Windows the build (E:) and temp (C:) can be on different drives,
+  // where no relative path between them exists.
+  const auto saved_cwd = fs::current_path();
+  fs::current_path(root.parent_path());
   const auto relative = root.lexically_relative(fs::current_path()) / "data/../new/missing";
   CHECK(resolve_ancestors(relative, ec) == physical / "new/missing" && !ec);
+  fs::current_path(saved_cwd);
   CHECK(resolve_ancestors(data / "./../build/sub/..", ec) == physical / "build" && !ec);
   CHECK(outside_build(build, data / "missing/file", ec) && !ec);
   CHECK(!outside_build(build, build / "missing/file", ec) && !ec);

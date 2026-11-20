@@ -19,7 +19,8 @@
 namespace host::sysgen {
 namespace {
 constexpr size_t max_asset = 256u * 1024 * 1024;
-const std::array<std::string, 2> required = {"GameSetup_gui.dat", "slpCSS.dat"};
+// SlippiCSS_gui.dat: Slippi 3.7.0's linked copy of slpCSS.dat (upstream v0.9.207).
+const std::array<std::string, 3> required = {"GameSetup_gui.dat", "slpCSS.dat", "SlippiCSS_gui.dat"};
 bool fail(std::string& error, const std::string& message) { error = message; return false; }
 bool component(const std::string& s) {
   return !s.empty() && s != "." && s != ".." &&
@@ -205,7 +206,8 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
       if (!shipped(config.sys_dir, name).empty()) continue;
       if (std::none_of(files.begin(), files.end(), [&](const File& f) {
             return f.target == name && std::find(f.sys.begin(), f.sys.end(), active) != f.sys.end();
-          })) return fail(error, name + ": missing delta manifest entry for active Sys directory");
+          })) return fail(error, name + ": missing delta manifest entry for active Sys directory " +
+                      config.sys_dir.u8string() + (has_manifest ? "" : " (no deltas/manifest.json beside it)"));
     }
     std::map<std::string, std::filesystem::path> pending;
     bool verified = false;
@@ -233,10 +235,15 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
       if (needed.empty()) continue;
       std::vector<uint8_t> output;
       bool rebuild = false;
+      // A generated file that no longer matches the manifest is stale (an older build's Sys asset, e.g. the
+      // Slippi 3.6 GameSetup_gui.dat left by build 121 under 3.7.0's build 122): rebuild and replace it.
+      std::set<std::filesystem::path> stale;
       for (const auto& item : needed) {
         if (std::filesystem::exists(item.second)) {
-          if (!read(item.second, file.size, output) || !matches(output, file.size, file.sha1))
-            return fail(error, file.target + ": generated file size/SHA-1 mismatch");
+          if (!read(item.second, file.size, output) || !matches(output, file.size, file.sha1)) {
+            stale.insert(item.second);
+            rebuild = true;
+          }
         } else rebuild = true;
       }
       if (rebuild) {
@@ -258,7 +265,7 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
         if (sha1(output) != file.sha1) return fail(error, file.target + ": rebuilt target size/SHA-1 mismatch");
         bool built = false;
         for (const auto& item : needed) {
-          if (std::filesystem::exists(item.second)) continue;
+          if (std::filesystem::exists(item.second) && !stale.count(item.second)) continue;
           if (!atomic_write(item.second, output))
             return fail(error, file.target + ": cannot atomically write generated file");
           built = true;

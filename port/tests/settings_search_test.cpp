@@ -25,7 +25,7 @@ int main() {
   check(!matches("zzqx", "Volume Audio"), "nonsense matches nothing");
   check(!matches("hb", "Show attack hitboxes"), "two letters are too few for an abbreviation");
   check(!matches("vol", "Hide fighter shadows"), "a short word is not a typo of an unrelated one");
-  check(!matches("##editing", "Editing"), "an empty query matches nothing");
+  check(!matches("##profile", "Profile"), "an empty query matches nothing");
   check(matches("fulscreen", "Fullscreen Video"), "a typo in a long word");
   std::printf(g_fail ? "settings search: %d failures\n" : "settings search: all passed\n", g_fail);
   return g_fail ? 1 : 0;

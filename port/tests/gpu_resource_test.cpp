@@ -20,6 +20,8 @@ namespace host {
 void log(const char* fmt, ...) { va_list args; va_start(args, fmt); vprintf(fmt,args); va_end(args); puts(""); }
 [[noreturn]] void die(const char* fmt, ...) { char buf[1024]; va_list args; va_start(args,fmt); vsnprintf(buf,sizeof buf,fmt,args); va_end(args); throw std::runtime_error(buf); }
 // The renderer reaches back into the window for fullscreen changes; this test owns a bare HWND.
+// A lost device in this test is reported (die above), never a restart of the test program.
+bool restart_after_device_loss(const char*, bool (*)()) { return false; }
 bool window_take_fullscreen_toggle() { return false; }
 bool window_take_activation() { return false; }
 void window_set_fullscreen(bool) {}
@@ -38,6 +40,8 @@ namespace slippi { void request_widescreen(bool) {} void request_fod_reflections
 // D3D12 backend linkable without pulling in the full game core or generated Gecko data.
 namespace gx { void set_hud_scales(int, int, bool) {} void set_low_poly_fighters(bool) {} void set_fod_reflections(bool) {} void set_css_background_free(bool) {} void set_player_tags_always(bool) {} void set_arcade_display(ArcadeSource, uint32_t) {} void set_shield_colors(const uint32_t*, uint32_t) {} void set_presented_test_fill(int) {} void set_lightweight_level(int) {} void lightweight_count(bool) {} void lightweight_publish_counts() {} void lightweight_debug(const Frame&, const LightweightFilter&) {} void arcade_debug(const Frame&, const LightweightFilter&) {} int8_t& lightweight_skip_slot(const Frame&, size_t, int) { static int8_t s; s = -1; return s; } }
 namespace gecko { bool option_pal_stock_icons = false; }
+namespace yougame { bool embedded() { return false; } bool embed_toplevel() { return false; } }
+namespace host { void startup_first_frame() {} }   // the renderer asks; never embedded in this test
 // This renderer regression test deliberately links the production D3D12 backend without Media
 // Foundation. Keep its video-background hooks inert so it exercises descriptor/upload behavior.
 namespace gx::video_bg {

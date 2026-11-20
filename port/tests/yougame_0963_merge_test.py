@@ -35,7 +35,8 @@ class YouGame0963MergeTest(unittest.TestCase):
         report = online.split("void handle_report_game(", 1)[1].split("\n}", 1)[0]
         self.assertIn("trace_end_match();", report)
         policy = source("port/runtime/host/test_env.h")
-        self.assertIn("yougame_session || gameplay::vanilla_only() ? nullptr", policy)
+        self.assertIn("return yougame_session ? nullptr : std::getenv(name);", policy)
+        self.assertNotIn("vanilla_only", policy)
 
     def test_upstream_deadline_signal_and_local_timing_report_coexist(self):
         host = source("port/runtime/host/host.cpp")

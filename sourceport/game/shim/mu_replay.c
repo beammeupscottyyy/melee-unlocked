@@ -6,10 +6,17 @@
  * What the playback also needs from the replay's own Gecko list (NeutralSpawn, UCF 0.84, the online
  * gameplay codes) is carried by the host's MU_REPLAY_CODE_* mask; each native code checks it.
  */
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad.h"
+void mu_replay_apply_game_info(StartMeleeData* data, const unsigned char* info);
+#endif
 #if MU_MAKER
 #include <mu_bm.h>
 #endif
 #include <string.h>
+#include "mu_tourney_game.h"
+#include "mu_doubles_game.h"
 #include <melee/cm/camera.h>
 #include <melee/cm/types.h>
 #include <melee/ft/fighter.h>
@@ -89,7 +96,8 @@ int mu_replay_on(void)
  * Dolphin always runs the sections these codes come from). */
 int mu_replay_code(unsigned int code)
 {
-    return (mu_replay_abi_codes() & code) != 0 || (mu_online_codes() & code) != 0;
+    return (mu_replay_abi_codes() & code) != 0 || (mu_online_codes() & code) != 0 ||
+           (mu_console_rollback_codes() & code) != 0;
 }
 
 /* A code the native game runs as part of the General Codes: during playback it runs only when the
@@ -119,10 +127,25 @@ int mu_online_is_test_run(void);
 int mu_online_test_wait(void);
 const unsigned char* mu_online_pending_game_info(void);
 
+int mu_console_active(void);
+void mu_console_load_save(void);
+
 void mu_replay_boot_mode(u8* mode)
 {
+    /* Frozen session state only: every seat takes retail VS on the same first
+     * scene boundary, before any body or frame-zero digest. No local input. */
+    if (mu_console_active()) {
+        mu_console_load_save();
+#ifdef MELEE_DOUBLES
+        mu_doubles_boot();
+#endif
+        *mode = GM_VS;
+        return;
+    }
     if (mu_replay_on() || mu_online_is_test_run()) {
         *mode = GM_DEBUG_VS;
+    } else if (mu_tourney_boot()) {
+        *mode = GM_VS;
     }
 }
 
@@ -160,6 +183,23 @@ void mu_replay_prepare_scene(void)
 #endif
         scene->game_cache.entries[i].color = p[3];
     }
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+     * The harness skips SplashSceneInit; import the same exchanged setup before any preload. */
+    if (mu_online_pending() && mu_online_harness() && gmSquad_OnlineChosen()) {
+        StartMeleeData start;
+        mu_replay_apply_game_info(&start, info);
+        gmSquad_OnlineSetup(&start);
+        for (i = 0; i < 4; ++i) {
+            scene->game_cache.entries[i].char_id = start.players[i].ckind;
+            scene->game_cache.entries[i].color = start.players[i].color;
+        }
+        /* No direct gmSquad_AddPreloads here: lbDvd_80018254 below reaches the lbDvd_80017960 hook once the
+         * scene's heaps exist. Queuing earlier asked for heap 4 while it was destroyed (Linux test PC, 11-04: lbdvd.c
+         * assert "4, 762", PlPp.dat). */
+        mask |= gmSquad_SoundMask();
+    }
+#endif
     lbDvd_80018254();
     lbDvd_80018C2C(199);
     lbDvd_80017700(4);
@@ -356,6 +396,8 @@ void mu_replay_fountain_heights(float* left, float* right)
 
 void mu_replay_scene_think(int match_result)
 {
+    mu_tourney_tick();
+    mu_tourney_report(match_result);
     if (gm_801A4BA8() == 0) {
         match_frame = FIRST_FRAME;
         fountain_height[0] = 28.0f;
@@ -858,6 +900,16 @@ static void emit_game_end(int end_method);
 
 void mu_replay_match_exit(void)
 {
+    mu_tourney_report(gmVs_GetSceneState()->match_result);
+#ifdef MELEE_DOUBLES
+    /* Doubles reports its result from the Game End record. Without a recording (no spectator
+     * server, no --record-native) nothing sends one, so send it at the scene's exit, when the
+     * last frame can no longer be rolled back. */
+    if (!recording_active && !mu_replay_on() && mu_doubles_active()) {
+        emit_game_end(gmVs_GetSceneState()->match_result);
+        return;
+    }
+#endif
     if (recording_active) {
         /* The scene ends without the game end having been sent (a reset, a disconnect): end the
          * recording here with what the scene knows. */

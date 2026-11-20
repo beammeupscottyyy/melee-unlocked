@@ -1,6 +1,7 @@
 // Slippi spectator server (see slippi_spectate.h). Port of Dolphin's SlippiSpectateServer, same
 // ENet host, same messages (nlohmann's dump writes the keys in the same order), same cursors.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "slippi_agent_lock.h"
 #include "slippi_spectate.h"
 #include "slippi_net.h"
 #include "host.h"
@@ -194,13 +195,17 @@ void handle_message(const uint8_t* buffer, size_t length, uint16_t peer_id) {
 
 // SlippiSpectateServer::SlippicommSocketThread
 void server_thread(uint16_t port) {
+  if (agent_lock::blocked(agent_lock::Operation::Spectator)) { g_running = false; return; }
   if (enet_initialize() != 0) {
     host::log("spectator: ENet did not start; no spectator server");
     g_running = false;
     return;
   }
   ENetAddress address{};
-  address.host = ENET_HOST_ANY;
+  // This computer only: the Slippi Launcher and overlays connect on 127.0.0.1. Listening on every interface
+  // made Windows Firewall ask about the game at its first start, over the game, before the player went
+  // anywhere near online play (A2 walk 11-17); a loopback listener never asks.
+  address.host = ENET_HOST_TO_NET_32(0x7F000001u);   // 127.0.0.1
   address.port = port;
   // Fails while something else holds the port, or for a while after it closed: retry as Dolphin does.
   ENetHost* server = enet_host_create(&address, kMaxClients, kChannels, 0, 0);
@@ -215,7 +220,7 @@ void server_thread(uint16_t port) {
     return;
   }
   g_port = port;
-  host::log("spectator: serving the game on port %u for the Slippi Launcher and overlays", (unsigned)port);
+  host::log("spectator: serving the game on 127.0.0.1 port %u for the Slippi Launcher and overlays", (unsigned)port);
   while (!g_stop) {
     pop_events();
     for (auto& entry : g_sockets)
@@ -259,6 +264,7 @@ void server_thread(uint16_t port) {
 }  // namespace
 
 void start() {
+  if (agent_lock::blocked(agent_lock::Operation::Spectator)) return;
   std::call_once(g_started, [] {
     const bool yougame_mode = yougame::active();
     if (!yougame::mode_policy::spectator_allowed(yougame_mode, gx::RenderOptions::live_slippi_spectator())) {

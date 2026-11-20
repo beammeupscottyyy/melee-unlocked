@@ -19,6 +19,7 @@ struct Snapshot {
   Phase phase = Phase::Idle;
   MatchMode mode = MatchMode::None;
   bool in_practice = false;
+  uint8_t scene_major = 0, scene_minor = 0;   // the game's scene as of the last tick
   bool tab_available = false;
   bool can_start = false;
   bool cosmetic_profile_locked = false;
@@ -64,6 +65,23 @@ struct Snapshot {
       int costume = 0; std::string name;   // for the stock icon; the player's name (empty: not sent)
     } score_fighter[4];
   } warmup;
+  // Play while searching: a search the player chose to keep while they play elsewhere.
+  struct Kept {
+    int stage = 0;              // 0 none, 1 searching while away, 2 opponent found, 3 on the way back
+    std::string service;        // "YouGame", "Slippi", "YouGame and Slippi"
+    std::string mode;           // "Unranked", "Ranked", "Friends", "Squad Strike", "Direct", "Teams"
+    uint32_t elapsed_ms = 0;    // the search's own time
+    uint32_t shown_ms = 0;      // since it was kept
+    uint32_t found_ms = 0;      // since the opponent was found
+    int countdown_ms = -1;      // found: until the way back (0 going, -1 waiting for a safe moment)
+    float hold = 0.0f;          // L+R toward going back now
+    std::string note;           // found but waiting: why
+    // On the online select while a search runs: whether it can be kept, and the question.
+    bool possible = false;
+    bool asking = false;
+    uint32_t ask_ms = 0;
+    int ask_look = 1;
+  } kept;
 };
 
 Snapshot snapshot();
@@ -79,6 +97,13 @@ void submit_acknowledge_failure();
 // Warm-up room: go to Training from the online character select (the button), or back to the select.
 void submit_warmup();
 void submit_warmup_return();
+// The main menu's cleanup came (the online select was left, or the player is passing through): true
+// when a search the player chose to keep goes on (slippi_online.cpp skips that cleanup then).
+bool keep_search_at_menu();
+// A Squad Strike search the player chose to keep: the online menu keeps the select's lineup for the way back.
+bool keep_search_squad();
+// Tests only (the search banner's pictures): into a Training match as `character`, the menus pressed through.
+void test_request_training(int character);
 
 // Called once per 60 Hz retrace, before the guest advances its frame.
 void tick();

@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -36,10 +37,14 @@ namespace gx::user_shader {
 std::vector<std::string> presets();
 namespace {
 
-std::filesystem::path shader_root() {
+[[maybe_unused]] std::filesystem::path program_shaders() {   // the Shaders folder shipped beside the program
   wchar_t path[32768]{};
   const DWORD n = GetModuleFileNameW(nullptr, path, (DWORD)std::size(path));
   const std::filesystem::path exe = (!n || n >= std::size(path)) ? std::filesystem::current_path() : std::filesystem::path(path).parent_path();
+  return exe / "Shaders";
+}
+
+std::filesystem::path shader_root() {
 #ifdef __APPLE__
   static const auto writable = [] {
     auto folder = std::filesystem::current_path() / "Shaders";
@@ -51,7 +56,17 @@ std::filesystem::path shader_root() {
   }();
   return writable;
 #else
-  return exe / "Shaders";
+  // Under the YouGame app the program folder is read-only (the sandbox writes only YOUGAME_DATA), so
+  // the unpacked presets and the player's own live in the game's data folder; the pack stays beside
+  // the program and is read from there.
+#ifdef _WIN32
+  const wchar_t* data = _wgetenv(L"YOUGAME_DATA");
+  if (data && *data) return std::filesystem::path(data) / "Shaders";
+#else
+  const char* data = std::getenv("YOUGAME_DATA");
+  if (data && *data) return std::filesystem::u8path(data) / "Shaders";
+#endif
+  return program_shaders();
 #endif
 }
 
@@ -236,6 +251,7 @@ void unpack_bundle() {
   std::call_once(once, [] {
     const std::filesystem::path root = shader_root(), stamp = root / "slang-shaders" / "bundle-id.txt";
     FILE* f = _wfopen((root / "crt-shaders.pak").c_str(), L"rb");
+    if (!f) f = _wfopen((program_shaders() / "crt-shaders.pak").c_str(), L"rb");
     if (!f) return;
     char head[24]{};
     uint32_t count = 0;

@@ -7,6 +7,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "recomp"))
 from gekko import decode
 from emit import Emitter
 
+if len(sys.argv) == 1:
+    print("SKIP: build helper requires an output C++ path")
+    raise SystemExit(0)
+
 emitter = Emitter(None, None, {}, set(), {})
 info = SimpleNamespace(func=None)
 out = [r'''

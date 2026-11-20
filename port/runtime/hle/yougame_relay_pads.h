@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <nlohmann/json.hpp>
+#include "yougame_relay_timing.h"
+#include <memory>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -18,15 +21,28 @@ namespace yougame::relay_pads {
 struct Pad {
   bool present = false;
   std::string id, name, kind;
-  uint16_t buttons = 0;
+  uint32_t buttons = 0;  // XInput-layout wButtons; kind "hid": the device's own 32-bit mask
+  unsigned family_index = 0;  // its number in its game family (family_of); kNoFamilyIndex: skipped
   int16_t lx = 0, ly = 0, rx = 0, ry = 0;
   uint8_t lt = 0, rt = 0;
 };
 struct Frame {
   uint32_t seq = 0;
   double t = 0;
+  bool has_hs = false;
+  double hs = 0;
   std::array<Pad, 4> pads{};
 };
+
+// The game controller family a relayed pad joins (yougame_controller_relay.h). Xbox and other pads
+// share the Xbox family, so they share familyIndex numbers, as the app numbers them.
+enum class Family : uint8_t { Xbox, PlayStation, Switch, Hid };
+inline Family family_of(const std::string& kind) {
+  return kind == "ps" ? Family::PlayStation : kind == "switch" ? Family::Switch :
+         kind == "hid" ? Family::Hid : Family::Xbox;
+}
+// The family_index of a pad whose number another pad of its family already has.
+inline constexpr unsigned kNoFamilyIndex = 4;
 
 inline bool parse(const std::string& line, Frame& out, std::string& reason) {
   using json = nlohmann::json;
@@ -49,6 +65,12 @@ inline bool parse(const std::string& line, Frame& out, std::string& reason) {
   if (time == j.end() || !time->is_number() || !std::isfinite(time->get<double>()) || time->get<double>() < 0)
     return fail("t must be finite nonnegative milliseconds");
   next.seq = j["seq"].get<uint32_t>(); next.t = time->get<double>();
+  const auto helper = j.find("hs");
+  if (helper != j.end()) {
+    if (!helper->is_number() || !std::isfinite(helper->get<double>()) || helper->get<double>() < 0)
+      return fail("hs must be finite nonnegative milliseconds");
+    next.has_hs = true; next.hs = helper->get<double>();
+  }
   const auto pads = j.find("pads");
   if (pads == j.end() || !pads->is_array() || pads->size() > 4) return fail("pads must be an array of at most 4");
   for (const auto& p : *pads) {
@@ -58,7 +80,7 @@ inline bool parse(const std::string& line, Frame& out, std::string& reason) {
     if (pad.present) return fail("duplicate slot");
     auto string = [&](const char* key) { const auto i = p.find(key); return i != p.end() && i->is_string(); };
     // The id is the app's opaque per-run handle ("p1", "virtual") and the only pad identity the log shows, so it
-    // stays short and plain; the pad's name never reaches the log (pack-platform).
+    // stays short and plain; the pad's name never reaches the log.
     if (!string("id")) return fail("id must be 1..32 of A-Z a-z 0-9 _ -");
     const auto& id = p["id"].get_ref<const std::string&>();
     if (id.empty() || id.size() > 32 || !std::all_of(id.begin(), id.end(), [](unsigned char c) {
@@ -69,20 +91,35 @@ inline bool parse(const std::string& line, Frame& out, std::string& reason) {
     // JSON is UTF-8: count code points, not bytes, for the 64-character limit.
     if (std::count_if(pad.name.begin(), pad.name.end(), [](unsigned char c) { return (c & 0xc0) != 0x80; }) > 64)
       return fail("name exceeds 64 characters");
-    if (!string("kind")) return fail("kind must be ps|xbox|switch|other");
+    if (!string("kind")) return fail("kind must be ps|xbox|switch|other|hid");
     pad.kind = p["kind"].get<std::string>();
-    if (pad.kind != "ps" && pad.kind != "xbox" && pad.kind != "switch" && pad.kind != "other")
-      return fail("kind must be ps|xbox|switch|other");
-    if (!integer(p, "b", 0, 65535)) return fail("b must be 0..65535");
+    // "hid": a raw HID pad (a box in DInput mode, say) with its own button mask, all 32 bits.
+    if (pad.kind != "ps" && pad.kind != "xbox" && pad.kind != "switch" && pad.kind != "other" && pad.kind != "hid")
+      return fail("kind must be ps|xbox|switch|other|hid");
+    if (!integer(p, "b", 0, pad.kind == "hid" ? UINT32_MAX : 65535)) return fail("b must be 0..65535 (hid: uint32)");
+    // The pad's number in its family, which the app keeps through other pads' hotplugs. Optional:
+    // without it the seat is the number, as before.
+    const bool numbered = p.find("familyIndex") != p.end();
+    if (numbered && !integer(p, "familyIndex", 0, 3)) return fail("familyIndex must be 0..3");
+    pad.family_index = numbered ? p["familyIndex"].get<unsigned>() : p["slot"].get<unsigned>();
     for (const char* axis : {"lx", "ly", "rx", "ry"})
       if (!integer(p, axis, -32768, 32767)) return fail("sticks must be int16");
     for (const char* trigger : {"lt", "rt"})
       if (!integer(p, trigger, 0, 255)) return fail("triggers must be 0..255");
     pad.present = true; pad.id = p["id"].get<std::string>();
-    pad.buttons = p["b"].get<uint16_t>();
+    pad.buttons = p["b"].get<uint32_t>();
     pad.lx = p["lx"].get<int16_t>(); pad.ly = p["ly"].get<int16_t>();
     pad.rx = p["rx"].get<int16_t>(); pad.ry = p["ry"].get<int16_t>();
     pad.lt = p["lt"].get<uint8_t>(); pad.rt = p["rt"].get<uint8_t>();
+  }
+  // Two pads with one number in one family would be one controller to the game. The lower seat
+  // keeps the number and the other is skipped (State logs it): failing the line instead would
+  // hold every pad on its last state, held buttons included.
+  bool taken[4][4]{};
+  for (auto& pad : next.pads) {
+    if (!pad.present) continue;
+    bool& used = taken[static_cast<size_t>(family_of(pad.kind))][pad.family_index];
+    if (used) pad.family_index = kNoFamilyIndex; else used = true;
   }
   out = std::move(next); reason.clear(); return true;
 }
@@ -102,6 +139,7 @@ class State {
   bool accept(const std::string& line, uint64_t received_ms) {
     Frame next; std::string reason;
     const bool valid = parse(line, next, reason);
+    const double arrived = steady_ms();
     std::unique_lock<std::shared_mutex> native_lock(native_mutex_);
     std::lock_guard<std::mutex> lock(mutex_);
     if (!valid) {
@@ -112,7 +150,7 @@ class State {
       active_ = true; first_local_ = received_ms; first_app_ = next.t;
       emit_locked("pads: relay mode (app): non-adapter pads come from the YouGame app");
     }
-    // Connects and disconnects by the app's opaque id and kind only, never the pad's name (pack-platform).
+    // Connects and disconnects by the app's opaque id and kind only, never the pad's name.
     for (unsigned slot = 0; slot < next.pads.size(); ++slot) {
       const auto& before = latest_.pads[slot];
       const auto& now = next.pads[slot];
@@ -120,15 +158,53 @@ class State {
         emit_locked("pads: relay disconnect slot " + std::to_string(slot) + " " + before.id);
       if (now.present && (!before.present || now.id != before.id))
         emit_locked("pads: relay connect slot " + std::to_string(slot) + " " + now.id + " " + now.kind);
+      if (now.present && now.family_index == kNoFamilyIndex &&
+          (!before.present || now.id != before.id || before.family_index != kNoFamilyIndex))
+        emit_locked("pads: relay slot " + std::to_string(slot) + " " + now.id + " skipped: its familyIndex is taken");
+    }
+    if (!owns_hid_.load(std::memory_order_relaxed) &&
+        std::any_of(next.pads.begin(), next.pads.end(), [](const Pad& p) { return p.present && p.kind == "hid"; })) {
+      owns_hid_.store(true, std::memory_order_release);
+      emit_locked("pads: relay owns HID pads (the app sent a raw HID pad)");
     }
     // Signed delay relative to the first arrival: jitter, NOT absolute app-to-game latency.
     // Subtract in floating point to avoid unsigned wrap when an app timestamp moves backwards.
     lag_.push_back((double(received_ms) - double(first_local_)) - (double(next.t) - double(first_app_)));
+    timing_->arrival(arrived, next.has_hs, next.hs,
+        std::any_of(next.pads.begin(), next.pads.end(), [](const Pad& p) { return p.present; }));
     latest_ = std::move(next); // stdin arrival order wins, including repeated or wrapped seq.
     if (lag_.size() == 600) report_locked();
     return true;
   }
   bool active() const { std::lock_guard<std::mutex> lock(mutex_); return active_; }
+  // The latest accepted line, copied for the game's readers (yougame_controller_relay.h).
+  Frame snapshot() const { std::lock_guard<std::mutex> lock(mutex_); return latest_; }
+  // The app has sent a raw HID pad this run: HID pads are the app's from then on (sticky, like the
+  // relay itself), so a box is never read twice or flips between two readers. Until then the
+  // game's own HID reader keeps them (window.cpp relay_hid_poll).
+  void timing_tick() {
+    const double now = steady_ms();
+    { std::lock_guard<std::mutex> lock(mutex_); if (!timing_->due(now)) return; }
+    Timing completed;  // allocate replacement sample buffers outside the PADRead lock
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!timing_->take_report(now, completed)) return;
+    }
+    char line[384];
+    completed.format(line, sizeof line);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!logging_ready_) { pending_logs_.push_back(line); return; }
+    }
+    log_(line);
+  }
+  Frame game_snapshot() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const double now = steady_ms();
+    timing_->poll(now);
+    return latest_;
+  }
+  bool owns_hid() const { return owns_hid_.load(std::memory_order_acquire); }
   template<class XState> bool read(unsigned slot, XState* out) const {
     std::lock_guard<std::mutex> lock(mutex_); return read_locked(slot, out);
   }
@@ -140,12 +216,12 @@ class State {
     { std::lock_guard<std::mutex> lock(mutex_); if (active_) return read_locked(slot, out); }
     return native();
   }
-  template<class Native> void rumble(Native native) {
+  template<class Native> void rumble(Native native, bool relayed_output = false) {
     std::shared_lock<std::shared_mutex> native_lock(native_mutex_);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (active_) {
-        if (!rumble_reported_) { rumble_reported_ = true; emit_locked("pads: relayed pads have no rumble yet"); }
+        if (!relayed_output && !rumble_reported_) { rumble_reported_ = true; emit_locked("pads: relayed pads have no rumble yet"); }
         return;
       }
     }
@@ -160,6 +236,7 @@ class State {
       if (pad.present)
         emit_locked("pads: relay disconnect slot " + std::to_string(slot) + " " + pad.id);
     }
+    timing_->reset();
     latest_ = {}; // Keep the relay latch: closed stdin must never restore native pads.
     if (!eof_reported_) {
       eof_reported_ = true;
@@ -173,11 +250,12 @@ class State {
   template<class XState> bool read_locked(unsigned slot, XState* out) const {
     if (!out) return false;
     *out = {};
-    if (!active_ || slot >= 4 || !latest_.pads[slot].present) return false;
+    // Kind "hid" has no Xbox layout: the seat reads as empty here.
+    if (!active_ || slot >= 4 || !latest_.pads[slot].present || latest_.pads[slot].kind == "hid") return false;
     const auto& p = latest_.pads[slot];
     out->dwPacketNumber = latest_.seq;
     auto& g = out->Gamepad;
-    g.wButtons = p.buttons; g.bLeftTrigger = p.lt; g.bRightTrigger = p.rt;
+    g.wButtons = static_cast<uint16_t>(p.buttons); g.bLeftTrigger = p.lt; g.bRightTrigger = p.rt;
     g.sThumbLX = p.lx; g.sThumbLY = p.ly; g.sThumbRX = p.rx; g.sThumbRY = p.ry;
     return true;
   }
@@ -198,7 +276,9 @@ class State {
   mutable std::mutex mutex_;
   mutable std::shared_mutex native_mutex_;
   bool active_ = false, rejected_ = false, rumble_reported_ = false, eof_reported_ = false;
+  std::atomic<bool> owns_hid_{false};
   Frame latest_;
+  std::unique_ptr<Timing> timing_{new Timing};
   uint64_t first_local_ = 0;
   double first_app_ = 0;
   std::vector<double> lag_;

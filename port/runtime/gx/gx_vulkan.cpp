@@ -11,6 +11,18 @@
 // there for measurement, off by default. AMD FSR upscales on Vulkan too (gx_fsr_vk.cpp); NVIDIA
 // DLSS, Reflex and XeSS stay Direct3D 12 features.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef __APPLE__
+// The Mac host uses its OpenGL/AppKit path; upstream's Vulkan backend targets Win32 and Linux.
+#include "gx_vulkan.h"
+namespace gx {
+bool vulkan_available() { return false; }
+Backend* create_vulkan_backend(const VulkanWindow&, int, int, const RenderOptions&) { return nullptr; }
+// The Mac never starts Vulkan, so the crashed-start fallback (upstream v0.9.96) never triggers.
+int vulkan_failed_starts() { return 0; }
+void vulkan_set_shader_cache(const std::string&) {}
+void vulkan_forget_failed_starts() {}
+}
+#else
 #define VK_NO_PROTOTYPES
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -45,7 +57,14 @@
 // readout (Linux and macOS: port/linux/full/gpu_features_linux.cpp).
 #include "gx_streamline.h"
 #include "host.h"
+#include "pipeline_cache_store.h"
+#include "progress_frame.h"
+#ifdef MELEE_NO_SLIPPI
+#include "netplay_state.h"
+#else
 #include "exi_slippi.h"
+#endif
+#include "yougame_parity.h"
 #include "window.h"
 #include "sim_work.h"
 #include "fullscreen_state.h"
@@ -173,6 +192,7 @@ void load_device(VkDevice device) {
 }
 
 void check(VkResult r, const char* what) {
+  if (r == VK_ERROR_DEVICE_LOST) cache_store::freeze();   // nothing from a lost device replaces the saved caches
   if (r != VK_SUCCESS) throw std::runtime_error(std::string("vulkan: ") + what + " failed (" + std::to_string((int)r) + ")");
 }
 
@@ -486,6 +506,7 @@ class VulkanBackend final : public Backend {
 #endif
     scale_ = pick_scale();
     create_efb();
+    start_cache_saver();   // before the prewarm: a first start that is cut short keeps what it built
     prewarm_pipelines();
     blit_vs_ = module(spirv_for(std::string("#define VERTEX 1\n") + kBlitShader, true));
     blit_ps_ = module(spirv_for(kBlitShader, false));
@@ -500,15 +521,32 @@ class VulkanBackend final : public Backend {
     check(vkCreateSampler(device_, &s, nullptr, &nearest_), "sampler");
     create_white();
     g_vulkan_running = true;
-    { std::error_code ec; std::filesystem::remove(shader_cache_dir() / "startup.pending", ec); }
+    if (!opts_.prewarm_only) { std::error_code ec; std::filesystem::remove(shader_cache_dir() / "startup.pending", ec); }
 #ifdef GX_PC_SETTINGS
     if (opts_.pc_settings) create_settings_ui();
 #endif
     host::log("vulkan: %s, internal resolution EFB x%d (window %dx%d), %s", device_name_.c_str(), scale_, client_w_, client_h_,
               present_mode_ == VK_PRESENT_MODE_FIFO_KHR ? "vsync" : present_mode_ == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "immediate");
+    if (opts_.prewarm_only) { cache_dirty_ = true; cache_saver_.mark_dirty(); }
     start_pipeline_worker();   // last: a constructor that throws after this would leave the thread joinable
   }
 
+  PrewarmStats prewarm_stats() const override {
+    return {"vulkan", recipes_.size(), pipelines_hit_.load(), pipelines_compiled_.load()};
+  }
+  bool supports_game_reset() const override { return true; }
+  void reset_game_state() override {
+    vkDeviceWaitIdle(device_);
+    for (auto& t : textures_) destroy(t.second);
+    for (auto& c : copies_) destroy(c.second);
+    textures_.clear(); copies_.clear(); pending_hd_.clear();
+    destroy(efb_color_); destroy(efb_depth_); destroy(msaa_color_); destroy(msaa_depth_);
+    create_efb();
+    for (auto& f : frames_) {
+      for (auto& img : f.dead) destroy(img);
+      f.dead.clear(); vkResetDescriptorPool(device_, f.pool, 0);
+    }
+  }
   ~VulkanBackend() override {
     if (!device_) return;
     stop_pipeline_worker();   // before anything it uses goes; what it finished joins the maps emptied below
@@ -516,17 +554,16 @@ class VulkanBackend final : public Backend {
     fg_presenter_wait(); fg_presenter_stop();
 #endif
     vkDeviceWaitIdle(device_);
+    // The last save, on the saver thread, while the pipeline cache and the device still exist.
+    cache_saver_.stop();
+    log_pipeline_stats("session", cache_saver_.saved_bytes());
 #ifdef _WIN32
     vblank_.stop();
     if (present_timer_) { CloseHandle(present_timer_); present_timer_ = nullptr; }
 #endif
     // Quitting: keep the caches and leave the device to Windows. NVIDIA's driver crashed inside
     // vkDestroyDevice as the game closed (RTX 3060, 0.9.96 reports), after everything was saved.
-    if (host::process_ending()) {
-      save_pipeline_recipes();
-      if (pipeline_cache_) save_pipeline_cache();
-      return;
-    }
+    if (host::process_ending()) return;
 #ifdef GX_PC_SETTINGS
     destroy_settings_ui();
 #endif
@@ -572,8 +609,7 @@ class VulkanBackend final : public Backend {
     }
     vkDestroyPipelineLayout(device_, layout_, nullptr); vkDestroyPipelineLayout(device_, blit_layout_, nullptr);
     vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr); vkDestroyDescriptorSetLayout(device_, blit_set_layout_, nullptr);
-    save_pipeline_recipes();
-    if (pipeline_cache_) { save_pipeline_cache(); vkDestroyPipelineCache(device_, pipeline_cache_, nullptr); }
+    if (pipeline_cache_) vkDestroyPipelineCache(device_, pipeline_cache_, nullptr);
     heap_.destroy();
     vkDestroyDevice(device_, nullptr);
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
@@ -649,6 +685,7 @@ class VulkanBackend final : public Backend {
   void submit_frame(const Frame& frame) override { submit_frame(frame, nullptr); }
   void submit_frame(const Frame& frame, const DrawMatrices* overrides) override {
     begin_frame(frame);
+    cache_saver_.hold(frame_in_match(frame));   // timed cache saves wait for the next menu
     exact_frame_ = !frame_in_match(frame) &&
                    std::any_of(frame.copies.begin(), frame.copies.end(), [](const EfbCopy& c) { return !c.to_xfb; });
     const size_t original = frame.vertices.size();
@@ -731,7 +768,7 @@ class VulkanBackend final : public Backend {
       // the rest of this frame is not drawn; what was recorded is still submitted.
       if (++ring_overflows_ <= 3) host::log("%s; the rest of this frame was skipped", e.what());
     }
-    end_frame(presented);
+    end_frame(presented, frame.test_fill < 0);
     trim();
   }
 
@@ -852,7 +889,18 @@ class VulkanBackend final : public Backend {
 #else
   void release_exclusive() {}
   bool exclusive_lost(VkResult) { return false; }
-  void timing_reset() { last_actual_present_ = 0; timing_intervals_ = timing_on_grid_ = 0; timing_window_start_ = 0; }
+  void timing_reset() { last_actual_present_ = 0; timing_intervals_ = timing_on_grid_ = 0; timing_window_start_ = 0; present_times_ = {}; }
+  // Latency probe: when a present reached the screen, from the times update_variable_refresh
+  // collects (VK_GOOGLE_display_timing reports each once). Nanoseconds on CLOCK_MONOTONIC, the
+  // clock now_seconds reads.
+  uint64_t probe_present_id() override { return display_timing_on_ ? present_id_ : 0; }
+  int probe_presented(uint64_t id, double* seconds) override {
+    if (!display_timing_on_ || !id) return -1;
+    update_variable_refresh();
+    for (const auto& t : present_times_)
+      if (t.second && t.first == (uint32_t)id) { *seconds = (double)t.second * 1e-9; return 1; }
+    return 0;
+  }
   // Linux: VK_GOOGLE_display_timing says when each frame really reached the screen. On a display
   // that refreshes at a fixed rate those times sit on its refresh grid (intervals are whole
   // refreshes); on one that follows the frames they follow the frame times. Verdict after two
@@ -873,6 +921,7 @@ class VulkanBackend final : public Backend {
         if (std::fabs(k - std::round(k)) < 0.05) { ++timing_on_grid_; ++timing_line_on_grid_; }
       }
       last_actual_present_ = std::max(last_actual_present_, t[i].actualPresentTime);
+      present_times_[present_times_next_++ % present_times_.size()] = {t[i].presentID, t[i].actualPresentTime};
     }
     const double now = host::now_seconds();
     if (timing_window_start_ <= 0) { timing_window_start_ = now; timing_window_presents_ = presented_; return; }
@@ -1133,14 +1182,14 @@ class VulkanBackend final : public Backend {
     // vkCreateGraphicsPipelines, every start) left this marker behind: the cached pipelines, recipes
     // and SPIR-V are then cleared and built anew, so a bad cache costs one crash, not every start.
     // The marker counts the unfinished starts: at two, main.cpp starts on the default renderer.
-    {
+    if (!opts_.prewarm_only) {
       std::error_code ec;
       const auto marker = shader_cache_dir() / "startup.pending";
       const int failed = vulkan_failed_starts();
       if (failed > 0) {
         host::log("vulkan: the last start did not finish; clearing the Vulkan shader cache");
         for (const auto& entry : std::filesystem::directory_iterator(shader_cache_dir(), ec))
-          std::filesystem::remove(entry.path(), ec);
+          if (entry.path().filename() != "prewarm.lock") std::filesystem::remove(entry.path(), ec);
       }
       std::ofstream(marker, std::ios::binary) << (failed + 1);
     }
@@ -1154,13 +1203,135 @@ class VulkanBackend final : public Backend {
     }
   }
 
-  void save_pipeline_cache() {
-    size_t size = 0;
-    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
-    std::string data(size, '\0');
-    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) return;
-    std::ofstream f(shader_cache_dir() / "pipelines.bin", std::ios::binary);
-    f.write(data.data(), (std::streamsize)size);
+  // ---- Saving the caches while the game runs (pipeline_cache_store.h) ----
+  // The saver thread writes pipelines.bin and vk_recipes.bin a moment after new pipelines arrive, on
+  // an exit or relaunch (flush_all), and once more from the destructor. A VkPipelineCache is
+  // internally synchronized, so reading its data there needs no lock against the pipeline worker.
+  // The saver itself is the class's last member (destroyed first).
+  std::atomic<bool> cache_dirty_{false};
+  std::atomic<uint64_t> pipelines_hit_{0}, pipelines_compiled_{0}, pipelines_unreported_{0};
+  std::mutex recipes_mutex_;              // recipes_: the render thread appends, the saver thread copies
+  size_t recipes_saved_ = 0;              // saver thread
+  std::atomic<bool> recipes_ready_{false};   // after the prewarm: a list saved halfway would drop recipes
+  using Recipe = vk_recipes::Recipe;      // the file format (vulkan_recipes.h, unit-tested)
+
+  void start_cache_saver() {
+    // A failed write is forgotten as saved, so the next round writes it again (pipeline_cache_store.h).
+    cache_saver_.add((shader_cache_dir() / "vk_recipes.bin").string(), [this](cache_store::Buffer& out) { return produce_recipes(out); },
+                     [this] { std::lock_guard<std::mutex> lock(recipes_mutex_); recipes_saved_ = 0; });
+    cache_saver_.add((shader_cache_dir() / "pipelines.bin").string(), [this](cache_store::Buffer& out) { return produce_pipeline_cache(out); },
+                     [this] { cache_dirty_ = true; });
+    cache_saver_.on_saved([this](uint64_t bytes, const char* why) { log_pipeline_stats(why, bytes); });
+    cache_saver_.start();
+  }
+  // One line per save and per session; the second launch should say compiled=0. "unreported" counts
+  // pipelines whose driver gave no cache feedback (neither hit nor compiled is known).
+  void log_pipeline_stats(const char* why, uint64_t saved_bytes) {
+    host::log("vulkan: pipelines cache_hits=%llu compiled=%llu unreported=%llu saved_bytes=%llu (%s)",
+              (unsigned long long)pipelines_hit_.load(), (unsigned long long)pipelines_compiled_.load(),
+              (unsigned long long)pipelines_unreported_.load(), (unsigned long long)saved_bytes, why);
+  }
+  // The dirty mark is taken first, so a pipeline the worker adds during the copy marks it again. A
+  // copy that fails gives the mark back (the failed write path, start_cache_saver). VK_INCOMPLETE:
+  // the cache grew past the room given between the size and the copy, so it is asked again.
+  cache_store::Produce produce_pipeline_cache(cache_store::Buffer& out) {
+    if (!pipeline_cache_ || !cache_dirty_.exchange(false)) return cache_store::Produce::Nothing;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      size_t size = 0;
+      if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr) != VK_SUCCESS) break;
+      if (!size) return cache_store::Produce::Nothing;
+      size += size / 8;   // room for what the worker adds before the copy
+      out.resize(size);
+      const VkResult copied = vkGetPipelineCacheData(device_, pipeline_cache_, &size, out.data());
+      if (copied == VK_SUCCESS) { out.resize(size); return cache_store::Produce::Write; }
+      if (copied != VK_INCOMPLETE) break;
+    }
+    return cache_store::Produce::Failed;
+  }
+  cache_store::Produce produce_recipes(cache_store::Buffer& out) {
+    if (!recipes_ready_) return cache_store::Produce::Nothing;
+    std::lock_guard<std::mutex> lock(recipes_mutex_);
+    if (recipes_.empty() || recipes_.size() == recipes_saved_) return cache_store::Produce::Nothing;
+    recipes_saved_ = recipes_.size();
+    const uint32_t head[2] = {vk_recipes::kMagic, (uint32_t)std::min(recipes_.size(), kMaxRecipes)};
+    out.resize(sizeof head + head[1] * sizeof(Recipe));
+    std::memcpy(out.data(), head, sizeof head);
+    std::memcpy(out.data() + sizeof head, recipes_.data(), head[1] * sizeof(Recipe));
+    return cache_store::Produce::Write;
+  }
+  void remember_recipe(const Recipe& r) {   // render thread
+    {
+      std::lock_guard<std::mutex> lock(recipes_mutex_);
+      if (recipes_.size() >= kMaxRecipes) return;
+      recipes_.push_back(r);
+    }
+    if (recipes_ready_) cache_saver_.mark_dirty();
+  }
+
+  // ---- "Preparing graphics" while the prewarm compiles (progress_frame.h) ----
+  // A frame of its own between pipelines: solid clears only, so it needs nothing the prewarm is
+  // still building. It is not a game frame: no present counters or parity signals move.
+  progress_frame::Pacer progress_pacer_;
+  void show_progress(size_t done, size_t total) {
+    if (!progress_pacer_.due()) return;
+#ifdef _WIN32
+    // This thread owns the window (it made it, and pumps it between frames): a long prewarm keeps
+    // reading its messages, so Windows never marks the game Not Responding.
+    host::window_pump();
+#endif
+    if (!swapchain_ || swapchain_dirty_ || swap_images_.empty()) return;
+    slot_ = (slot_ + 1) % kFrames;
+    Frame_& f = frames_[slot_];
+    vkWaitForFences(device_, 1, &f.fence, VK_TRUE, UINT64_MAX);
+    uint32_t image = 0;
+    // Never waits for an image: a hidden or covered window may not give one back for a long time,
+    // and the prewarm must not slow down for a frame nobody sees.
+    const VkResult acquired = vkAcquireNextImageKHR(device_, swapchain_, 0, f.acquired, VK_NULL_HANDLE, &image);
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) { swapchain_dirty_ = true; return; }
+    if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return;   // not ready (hidden, minimized): skip this one
+    vkResetCommandPool(device_, f.commands, 0);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(f.cmd, &begin), "begin progress");
+    const VkImage target = swap_images_[image];
+    raw_barrier(f.cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    auto rgba = [](uint32_t c) {
+      VkClearValue v{};
+      v.color = {{((c >> 24) & 255) / 255.0f, ((c >> 16) & 255) / 255.0f, ((c >> 8) & 255) / 255.0f, (c & 255) / 255.0f}};
+      return v;
+    };
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = swap_views_[image]; color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.clearValue = rgba(progress_frame::kBackground);
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, swap_extent_}; info.layerCount = 1; info.colorAttachmentCount = 1; info.pColorAttachments = &color;
+    vkCmdBeginRendering(f.cmd, &info);
+    const auto rects = progress_frame::layout((int)swap_extent_.width, (int)swap_extent_.height, done, total);
+    // One clear call per colour, with all of that colour's rectangles.
+    for (uint32_t c : {progress_frame::kPanel, progress_frame::kTrack, progress_frame::kFill, progress_frame::kText, progress_frame::kDim}) {
+      std::vector<VkClearRect> clears;
+      for (const auto& r : rects)
+        if (r.rgba == c) clears.push_back({{{r.x, r.y}, {(uint32_t)r.w, (uint32_t)r.h}}, 0, 1});
+      if (clears.empty()) continue;
+      VkClearAttachment att{VK_IMAGE_ASPECT_COLOR_BIT, 0, rgba(c)};
+      vkCmdClearAttachments(f.cmd, 1, &att, (uint32_t)clears.size(), clears.data());
+    }
+    vkCmdEndRendering(f.cmd);
+    raw_barrier(f.cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    check(vkEndCommandBuffer(f.cmd), "end progress");
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    submit.waitSemaphoreCount = 1; submit.pWaitSemaphores = &f.acquired; submit.pWaitDstStageMask = &wait_stage;
+    submit.commandBufferCount = 1; submit.pCommandBuffers = &f.cmd;
+    submit.signalSemaphoreCount = 1; submit.pSignalSemaphores = &swap_done_[image];
+    vkResetFences(device_, 1, &f.fence);
+    check(vkQueueSubmit(queue_, 1, &submit, f.fence), "submit progress");
+    VkPresentInfoKHR p{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    p.waitSemaphoreCount = 1; p.pWaitSemaphores = &swap_done_[image];
+    p.swapchainCount = 1; p.pSwapchains = &swapchain_; p.pImageIndices = &image;
+    const VkResult presented = vkQueuePresentKHR(queue_, &p);
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR) swapchain_dirty_ = true;
   }
 
   void create_layouts() {
@@ -1648,7 +1819,7 @@ class VulkanBackend final : public Backend {
     }
   }
 
-  void end_frame(bool presented) {
+  void end_frame(bool presented, bool real_frame) {
     Frame_& f = frames_[slot_];
 #ifdef _WIN32
     fg_presenter_wait();
@@ -1671,11 +1842,14 @@ class VulkanBackend final : public Backend {
     const VkResult submitted = vkQueueSubmit(queue_, 1, &submit, f.fence);
     latency_marker(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
     if (submitted == VK_ERROR_DEVICE_LOST) {
+      cache_store::freeze();   // first: the saver must not write a cache read from a lost device
       // The driver lost the GPU (a Linux AMD player: "GPUVM fault" as every Training stage loaded, on
       // 0.9.93 and 0.9.95; OpenGL drew it). Counted as two failed starts: the next launch starts on the
       // default renderer (main.cpp) instead of losing the device again.
-      std::ofstream(shader_cache_dir() / "startup.pending", std::ios::binary) << 2;
-      host::log("vulkan: the GPU was lost; the next start uses the default renderer (pick Vulkan in the settings to try it again)");
+      if (!opts_.prewarm_only) {
+        std::ofstream(shader_cache_dir() / "startup.pending", std::ios::binary) << 2;
+        host::log("vulkan: the GPU was lost; the next start uses the default renderer (pick Vulkan in the settings to try it again)");
+      }
     }
     check(submitted, "submit");
     if (presented && acquired_) {
@@ -1712,6 +1886,13 @@ class VulkanBackend final : public Backend {
       if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || exclusive_lost(r)) swapchain_dirty_ = true;
       else if (r != VK_SUCCESS) check(r, "present");
       ++presented_;
+      if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        yougame::parity::signals.presented(real_frame);
+        if (real_frame) host::startup_first_frame();
+#ifndef _WIN32
+        host::window_presented(presented_);
+#endif
+      }
       if ((presented_ & 31) == 0) update_variable_refresh();
 #ifdef _WIN32
       if ((presented_ & 127) == 0) track_vblank();   // a move to another monitor restarts the clock there
@@ -1852,7 +2033,7 @@ class VulkanBackend final : public Backend {
                             VkPipelineLayout layout, VkFormat color, VkFormat depth,
                             VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
                             bool upscale_outputs = false, VkColorComponentFlags mvec_write = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT,
-                            VkColorComponentFlags hud_write = VK_COLOR_COMPONENT_R_BIT) {
+                            VkColorComponentFlags hud_write = VK_COLOR_COMPONENT_R_BIT, VkPipelineCreationFeedback* feedback = nullptr) {
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = topology;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -1875,6 +2056,9 @@ class VulkanBackend final : public Backend {
     dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = outputs; rendering.pColorAttachmentFormats = formats; rendering.depthAttachmentFormat = depth;
+    // Vulkan 1.3 core: whether the pipeline came out of the pipeline cache (for the cache_hits line).
+    VkPipelineCreationFeedbackCreateInfo feedback_info{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+    if (feedback) { *feedback = {}; feedback_info.pPipelineCreationFeedback = feedback; rendering.pNext = &feedback_info; }
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &rendering; info.stageCount = 2; info.pStages = stages; info.pVertexInputState = &vi;
     info.pInputAssemblyState = &ia; info.pViewportState = &vp; info.pRasterizationState = &rs; info.pMultisampleState = &ms;
@@ -1928,7 +2112,7 @@ class VulkanBackend final : public Backend {
       return VK_NULL_HANDLE;
     }
     VkPipeline p = game_pipeline(key, cached_module(key.vs, vs_hlsl, true), cached_module(key.ps, ps_hlsl, false));
-    if (recipes_.size() < kMaxRecipes) recipes_.push_back({key.vs, key.ps, spirv_hash(vs_hlsl, true), spirv_hash(ps_hlsl, false), key.state});
+    if (recipes_.size() < kMaxRecipes) remember_recipe({key.vs, key.ps, spirv_hash(vs_hlsl, true), spirv_hash(ps_hlsl, false), key.state, 0});
     return p;
   }
 
@@ -1937,23 +2121,38 @@ class VulkanBackend final : public Backend {
   // as on Direct3D 12 before its own prewarm. Each one the game builds is recorded with the SPIR-V
   // files of its two shaders; at the next start those are read back and built through the pipeline
   // cache. A recipe whose SPIR-V is gone (a cleared cache) is dropped.
-  using Recipe = vk_recipes::Recipe;   // the file format (vulkan_recipes.h, unit-tested)
+  // Recipe is declared with the cache saver above (vk_recipes::Recipe, the file format).
   static constexpr size_t kMaxRecipes = vk_recipes::kMax;
   std::vector<Recipe> recipes_;
 
   void prewarm_pipelines() {
+    prewarm_recipes();
+    // From here the recipe list is whole and may be saved. Nothing is written until a new pipeline
+    // arrives: the shipped recipes merged in below are read again at every start.
+    { std::lock_guard<std::mutex> lock(recipes_mutex_); recipes_saved_ = recipes_.size(); }
+    recipes_ready_ = true;
+    log_pipeline_stats("startup", cache_saver_.saved_bytes());
+  }
+  void prewarm_recipes() {
     // The player's own recipes, then the ones the release ships (vk_recipes.shipped.bin, from a warmed
     // run: tools/package_release.py). SPIR-V is the same on every GPU and driver, so a first session on
     // Vulkan builds the common pipelines before its first frame instead of compiling them mid-match.
     // The shipped file has its own name so an update never overwrites what the player's sessions saved.
     const std::vector<Recipe> saved = vk_recipes::merge({shader_cache_dir() / "vk_recipes.bin", shader_cache_dir() / "vk_recipes.shipped.bin"});
     if (saved.empty()) return;
+    // Another MSAA sample count or upscaling state than this session's draws to other images.
+    auto recipe_for_session = [&](const Recipe& r) {
+      return state_samples(r.state) == samples_ && ((r.state & kStateUpscaleOutputs) != 0) == upscaling_;
+    };
     const auto start = std::chrono::steady_clock::now();
-    size_t built = 0;
+    size_t built = 0, done = 0;
+    const size_t total = (size_t)std::count_if(saved.begin(), saved.end(), recipe_for_session);
+    progress_pacer_ = progress_frame::Pacer();
     for (const Recipe& r : saved) {
       const PipelineKey key{r.vs, r.ps, r.state};
-      // Another MSAA sample count than this session's draws to other images: kept for when it is used.
-      if (state_samples(r.state) != samples_ || ((r.state & kStateUpscaleOutputs) != 0) != upscaling_) { recipes_.push_back(r); continue; }
+      // Not this session's state (above): kept for when it is used.
+      if (!recipe_for_session(r)) { remember_recipe(r); continue; }
+      show_progress(done++, total);
       if (pipelines_.count(key)) continue;
       // Wireframe needs fillModeNonSolid, which a recipe saved on another GPU may have had.
       if (((r.state >> 18) & 1) && !wire_supported_) continue;
@@ -1965,16 +2164,11 @@ class VulkanBackend final : public Backend {
       else if (auto w = read_spirv(spirv_path(r.ps_spv, false)); !w.empty()) { pm = module(w); modules_.emplace(pk, pm); }
       if (!vm || !pm) continue;
       game_pipeline(key, vm, pm);
-      recipes_.push_back(r);
+      remember_recipe(r);
       ++built;
     }
     host::log("vulkan: prewarmed %zu pipelines from %zu recipes in %.1f ms", built, saved.size(),
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-  }
-
-  void save_pipeline_recipes() {
-    if (recipes_.empty()) return;
-    if (!vk_recipes::write(shader_cache_dir() / "vk_recipes.bin", recipes_)) host::log("vulkan: the pipeline recipes could not be saved");
   }
 
   // ---- The pipeline worker ----
@@ -2055,7 +2249,7 @@ class VulkanBackend final : public Backend {
       if (d.ps && !modules_.emplace(pk, d.ps).second) vkDestroyShaderModule(device_, d.ps, nullptr);
       if (!d.pipeline) { worker_failed_.insert(d.key); continue; }   // the next draw builds it here and says why
       if (!pipelines_.emplace(d.key, d.pipeline).second) { vkDestroyPipeline(device_, d.pipeline, nullptr); continue; }
-      if (recipes_.size() < kMaxRecipes) recipes_.push_back({d.key.vs, d.key.ps, d.vs_spv, d.ps_spv, d.key.state, 0});
+      if (recipes_.size() < kMaxRecipes) remember_recipe({d.key.vs, d.key.ps, d.vs_spv, d.ps_spv, d.key.state, 0});
     }
   }
 
@@ -2101,13 +2295,20 @@ class VulkanBackend final : public Backend {
                            (bits(s, 9, 1) ? VK_COLOR_COMPONENT_A_BIT : 0);
     static const VkCullModeFlags culls[] = {VK_CULL_MODE_NONE, VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT, VK_CULL_MODE_BACK_BIT};
     const bool wire_on = bits(s, 18, 1);
+    VkPipelineCreationFeedback feedback{};
     VkPipeline p = build_pipeline(stages, vi, bits(s, 17, 1) ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                                   wire_on ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, wire_on ? VK_CULL_MODE_NONE : culls[bits(s, 15, 2)],
                                   blend, bits(s, 10, 1), bits(s, 11, 1), compare[bits(s, 12, 3)], layout_,
                                   VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT, state_samples(s), (s & kStateUpscaleOutputs) != 0,
                                   // Motion vectors belong to the surface in the depth buffer: only draws that write depth write
                                   // them, so a translucent layer over a moving fighter does not replace its motion (gx_d3d12.cpp).
-                                  bits(s, 11, 1) ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT) : 0);
+                                  bits(s, 11, 1) ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT) : 0,
+                                  VK_COLOR_COMPONENT_R_BIT, &feedback);
+    // Counted here, the one place game pipelines are made (render thread and worker alike). Only a
+    // pipeline the cache did not already hold makes the cache worth saving again.
+    if (!(feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) { ++pipelines_unreported_; cache_dirty_ = true; cache_saver_.mark_dirty(); }
+    else if (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ++pipelines_hit_;
+    else { ++pipelines_compiled_; cache_dirty_ = true; cache_saver_.mark_dirty(); }
     return p;
   }
 
@@ -3450,11 +3651,15 @@ class VulkanBackend final : public Backend {
   vrr::Detector vrr_;
 #else
   uint64_t last_actual_present_ = 0;
+  std::array<std::pair<uint32_t, uint64_t>, 64> present_times_{};   // presentID, actualPresentTime
+  size_t present_times_next_ = 0;
   uint32_t timing_intervals_ = 0, timing_on_grid_ = 0, timing_line_intervals_ = 0, timing_line_on_grid_ = 0;
   double timing_window_start_ = 0;
   uint32_t timing_window_presents_ = 0;
   int timing_state_ = -1, timing_pending_ = -1, timing_votes_ = 0;
 #endif
+  // Last member, so it is destroyed first: its thread reads the pipeline cache and the recipes.
+  cache_store::Saver cache_saver_;
 };
 
 }  // namespace
@@ -3543,3 +3748,5 @@ Backend* create_vulkan_backend(const VulkanWindow& window, int client_w, int cli
 }
 
 }  // namespace gx
+
+#endif  // __APPLE__

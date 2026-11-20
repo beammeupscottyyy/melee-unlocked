@@ -17,10 +17,15 @@
 #include <nlohmann/json.hpp>
 #include <onnxruntime_c_api.h>
 
+namespace yougame { bool active(); }   // yougame_link.h: launched by the YouGame desktop app
+
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include <limits.h>
 #include <unistd.h>
 #endif
@@ -65,6 +70,11 @@ std::string exe_dir() {
   char exe[MAX_PATH] = {};
   GetModuleFileNameA(nullptr, exe, MAX_PATH);
   std::string dir(exe);
+#elif defined(__APPLE__)
+  // macOS has no /proc: without this the runtime and ProAI were looked for in the working directory.
+  char exe[PATH_MAX] = {};
+  uint32_t size = sizeof exe;
+  std::string dir(_NSGetExecutablePath(exe, &size) == 0 ? std::string(exe) : std::string("/nonexistent/x"));
 #else
   char exe[PATH_MAX] = {};
   const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
@@ -247,6 +257,9 @@ void fetch_worker() {
 
 void fetch_later(const Entry& e, bool retry = false) {
   static const bool off = std::getenv("MELEE_PRO_AI_NO_DOWNLOAD") != nullptr;
+  // Never inside the YouGame app: its builds ship no catalog, and one dropped beside the game (a mod or
+  // a pack) must not start downloads until the catalog is part of the verified build.
+  if (yougame::active()) return;
   // Two places only: Phillip's published models (a pinned Hugging Face commit) and this game's own
   // content release, which holds the policies trained here.
   const bool known_source = e.source.rfind("https://huggingface.co/vladfi/phillip-models/resolve/", 0) == 0 ||

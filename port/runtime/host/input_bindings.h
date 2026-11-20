@@ -630,6 +630,7 @@ struct PortSource {
 // window and the input preview use this same configured-route fallback policy.
 struct InputDeviceFacts {
   bool xinput[4]{}, ds4[4]{}, gc[4]{}, switch_pro[4]{}, hid[4]{};
+  bool skip_xinput_fallback[4]{}; // Automatic P1 only; explicit routes stay connected.
 };
 inline bool input_device_connected(PortSource source, const InputDeviceFacts& facts) {
   if (source.kind == DeviceKind::Keyboard) return true;
@@ -655,6 +656,7 @@ inline PortSource effective_port_source(const std::array<PortSource, 4>& sources
   for (DeviceKind kind : order) for (int index = 0; index < 4; ++index) {
     const PortSource candidate{kind, index};
     if (!input_device_connected(candidate, facts)) continue;
+    if (port == 0 && kind == DeviceKind::XInputPad && facts.skip_xinput_fallback[index]) continue;
     bool routed = false;
     for (const PortSource assigned : sources)
       if (assigned.kind == kind && assigned.index == index) { routed = true; break; }
@@ -693,6 +695,25 @@ inline std::array<PortSource, 4> default_port_sources() {
 }
 
 extern std::array<PortSource, 4> g_port_sources;
+
+// Which port (1-4) a device plays as, given what fed each port on the last poll (`feeding`, port 1's
+// spare-pad fallback included); 0 when it plays as none.
+inline int port_playing(const PortSource (&feeding)[4], PortSource device) {
+  for (int port = 0; port < 4; ++port)
+    if (feeding[port].kind == device.kind && (device.kind == DeviceKind::Keyboard || feeding[port].index == device.index))
+      return port + 1;
+  return 0;
+}
+// The port offered to a plugged-in pad that plays as none (the settings' "Play as P2"): the first port
+// with nothing plugged in feeding it, -1 when all four have a controller. Only offered, never taken on
+// its own: ports 2 to 4 do not fall back to spare pads like port 1, because one physical pad can be
+// listed twice (Steam's Xbox copy of a PlayStation pad, a box as HID and as XInput), and a spare-pad
+// fallback would make the copy a second, mirrored player.
+inline int open_port_for_pad(const PortSource (&feeding)[4], const InputDeviceFacts& facts) {
+  for (int port = 0; port < 4; ++port)
+    if (feeding[port].kind == DeviceKind::None || !input_device_connected(feeding[port], facts)) return port;
+  return -1;
+}
 
 // ---- rebind capture ----
 

@@ -90,6 +90,25 @@ int dolphin_folder_as_root(const fs::path& root) {
   return 0;
 }
 
+// macOS (com.project-slippi.dolphin): stable keeps Slippi/user.json at the root, mainline keeps
+// netplay<beta>/User/Slippi/user.json one folder down. Linux mainline: slippi-dolphin/netplay<beta>/Slippi.
+int mac_and_mainline_folders(const fs::path& root) {
+  const fs::path local = root / "MU" / "User" / "Slippi";
+  const fs::path mac = root / "Library" / "Application Support" / "com.project-slippi.dolphin";
+  write(mac / "netplay-beta" / "User" / "Slippi" / "user.json", profile("Mac beta", "MACB#1"));
+  auto found = slippi::account::resolve(local, {mac});
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "MACB#1");
+  write(mac / "Slippi" / "user.json", profile("Mac stable", "MACS#1"));
+  found = slippi::account::resolve(local, {mac});
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "MACS#1");
+  const fs::path linux_mainline = root / "config" / "slippi-dolphin";
+  write(linux_mainline / "netplay" / "Slippi" / "user.json", profile("Linux mainline", "LNXM#1"));
+  found = slippi::account::resolve(local, {linux_mainline});
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "LNXM#1");
+  fs::remove_all(root);
+  return 0;
+}
+
 int main() {
   const fs::path root = fs::current_path() / ("slippi-login-fixture-" + std::to_string(_getpid()));
   // The folder is named after this process and removed at the end. A run that died left its folder
@@ -99,6 +118,7 @@ int main() {
   struct Cleanup { fs::path folder; ~Cleanup() { std::error_code ec; fs::remove_all(folder, ec); } } cleanup{root};
   if (const int failed = moved_build_and_reasons(root / "moved")) return failed;
   if (const int failed = dolphin_folder_as_root(root / "dolphin")) return failed;
+  if (const int failed = mac_and_mainline_folders(root / "mac")) return failed;
   CHECK(!fs::exists(root / "moved"));
   fs::remove_all(root);
   const fs::path local = root / "MU" / "User" / "Slippi";

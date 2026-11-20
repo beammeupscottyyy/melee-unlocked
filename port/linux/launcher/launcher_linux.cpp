@@ -612,31 +612,10 @@ void yougame_line() {
   ImGui::SameLine();
   if (ImGui::SmallButton("Open YouGame")) open_path(launcher::yougame::game_page());
   if (ImGui::BeginPopupModal("Connect YouGame", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-    static char email[256], pass[256];
-    ImGui::TextUnformatted("Sign in with your YouGame account. Your password goes only to YouGame.");
-    ImGui::InputText("Email", email, sizeof email);
-    ImGui::InputText("Password", pass, sizeof pass, ImGuiInputTextFlags_Password);
-    { std::lock_guard<std::mutex> lock(g_yg_mutex); if (!g_yg_status.empty()) ImGui::TextWrapped("%s", g_yg_status.c_str()); }
-    ImGui::BeginDisabled(g_yg_busy.load());
-    if (ImGui::Button("Sign in") && email[0] && pass[0]) {
-      g_yg_busy = true;
-      { std::lock_guard<std::mutex> lock(g_yg_mutex); g_yg_status = "Signing in..."; }
-      std::thread([e = std::string(email), p = std::string(pass)] {
-        std::string why;
-        const bool ok = launcher::yougame::sign_in(e, p, &why);
-        std::lock_guard<std::mutex> lock(g_yg_mutex);
-        g_yg_status = ok ? "" : why;
-        g_yg_busy = false;
-      }).detach();
-      std::memset(pass, 0, sizeof pass);
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button("Close") || launcher::yougame::account().signed_in) { std::memset(pass, 0, sizeof pass); ImGui::CloseCurrentPopup(); }
-    // yougame.co in the browser, never the app
-    if (ImGui::SmallButton("Create an account")) open_path(launcher::yougame::signup_page());
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Forgot password")) open_path(launcher::yougame::reset_page());
+    // The only YouGame sign-in is YouGame's own page in a browser view the launcher owns (Windows today;
+    // here that will be a WebKitGTK view). Until it is built there is nothing to sign in with on Linux.
+    ImGui::TextUnformatted("Signing in to YouGame from this launcher is not on Linux yet.");
+    if (ImGui::Button("Close")) ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
   }
   if (g_yg_save.exchange(false)) save_ini();

@@ -19,6 +19,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <sddl.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <intrin.h>
@@ -52,6 +53,7 @@
 #include "launcher_lobby.h"
 #include "launcher_lobby_p2p.h"
 #include "launcher_yougame.h"
+#include "launcher_yougame_web.h"   // raise_sign_in: Connect pressed while the sign-in window is open
 #include "launcher_theme.h"
 #include "launcher_replay_data.h"
 #include "launcher_trace_view.h"
@@ -94,6 +96,8 @@ const UINT WM_APP_BUILD_DONE = WM_APP + 2;
 const UINT WM_APP_GAME_DONE = WM_APP + 3;
 const UINT WM_APP_CACHE_WARM_DONE = WM_APP + 4;
 const UINT WM_APP_YOUGAME = WM_APP + 52;
+const UINT WM_APP_YOUGAME_WEB = WM_APP + 53;   // YouGame's sign-in window is done: wParam signed in, lParam heap std::string* why not
+const UINT WM_APP_YOUGAME_CONNECT = WM_APP + 54;   // test runs only (MELEE_LAUNCHER_TEST_YG_CONNECT_MS): YouGame's Connect pressed
 const UINT WM_APP_GAME_DISC = WM_APP + 61;   // lParam: heap std::string*, the 1.02 disc unpacked from an RVZ/WIA   // the YouGame session changed: save launcher.ini, repaint
 
 // Client area in layout units; S() turns these into pixels for the current DPI.
@@ -216,6 +220,20 @@ void invalidate(RECT r) { if (g_main) InvalidateRect(g_main, &r, FALSE); }
 void log_line(const char* fmt, ...) {
   char buf[4096]; va_list ap; va_start(ap, fmt); std::vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
   PostMessageW(g_main, WM_APP_LOG, 0, (LPARAM) new std::string(std::string(buf) + "\r\n"));
+  // YouGame's lines also go to launcher-yougame.log beside the launcher (what Connect and the start did, step by
+  // step), started again when it passes 256 KB.
+  if (std::strncmp(buf, "yougame", 7) == 0 && !g_dir.empty()) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    const std::string path = g_dir + "\\launcher-yougame.log";
+    const char* mode = "ab";
+    if (FILE* probe = std::fopen(path.c_str(), "rb")) { std::fseek(probe, 0, SEEK_END); if (std::ftell(probe) > 256 * 1024) mode = "wb"; std::fclose(probe); }
+    if (FILE* f = std::fopen(path.c_str(), mode)) {
+      SYSTEMTIME t; GetLocalTime(&t);
+      std::fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d %s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, buf);
+      std::fclose(f);
+    }
+  }
 }
 
 std::string repo_root();   // defined below; load_ini looks for a disc beside a source checkout
@@ -517,6 +535,25 @@ std::string replay_dir_for_game() {
   return unsaved_replay_dir();
 }
 
+// The game builds two Sys files from the player's disc on its first start and never writes them
+// inside its own folder (sysgen.cpp: "generated data must be outside the build directory"). With
+// only --user-dir it would put them under this folder's User, so the current version gets a data
+// folder of its own in %LOCALAPPDATA%, the same one MeleeUnlocked.bat uses. An older version from
+// Versions keeps its own arguments.
+std::string sysgen_data_arg(const std::string& exe) {
+#ifdef MELEE_NO_SLIPPI
+  (void)exe;
+  return "";
+#else
+  const std::string name = exe.substr(exe.find_last_of("\\/") + 1);
+  if (!g_active_version.empty() || name.rfind("melee_source", 0) != 0) return "";
+  wchar_t local[MAX_PATH]{};
+  const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return "";
+  return " --sysgen-data-dir \"" + narrow(local) + "\\MeleeUnlocked-YouGame\"";
+#endif
+}
+
 std::string game_args() {
   std::string base = active_dir();
   std::string a = " --iso \"" + g_iso + "\" --threaded-renderer --settings-path \"" + settings_ini_path() + "\"";
@@ -526,9 +563,38 @@ std::string game_args() {
     a += " --sys-dir \"" + base + "\\Sys\" --replay-dir \"" + replay_dir_for_game() + "\" --card-dir \"" + g_dir + "\\User\\GC\\CardA\"";
 #else
   if (file_exists(base + "\\Sys\\codehandler.bin"))
-    a += " --sys-dir \"" + base + "\\Sys\" --user-dir \"" + g_dir + "\\User\\Slippi\" --replay-dir \"" + replay_dir_for_game() + "\" --card-dir \"" + g_dir + "\\User\\GC\\CardA\"";
+    a += " --sys-dir \"" + base + "\\Sys\" --user-dir \"" + g_dir + "\\User\\Slippi\" --replay-dir \"" + replay_dir_for_game() + "\" --card-dir \"" + g_dir + "\\User\\GC\\CardA\"" + sysgen_data_arg(g_game_exe);
 #endif
   return a;
+}
+
+// The YouGame app's plugin channel for this Windows user: the named pipes the game itself looks for
+// (yougame_channel.cpp, pipe_name: \\.\pipe\yougame-[staging-]sdk-v1-<user SID>). Only whether one
+// exists: WaitNamedPipe with a 1 ms wait never connects, so the app sees nothing and the game still
+// runs every check of its own when it connects. Returns which app answers ("YouGame" or "YouGame
+// staging"), or "" when neither does. The pipe name holds the user's SID, so it is not logged.
+std::string yougame_app_channel() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return "";
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  std::vector<BYTE> user(size);
+  const bool ok = size && GetTokenInformation(token, TokenUser, user.data(), size, &size);
+  CloseHandle(token);
+  if (!ok) return "";
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) return "";
+  const std::wstring sid_text = sid;
+  LocalFree(sid);
+  for (const bool staging : {false, true}) {
+    const std::wstring name = std::wstring(L"\\\\.\\pipe\\yougame-") + (staging ? L"staging-" : L"") + L"sdk-v1-" + sid_text;
+    const BOOL free_instance = WaitNamedPipeW(name.c_str(), 1);
+    const DWORD error = GetLastError();
+    // ERROR_SEM_TIMEOUT: the pipe exists and every instance is busy with another game.
+    if (free_instance || error == ERROR_SEM_TIMEOUT || error == ERROR_PIPE_BUSY)
+      return staging ? "YouGame staging" : "YouGame";
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------- painting helpers
@@ -663,10 +729,38 @@ int build_seg_at(POINT p) {
   }
   return -1;
 }
-RECT slippi_text_rect() { return LR(CX + 15, 212, 319, 34); }
+// The Play page's status area (owner 11-18: a real checkbox, no cut-off text, even spacing): one even
+// list (a dot, then text, every row on the same pitch), the YouGame extension as a drawn checkbox on its
+// own row, links in one style, then the notice and the buttons. MELEE_LAUNCHER_OLD_STATUS=1 (test runs
+// only) draws the earlier layout for a before/after capture.
+bool ui_fix_status() {
+  static const bool on = !(g_launcher_test && std::getenv("MELEE_LAUNCHER_OLD_STATUS"));
+  return on;
+}
+bool vanilla_active();
+// Rows of the Play page's status area, in unscaled units (y of each row's text).
+struct PlayLayout { int slippi_y, slippi_h, version_y, mods_y, yg_y, ext_y, sep_y, note_y, buttons_y; };
+PlayLayout play_layout() {
+  PlayLayout l{212, 34, 236, 260, 284, 0, 306, 314, 348};
+  if (!ui_fix_status()) return l;
+  const int pitch = 24;   // every row: 17 of text, 7 of air
+  int y = 210;
+  // Owner 11-19: Version, Slippi, YouGame, its extension option, then Mods.
+  l.version_y = y; y += pitch;
+  l.slippi_y = y;
+  l.slippi_h = g_slippi_missing && !vanilla_active() ? 34 : 17;   // the account notice wraps to two lines beside its button
+  y += l.slippi_h + (pitch - 17);
+  if (!vanilla_active()) { l.yg_y = y; y += pitch; l.ext_y = y; y += pitch; }
+  l.mods_y = y; y += pitch;
+  l.sep_y = y + 1;
+  l.note_y = l.sep_y + 9;
+  l.buttons_y = l.note_y + 32 + 8;
+  return l;
+}
+RECT slippi_text_rect() { const PlayLayout l = play_layout(); return LR(CX + 15, l.slippi_y, 319, l.slippi_h); }
 // Where the account line is, Vanilla shows its one choice instead: the box and its label.
-RECT vanilla_check_rect() { return LR(CX, 212, 330, 22); }
-RECT version_text_rect() { return LR(CX + 15, 236, 319, 24); }
+RECT vanilla_check_rect() { return LR(CX, play_layout().slippi_y, 330, 22); }
+RECT version_text_rect() { const PlayLayout l = play_layout(); return LR(CX + 15, l.version_y, 319, ui_fix_status() ? 17 : 24); }
 RECT drop_sub_rect() { return LR(CX, 86, CW, 20); }
 
 const wchar_t* HINT_TEXT =
@@ -829,8 +923,12 @@ void paint_rail(HDC dc) {
 }
 
 // The YouGame line on the Play page: the account, then Connect or Disconnect, then Open YouGame (the
-// Melee Unlocked page on the YouGame site, in the browser). The two links' rectangles are kept for clicks.
-RECT g_yg_link[2] = {};
+// installed YouGame app at Melee Unlocked's page, or the site's page without the app). The two links' rectangles are kept for clicks.
+RECT g_yg_link[3] = {};   // Connect/Disconnect, Open YouGame, the extension checkbox
+std::atomic<bool> g_yg_connecting{false};   // Connect is asking the YouGame app or showing the sign-in window
+std::atomic<bool> g_yg_start_check{false};   // the launcher's own check at start runs (it holds g_yg_connecting)
+bool g_yg_connect_queued = false;            // Connect pressed meanwhile: it runs once that check is done
+uint64_t g_yg_closed_at = 0;                // GetTickCount64 when the sign-in window last closed
 bool g_yg_hot = false;
 void paint_yougame_line(HDC dc) {
 #ifdef MELEE_YOUGAME_COMING_SOON
@@ -838,12 +936,70 @@ void paint_yougame_line(HDC dc) {
   dot(dc, CX, 287, C_FAINT);
   draw_text(dc, launcher::lang::txw(L"YouGame online: coming soon"), LR(CX + 15, 284, CW - 15, 17), g_font, C_DIM,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-  g_yg_link[0] = g_yg_link[1] = RECT{};
+  g_yg_link[0] = g_yg_link[1] = g_yg_link[2] = RECT{};
   return;
 #endif
-  const launcher::yougame::Account a = launcher::yougame::account();
+  launcher::yougame::Account a = launcher::yougame::account();
+  // Test runs only: the line as it reads for a signed-in account ("name:code"), for layout captures.
+  if (const char* show = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_YG_SHOW") : nullptr) {
+    const std::string who = show;
+    const size_t colon = who.find(':');
+    a.signed_in = true; a.name = who.substr(0, colon); a.code = colon == std::string::npos ? "" : who.substr(colon + 1);
+  }
+  if (ui_fix_status()) {
+    // The account, then its two links; the account name gives way (an ellipsis) before a link would.
+    const PlayLayout l = play_layout();
+    const std::wstring account = a.signed_in ? L"YouGame: " + widen(a.name) + (a.code.empty() ? L"" : L" (" + widen(a.code) + L")")
+                                             : launcher::lang::txw(g_yg_connecting ? L"YouGame: connecting..." : L"YouGame: not connected");
+    // The YouGame app's account while YouGame does not list this build: Connect (the launcher's own sign-in,
+    // which the game needs to play this build) instead of Disconnect.
+    const bool app_needs_web = a.app && !launcher::yougame::listed_current();
+    const std::wstring link0 = launcher::lang::txw(a.signed_in && !app_needs_web ? L"Disconnect" : L"Connect"), link1 = launcher::lang::txw(L"Open YouGame");
+    dot(dc, CX, l.yg_y + 3, a.signed_in ? C_OK : C_FAINT);
+    HGDIOBJ old_font = SelectObject(dc, g_font);
+    auto width = [&](const std::wstring& s) { SIZE z{}; GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &z); return (int)z.cx; };
+    const std::wstring bar = L"   |   ";
+    const RECT row = LR(CX + 15, l.yg_y, CW - 15, 17);
+    const int links = width(bar) * 2 + width(link0) + width(link1);
+    int x = row.left;
+    auto put = [&](const std::wstring& s, COLORREF c, int most) {
+      RECT r{x, row.top, x + std::min(width(s), most), row.bottom};
+      draw_text(dc, s, r, g_font, c, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+      x = r.right;
+      return r;
+    };
+    put(account, C_DIM, std::max<int>(S(40), row.right - row.left - links));
+    put(bar, C_FAINT, 9999);
+    g_yg_link[0] = put(link0, C_TEXT, 9999);
+    put(bar, C_FAINT, 9999);
+    g_yg_link[1] = put(link1, C_TEXT, 9999);
+    SelectObject(dc, old_font);
+    // Its own row: a drawn box (the Vanilla choice's box), then the label; the whole row is the target.
+    const bool on = launcher::yougame::extension();
+    const std::wstring label = launcher::lang::txw(L"Launch with YouGame extension");
+    // Owner 11-19: in line with the status dots above (centred on their column), the label with their text.
+    // A 12 box on the same centre as the dots (x CX + 4, y row + 7), so the column lines up exactly.
+    RECT box{S(CX - 2), S(l.ext_y + 1), S(CX + 10), S(l.ext_y + 13)};
+    round_rect(dc, box, 3, C_FIELD, C_FIELD, on ? C_ACC_HI : C_BTN_BORDER);
+    if (on) {
+      HPEN pen = CreatePen(PS_SOLID, S(2), C_ACC_HI);
+      HGDIOBJ old_pen = SelectObject(dc, pen);
+      MoveToEx(dc, box.left + S(2), box.top + S(6), nullptr);
+      LineTo(dc, box.left + S(5), box.bottom - S(3));
+      LineTo(dc, box.right - S(2), box.top + S(2));
+      SelectObject(dc, old_pen); DeleteObject(pen);
+    }
+    RECT text = LR(CX + 15, l.ext_y, CW - 15, 17);
+    draw_text(dc, label, text, g_font, on ? C_TEXT : C_DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    old_font = SelectObject(dc, g_font);
+    g_yg_link[2] = RECT{box.left, text.top, std::min<LONG>(text.left + width(label), text.right), text.bottom};
+    // Ticked: the game is on the YouGame app's channel for the extension, and its matches still go through the
+    // launcher (launch_game_now). No note beside the box (owner 11-20: it read as wrong).
+    SelectObject(dc, old_font);
+    return;
+  }
   std::wstring base = a.signed_in ? L"YouGame: " + widen(a.name) + (a.code.empty() ? L"" : L" (" + widen(a.code) + L")")
-                                  : launcher::lang::txw(L"YouGame: not connected");
+                                  : launcher::lang::txw(g_yg_connecting ? L"YouGame: connecting..." : L"YouGame: not connected");
   dot(dc, CX, 287, a.signed_in ? C_OK : C_FAINT);
   const RECT line = LR(CX + 15, 284, CW - 15, 17);
   HGDIOBJ old = SelectObject(dc, g_font);
@@ -861,10 +1017,35 @@ void paint_yougame_line(HDC dc) {
   g_yg_link[0] = put(launcher::lang::txw(a.signed_in ? L"Disconnect" : L"Connect"), C_TEXT);
   put(L"  |  ", C_FAINT);
   g_yg_link[1] = put(launcher::lang::txw(L"Open YouGame"), C_TEXT);
+  put(L"  |  ", C_FAINT);
+  // Launch with the YouGame extension (off by default): the game uses the YouGame app in the background
+  // (its sign-in and its controller layer) instead of connecting by itself.
+  const bool ext = launcher::yougame::extension();
+  g_yg_link[2] = put((ext ? L"[x] " : L"[  ] ") + launcher::lang::txw(L"Launch with YouGame extension"), ext ? C_TEXT : C_DIM);
   SelectObject(dc, old);
 }
 
+// The Play page's buttons that sit in or under the status rows, put where play_layout has them
+// (preview "4" only: the rows move when the account notice takes two lines or one).
+void place_play_children() {
+  if (!ui_fix_status() || !g_main) return;
+  const PlayLayout l = play_layout();
+  auto move = [](HWND w, int y, int h) {
+    if (!w) return;
+    RECT r{}; GetWindowRect(w, &r); MapWindowPoints(nullptr, g_main, reinterpret_cast<POINT*>(&r), 2);
+    if (r.top == S(y) && r.bottom - r.top == S(h)) return;
+    SetWindowPos(w, nullptr, r.left, S(y), r.right - r.left, S(h), SWP_NOZORDER | SWP_NOACTIVATE);
+  };
+  move(g_slippi_btn, l.slippi_y + 2, 30);
+  move(g_update_btn, l.version_y - 4, 25);
+  move(g_versions_btn, l.buttons_y, 32);
+  move(g_lang_btn, l.buttons_y, 32);
+  move(GetDlgItem(g_main, ID_THEME), l.buttons_y, 32);
+  move(GetDlgItem(g_main, ID_SEND_LOGS), l.buttons_y, 32);
+}
+
 void paint_play(HDC dc) {
+  place_play_children();
   draw_text(dc, L"MELEE NTSC 1.02 DISC IMAGE", LR(CX, 32, CW, 18), g_font_label, C_FAINT,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER, S(1));
   round_rect(dc, LR(CX, 58, 380, 34), 7, C_FIELD, C_FIELD, C_FIELD_BORDER);
@@ -912,27 +1093,57 @@ void paint_play(HDC dc) {
     draw_text(dc, launcher::lang::txw(L"Game's own code only (no UCF, nothing unlocked)"), label, g_font_small, C_DIM,
               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
   } else {
-    dot(dc, CX, 215, g_slippi_missing ? C_WARN : C_OK);   // centred on the first line of slippi_text_rect
+    dot(dc, CX, play_layout().slippi_y + 3, g_slippi_missing ? C_WARN : C_OK);   // centred on the first line of slippi_text_rect
     draw_text(dc, widen(g_slippi_line), slippi_text_rect(), g_font, C_DIM, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
   }
 
+  const PlayLayout rows = play_layout();
+  const std::string mods_line = mod_manager::summary();
+  if (ui_fix_status()) {
+    // One row style: dim words, a faint bar, then the row's link in the text colour (as the YouGame row).
+    auto row = [&](int y, const std::wstring& words, const std::wstring& link, int most) {
+      HGDIOBJ old_font = SelectObject(dc, g_font);
+      auto width = [&](const std::wstring& t) { SIZE z{}; GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &z); return (int)z.cx; };
+      const std::wstring bar = L"   |   ";
+      const RECT line = LR(CX + 15, y, most, 17);
+      const int w_words = width(words), w_bar = width(bar), w_link = width(link);
+      const int tail = link.empty() ? 0 : w_bar + w_link;
+      SelectObject(dc, old_font);
+      RECT r{line.left, line.top, line.left + std::min<int>(w_words, line.right - line.left - tail), line.bottom};
+      draw_text(dc, words, r, g_font, C_DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+      if (link.empty()) return;
+      RECT b{r.right, line.top, r.right + w_bar, line.bottom};
+      draw_text(dc, bar, b, g_font, C_FAINT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+      RECT k{b.right, line.top, b.right + w_link, line.bottom};
+      draw_text(dc, link, k, g_font, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    };
+    // The version line arrives whole ("Version 0.9.216. | What's new"): its last part is the link.
+    std::wstring version = launcher::lang::txw(widen(g_version_line).c_str()), version_link;
+    if (const size_t bar = version.rfind(L" | "); bar != std::wstring::npos) { version_link = version.substr(bar + 3); version.resize(bar); }
+    // "Version 0.9.990" before its link: no trailing spaces or full stop ahead of the bar.
+    while (!version_link.empty() && !version.empty() && (version.back() == L' ' || version.back() == L'.')) version.pop_back();
+    dot(dc, CX, rows.version_y + 3, g_version_dot);
+    row(rows.version_y, version, version_link, 319);
+    dot(dc, CX, rows.mods_y + 3, mods_line == launcher::lang::tx("Mods: none active") ? C_FAINT : C_OK);
+    row(rows.mods_y, widen(mods_line), launcher::lang::txw(L"Open Mods folder"), CW - 15);
+  } else {
   dot(dc, CX, 239, g_version_dot);   // centred on the first line of version_text_rect
   draw_text(dc, widen(g_version_line), version_text_rect(), g_font, C_DIM, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
 
   // Same shape as the account and version lines: a dot, then dim text. Green dot while a mod is on.
-  const std::string mods_line = mod_manager::summary();
   dot(dc, CX, 263, mods_line == launcher::lang::tx("Mods: none active") ? C_FAINT : C_OK);
   draw_text(dc, widen(mods_line + " | " + launcher::lang::tx("Open Mods folder")), LR(CX + 15, 260, CW - 15, 17), g_font, C_DIM, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+  }
   if (!vanilla_active()) paint_yougame_line(dc);
-  RECT sep = LR(CX, 306, CW, 1);
+  RECT sep = LR(CX, rows.sep_y, CW, 1);
   fill(dc, sep, C_SEP);
   // No game disc yet: Play stays grey, and a Melee ISO put in the Mods folder reads as an active mod
   // (a report, 11-11: the player had only done that). Say what is missing where the hint goes.
   if (g_iso.empty())
     draw_text(dc, launcher::lang::txw(L"No Melee disc chosen yet: press Browse and pick your Melee NTSC 1.02 ISO. A disc in the Mods folder only loads as a mod."),
-              LR(CX, 314, CW, 32), g_font_small, C_WARN, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+              LR(CX, rows.note_y, CW, 32), g_font_small, C_WARN, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
   else
-    draw_text(dc, HINT_TEXT, LR(CX, 314, CW, 32), g_font_small, C_FAINT, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+    draw_text(dc, HINT_TEXT, LR(CX, rows.note_y, CW, 32), g_font_small, C_FAINT, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
   std::string version_status = g_active_version.empty() ? "" : launcher::lang::fill(launcher::lang::tx("Playing {version}"), launcher::lang::Args{{"version", g_active_version}});
   if (!version_status.empty() && !vanilla_supported()) version_status += ". " + launcher::lang::tx("Vanilla needs 0.9.17 or newer");
   bool status_bad = host::updater::rollback_state() == host::updater::RollbackState::Failed;
@@ -950,7 +1161,7 @@ void paint_play(HDC dc) {
     version_status = host::updater::dlss5_model_message();
     status_bad = host::updater::dlss5_model_state(g_dir) == host::updater::ModelState::Failed;
   }
-  draw_text(dc, widen(version_status), LR(398, 348, 188, 32), g_font_small, status_bad ? C_BAD : C_DIM,
+  draw_text(dc, widen(version_status), LR(398, rows.buttons_y, 188, 32), g_font_small, status_bad ? C_BAD : C_DIM,
             DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 }
 
@@ -1050,93 +1261,97 @@ std::string yougame_restart_older(const launcher::yougame::Allowed& older, const
   g_yg_restart_mode = mode;
   return std::string();
 }
-HWND g_yg_signin = nullptr, g_yg_email = nullptr, g_yg_pass = nullptr, g_yg_status = nullptr, g_yg_ok = nullptr;
-bool g_yg_busy = false;
-LRESULT CALLBACK yougame_signin_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-  switch (m) {
-    case WM_COMMAND:
-      if (LOWORD(w) == IDOK && !g_yg_busy) {
-        wchar_t email[256]{}, pass[256]{};
-        GetWindowTextW(g_yg_email, email, 255);
-        GetWindowTextW(g_yg_pass, pass, 255);
-        if (!email[0] || !pass[0]) { SetWindowTextW(g_yg_status, launcher::lang::txw(L"Enter your YouGame email and password.").c_str()); return 0; }
-        g_yg_busy = true;
-        EnableWindow(g_yg_ok, FALSE);
-        SetWindowTextW(g_yg_status, launcher::lang::txw(L"Signing in...").c_str());
-        std::thread([h, e = narrow(email), p = narrow(pass)] {
-          std::string why;
-          const bool ok = launcher::yougame::sign_in(e, p, &why);
-          PostMessageW(h, WM_APP + 1, ok, (LPARAM)new std::string(why));
-        }).detach();
-        SecureZeroMemory(pass, sizeof pass);
-      } else if (LOWORD(w) == IDCANCEL) {
-        DestroyWindow(h);
-      } else if (LOWORD(w) == 102 || LOWORD(w) == 103) {   // yougame.co in the browser, never the app
-        const std::string url = LOWORD(w) == 102 ? launcher::yougame::signup_page() : launcher::yougame::reset_page();
-        ShellExecuteW(nullptr, L"open", widen(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-      }
-      return 0;
-    case WM_APP + 1: {
-      std::unique_ptr<std::string> why((std::string*)l);
-      g_yg_busy = false;
-      if (w) { DestroyWindow(h); return 0; }
-      SetWindowTextW(g_yg_status, widen(*why).c_str());
-      SetWindowTextW(g_yg_pass, L"");
-      EnableWindow(g_yg_ok, TRUE);
-      return 0;
+bool g_yg_again = false;     // the sign-in window opens because YouGame ended the earlier sign-in
+bool g_yg_reopen = false;    // ...once the game that is running has closed
+// This build's version as the YouGame app's channel hears it in a hello (as set_build names it).
+std::string yougame_build_version() {
+  return g_active_version.empty() ? std::string(MELEE_PORT_VERSION) : g_active_version.substr(0, g_active_version.find('-'));
+}
+// Connect's work, off the window thread (the caller set g_yg_connecting; this clears it and posts
+// WM_APP_YOUGAME_WEB). 1: the launcher's own saved sign-in, asked through the hidden view. 2 (use_app): the
+// YouGame app's account, the app started quietly when installed and not running; enough on its own only while
+// YouGame lists this build (the app refuses searches for a build it does not list). 3: YouGame's sign-in page
+// in the launcher's window, titled with why when the app's account was not enough.
+void yougame_sign_in_thread(bool use_app) {
+  const std::string no_webview = narrow(launcher::lang::txw(L"Signing in to YouGame needs Microsoft Edge WebView2, which this computer does not have. Install it from Microsoft (it is free), then press Connect again."));
+  const std::wstring unlisted = launcher::lang::txw(L"YouGame has not listed this version yet: sign in here once to play it now.");
+  std::thread([use_app_asked = use_app, again = g_yg_again, version = yougame_build_version(), no_webview, unlisted] {
+    if (launcher::yougame::resume_web()) {
+      log_line("yougame: Connect: the launcher's own saved sign-in answered signed in");
+      g_yg_connecting = false;
+      PostMessageW(g_main, WM_APP_YOUGAME_WEB, 1, (LPARAM)new std::string());
+      return;
     }
-    case WM_CTLCOLORSTATIC: SetBkMode((HDC)w, TRANSPARENT); return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
-    case WM_CLOSE: DestroyWindow(h); return 0;
-    case WM_DESTROY:
-      EnableWindow(g_main, TRUE);
-      SetForegroundWindow(g_main);
-      g_yg_signin = nullptr;
-      return 0;
-  }
-  return DefWindowProcW(h, m, w, l);
+    std::wstring title;
+    // Owner 11-19: while YouGame does not list this build nothing of the YouGame app runs: it is never started
+    // or asked (a running app overlays any Melee Unlocked window); the launcher's own sign-in is the way.
+    bool use_app = use_app_asked;
+    if (use_app && !launcher::yougame::listed_current()) {
+      use_app = false;
+      title = unlisted;
+      log_line("yougame: Connect: YouGame does not list this build yet; the YouGame app is not started or asked, the launcher's own sign-in opens");
+    }
+    if (use_app || launcher::yougame::account().app) {
+      std::string detail;
+      const auto app = use_app ? launcher::yougame::sign_in_app(true, version, &detail) : launcher::yougame::AppSignIn::kSignedIn;
+      if (use_app) log_line("yougame: Connect: %s", detail.c_str());
+      if (app == launcher::yougame::AppSignIn::kSignedIn) {
+        if (launcher::yougame::listed_current()) {
+          g_yg_connecting = false;
+          PostMessageW(g_main, WM_APP_YOUGAME_WEB, 1, (LPARAM)new std::string("app"));
+          return;
+        }
+        log_line("yougame: Connect: YouGame does not list this build yet, so the app's account cannot search with it; the launcher's own sign-in opens");
+        title = unlisted;
+      }
+    }
+    // YouGame's own sign-in page, in the launcher's browser view. The player signs in there once, and the
+    // launcher asks YouGame through that page from then on (remembered: it connects by itself at every start).
+    std::string why;
+    bool ok = false;
+    if (launcher::yougame::web_sign_in_available()) ok = launcher::yougame::sign_in_web(g_main, &why, {}, again, title);
+    else why = no_webview;
+    g_yg_connecting = false;
+    PostMessageW(g_main, WM_APP_YOUGAME_WEB, ok, (LPARAM)new std::string(why));
+  }).detach();
 }
 void yougame_connect() {
+  // Signed in through the YouGame app while YouGame does not list this build: Connect opens the launcher's own
+  // sign-in (the game cannot search with the app's account); Disconnect otherwise.
+  if (launcher::yougame::account().app && !launcher::yougame::listed_current() && !vanilla_active()) {
+    if (GetTickCount64() - g_yg_closed_at < 1500) return;
+    if (g_yg_connecting.exchange(true)) { if (g_yg_start_check) g_yg_connect_queued = true; else launcher::yougame::web::raise_sign_in(); return; }
+    yougame_sign_in_thread(false);
+    return;
+  }
   if (launcher::yougame::account().signed_in) {
     if (MessageBoxW(g_main, launcher::lang::txw(L"Disconnect your YouGame account from this launcher?").c_str(), L"YouGame",
                     MB_YESNO | MB_ICONQUESTION) == IDYES)
-      launcher::yougame::sign_out();
+      std::thread([] { launcher::yougame::sign_out(); }).detach();   // the browser view's folder goes too
     return;
   }
-  if (g_yg_signin) { SetForegroundWindow(g_yg_signin); return; }
-  static bool registered = false;
-  if (!registered) {
-    WNDCLASSW c{};
-    c.lpfnWndProc = yougame_signin_proc;
-    c.hInstance = GetModuleHandleW(nullptr);
-    c.lpszClassName = L"MeleeUnlockedYouGameSignIn";
-    c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    c.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
-    RegisterClassW(&c);
-    registered = true;
-  }
-  RECT mr; GetWindowRect(g_main, &mr);
-  const int w = S(380), h = S(290);
-  g_yg_signin = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MeleeUnlockedYouGameSignIn", L"Connect YouGame", WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                                (mr.left + mr.right - w) / 2, (mr.top + mr.bottom - h) / 2, w, h, g_main, nullptr, GetModuleHandleW(nullptr), nullptr);
-  auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int cw, int ch, int id) {
-    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(cw), S(ch), g_yg_signin,
-                             (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
-    SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
-    return c;
-  };
-  child(L"STATIC", launcher::lang::txw(L"Sign in with your YouGame account. Your password goes only to YouGame.").c_str(), 0, 16, 12, 340, 34, 0);
-  child(L"STATIC", launcher::lang::txw(L"Email").c_str(), 0, 16, 52, 340, 18, 0);
-  g_yg_email = child(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 16, 72, 340, 24, 100);
-  child(L"STATIC", launcher::lang::txw(L"Password").c_str(), 0, 16, 104, 340, 18, 0);
-  g_yg_pass = child(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, 16, 124, 340, 24, 101);
-  g_yg_status = child(L"STATIC", L"", 0, 16, 156, 340, 34, 0);
-  child(L"BUTTON", launcher::lang::txw(L"Create an account").c_str(), WS_TABSTOP, 16, 196, 166, 28, 102);
-  child(L"BUTTON", launcher::lang::txw(L"Forgot password").c_str(), WS_TABSTOP, 190, 196, 168, 28, 103);
-  g_yg_ok = child(L"BUTTON", launcher::lang::txw(L"Sign in").c_str(), WS_TABSTOP | BS_DEFPUSHBUTTON, 176, 236, 88, 28, IDOK);
-  child(L"BUTTON", launcher::lang::txw(L"Cancel").c_str(), WS_TABSTOP, 270, 236, 88, 28, IDCANCEL);
-  EnableWindow(g_main, FALSE);
-  ShowWindow(g_yg_signin, SW_SHOW);
-  SetFocus(g_yg_email);
+  // A click that waited behind the sign-in window's close (a slow close, a double click on its X) never
+  // opens it again.
+  if (GetTickCount64() - g_yg_closed_at < 1500) return;
+  // Already open: its window comes to the front (posted to its own thread; this one never waits on it).
+  if (g_yg_connecting.exchange(true)) { if (g_yg_start_check) g_yg_connect_queued = true; else launcher::yougame::web::raise_sign_in(); return; }
+  if (g_tab == 0) InvalidateRect(g_main, nullptr, FALSE);   // "YouGame: connecting..."
+  // The launcher's window stays enabled and responsive throughout: everything below runs on its own thread,
+  // and the sign-in window is never owned by this one (launcher_yougame_web.h).
+  yougame_sign_in_thread(false);   // owner 11-20: the launcher's own sign-in; the YouGame app is never asked
+}
+// Play with an account the YouGame app gave while YouGame does not list this build: the app's searches would be
+// refused, so the game plays through the launcher's bridge, which needs the launcher's own sign-in. Its window
+// opens once per run, saying why (it finishes by itself when the browser view is still signed in); the game
+// starts when it closes, signed in or not. True when it opened (start_game waits for it).
+bool g_yg_play_after = false, g_yg_play_asked = false;
+bool yougame_sign_in_for_play() {
+  if (vanilla_active() || g_yg_play_asked || !launcher::yougame::account().app || launcher::yougame::listed_current()) return false;
+  if (!launcher::yougame::web_sign_in_available() || g_yg_connecting.exchange(true)) return false;
+  g_yg_play_asked = g_yg_play_after = true;
+  log_line("yougame: Play: YouGame does not list this build yet; the launcher's own sign-in opens once so the game can play through the launcher");
+  yougame_sign_in_thread(false);
+  return true;
 }
 #include "launcher_mods.inl"
 
@@ -1590,6 +1805,7 @@ bool game_exe_version_mismatch(const std::string& exe) {
 
 void start_game() {
   if (g_playing || g_iso.empty()) return;
+  if (yougame_sign_in_for_play()) return;   // the launcher's own sign-in first, once; the game starts when it closes
   if (const std::wstring problem = base_disc_problem(g_iso); !problem.empty()) {
     if (problem == kMexDiscProblem) {   // the mod disc goes where it plays, as a dropped one does
       std::error_code ec;
@@ -1673,7 +1889,7 @@ void launch_game_now() {
 #else
     if (file_exists(base + "\\Sys\\codehandler.bin"))
       args += " --sys-dir \"" + base + "\\Sys\" --user-dir \"" + g_dir + "\\User\\Slippi\" --replay-dir \"" + replay_dir_for_game() +
-              "\" --card-dir \"" + g_dir + "\\User\\GC\\Mods\\" + g_mod_launch_key + "\"";
+              "\" --card-dir \"" + g_dir + "\\User\\GC\\Mods\\" + g_mod_launch_key + "\"" + sysgen_data_arg(exe);
 #endif
     g_mod_launch_iso.clear(); g_mod_launch_engine.clear(); g_mod_launch_kind.clear();
   }
@@ -1681,27 +1897,66 @@ void launch_game_now() {
       " --lobby-status-file \"" + g_dir + "\\lobby-game-status.json\"";
   g_lobby_game_active = !g_lobby_launch_args.empty();
   g_lobby_launch_args.clear();
+  // The game's YouGame rows ask this launcher (launcher_yougame.h): its address, a token for this
+  // launch, and the build's hashes for the ticket's build check. Set only for this one start.
+  // When the YouGame app is running for this Windows user, the game talks to the app over its plugin
+  // channel instead, the same way as when it is started on its own: these variables would turn that
+  // channel off in the game (yougame_link.cpp), so the launcher leaves them out.
+  // Only with the "YouGame extension" option on: otherwise YouGame always goes through this launcher.
+  // Also when the account came from the YouGame app (Connect, or the launcher starting, found the player signed
+  // in there): the session is the app's, so the game asks the app, as with the extension on. No bridge then,
+  // even before the app's channel is up: the game finds the app (and opens it) itself.
+  // Owner 11-20: play never depends on the YouGame app. Every YouGame match goes through this launcher's bridge,
+  // with the launcher's own YouGame sign-in, extension or not. With "Launch with YouGame extension" ticked the
+  // game is also on the app's local channel for the extension's own features (its button and Shift+Tab menu, game
+  // and match state, pause): MELEE_YOUGAME_EXTENSION=1 with MELEE_YOUGAME_MATCH_BRIDGE=1 and the bridge
+  // (yougame_link.cpp routed_to_bridge). The app is started quietly (tray, no window) when installed and not
+  // running; closed or gone mid-session, the game goes on through the bridge. Unticked: no app, no channel.
+  const bool hybrid = !vanilla_active() && launcher::yougame::extension();
+  const std::string app_channel = hybrid ? yougame_app_channel() : std::string();
+  if (hybrid && app_channel.empty()) {
+    std::thread([] {
+      std::string detail;
+      const bool up = launcher::yougame::start_app_quietly(&detail);
+      log_line("yougame: extension: %s%s", detail.c_str(), up ? "" : " (the game plays through the launcher meanwhile)");
+    }).detach();
+  }
+  SetEnvironmentVariableW(L"MELEE_YOUGAME_EXTENSION", hybrid ? L"1" : nullptr);
+  SetEnvironmentVariableW(L"MELEE_YOUGAME_POOL", nullptr);   // the bridge's hello names the rooms (pool) now
+#ifdef MELEE_YOUGAME_COMING_SOON
+  const std::string yougame_bridge;   // YouGame is not open yet: the game gets no bridge
+  const std::string yougame_decision = vanilla_active() ? std::string()
+      : "YouGame: this launcher has no bridge in this build; the game looks for the YouGame app itself (" +
+        (app_channel.empty() ? std::string("no app channel for this user now") : "the " + app_channel + " app is running") + ").";
+#else
+  const std::string yougame_bridge = vanilla_active() ? std::string() : launcher::yougame::bridge_url();
+  const std::string yougame_decision = vanilla_active() ? std::string()
+      : hybrid ? "YouGame: the game uses the launcher's bridge for matches and the YouGame app's channel for the extension (" +
+                     (app_channel.empty() ? std::string("app being started") : "the " + app_channel + " app is running") + ")."
+      : std::string("YouGame: the game uses the launcher's bridge (extension off: no YouGame app).");
+#endif
+  if (!yougame_decision.empty()) log_line("%s", yougame_decision.c_str());
   // Test runs only (MELEE_LAUNCHER_TEST): extra game arguments (hidden, local peering instead of
-  // Slippi's servers) and the exact command line written to a file for the lobby gate to check.
+  // Slippi's servers) and the exact command line written to a file for the lobby gate to check,
+  // with the YouGame line above under it.
   if (g_launcher_test) {
     if (const char* extra = std::getenv("MELEE_LAUNCHER_TEST_GAME_ARGS")) cmd += std::string(" ") + extra;
     if (const char* log_path = std::getenv("MELEE_LAUNCHER_TEST_LAUNCH_LOG"))
-      if (FILE* f = std::fopen(log_path, "ab")) { std::fprintf(f, "%s\n", cmd.c_str()); std::fclose(f); }
+      if (FILE* f = std::fopen(log_path, "ab")) {
+        std::fprintf(f, "%s\n", cmd.c_str());
+        if (!yougame_decision.empty()) std::fprintf(f, "%s\n", yougame_decision.c_str());
+        std::fclose(f);
+      }
   }
-  // The game's YouGame rows ask this launcher (launcher_yougame.h): its address, a token for this
-  // launch, and the build's hashes for the ticket's build check. Set only for this one start.
-#ifdef MELEE_YOUGAME_COMING_SOON
-  const std::string yougame_bridge;   // YouGame is not open yet: the game gets no bridge
-#else
-  const std::string yougame_bridge = vanilla_active() ? std::string() : launcher::yougame::bridge_url();
-#endif
   if (!yougame_bridge.empty()) {
     const std::string game_dir = exe.substr(0, exe.find_last_of("\\/"));
     launcher::yougame::set_build(g_active_version.empty() ? std::string(MELEE_PORT_VERSION) : g_active_version.substr(0, g_active_version.find('-')),
                                  widen(exe), widen(game_dir + "\\melee_game.dll"));
     SetEnvironmentVariableW(L"YOUGAME_BRIDGE", widen(yougame_bridge).c_str());
     SetEnvironmentVariableW(L"YOUGAME_TOKEN", widen(launcher::yougame::new_launch_token()).c_str());
-    SetEnvironmentVariableW(L"MELEE_YOUGAME_LAUNCHER", L"1");
+    // The hybrid is not the launcher-only mode: MELEE_YOUGAME_LAUNCHER would keep the game off the app's channel.
+    SetEnvironmentVariableW(hybrid ? L"MELEE_YOUGAME_MATCH_BRIDGE" : L"MELEE_YOUGAME_LAUNCHER", L"1");
+    launcher::yougame::warm();   // the browser view is open and its session checked before the game's first search
   }
   PROCESS_INFORMATION pi{};
   const DWORD error = launcher::start_process(widen(exe), widen(cmd), widen(cwd), 0, pi);
@@ -1709,6 +1964,7 @@ void launch_game_now() {
     SetEnvironmentVariableW(L"YOUGAME_BRIDGE", nullptr);
     SetEnvironmentVariableW(L"YOUGAME_TOKEN", nullptr);
     SetEnvironmentVariableW(L"MELEE_YOUGAME_LAUNCHER", nullptr);
+    SetEnvironmentVariableW(L"MELEE_YOUGAME_MATCH_BRIDGE", nullptr);
   }
   if (error != ERROR_SUCCESS) {
     launcher::lobby::game_running(false);
@@ -1834,7 +2090,7 @@ void refresh_updater() {
   // label's rect from the background every tick is what stops old text showing through the new.
   if (line != g_version_line || d != g_version_dot) {
     g_version_line = line; g_version_dot = d;
-    if (g_tab == 0) { invalidate(version_text_rect()); invalidate(LR(CX, 239, 8, 8)); }
+    if (g_tab == 0) { invalidate(version_text_rect()); invalidate(LR(CX, play_layout().version_y + 3, 8, 8)); }
   }
   ShowWindow(g_update_btn, (st == State::UpdateAvailable || st == State::Failed) && g_tab == 0 ? SW_SHOW : SW_HIDE);
   set_text(g_update_btn, st == State::Failed ? "Retry" : "Update and restart");
@@ -2049,6 +2305,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       ShowWindow(g_slippi_btn, g_slippi_missing && !vanilla_active() ? SW_SHOW : SW_HIDE);
       // YouGame: the bridge the game's YouGame rows ask (launcher_yougame.h), up for the whole run.
       launcher::yougame::set_on_session_change([] { PostMessageW(g_main, WM_APP_YOUGAME, 0, 0); });
+      launcher::yougame::set_web_folder(widen(g_dir) + L"\\YouGameWeb");   // the sign-in page's browser view keeps its session here
 #ifndef MELEE_YOUGAME_COMING_SOON
       if (std::string why; !launcher::yougame::start_bridge(&why)) log_line("yougame: the launcher's bridge did not start (%s)", why.c_str());
       // Which builds YouGame allows: when it is on an older release, get that one beside this
@@ -2064,20 +2321,52 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           if (!file_exists(g_dir + "\\Versions\\" + older.version + "-legacy\\melee_source.exe"))
             host::updater::install_release(older.version, false, g_dir);
         }).detach();
-      // Test runs only: sign in to the stand-in site (MELEE_YOUGAME_SITE / _AUTH) as "email:password".
-      if (const char* who = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_YOUGAME") : nullptr)
-        if (const char* colon = std::strchr(who, ':'))
-          std::thread([email = std::string(who, colon), pass = std::string(colon + 1)] {
-            std::string why;
-            if (!launcher::yougame::sign_in(email, pass, &why)) log_line("yougame: test sign-in failed (%s)", why.c_str());
-          }).detach();
+      launcher::yougame::warm();   // a saved sign-in is checked with YouGame now: one that ended asks for a new one at once
+      // Connected by itself, no button and no window (owner 11-19): (a) the launcher's own sign-in its browser
+      // view kept, asked through the hidden view; (b) else the YouGame app's account when the app runs and is
+      // signed in; (c) else, when this launcher connected through the app before, the installed app started
+      // quietly (tray only) and its account taken once its channel answers. Never the sign-in window: that
+      // stays on Connect. Not after the player chose Disconnect for the app's account. Off this thread; the row
+      // reads "connecting..." meanwhile.
+      if (!vanilla_active() && !launcher::yougame::account().signed_in && !g_yg_connecting.exchange(true)) {
+        g_yg_start_check = true;
+        if (g_tab == 0) InvalidateRect(hwnd, nullptr, FALSE);
+        std::thread([version = yougame_build_version()] {
+          std::string how;
+          // Owner 11-20: only the launcher's own saved sign-in (the YouGame app is never asked for an account).
+          if (launcher::yougame::resume_web()) how = "the launcher's own saved sign-in answered signed in";
+          else how = "no saved sign-in (Connect opens the launcher's own sign-in)";
+          (void)version;
+          log_line("yougame: at start: %s", how.c_str());
+          g_yg_connecting = false;
+          g_yg_start_check = false;
+          PostMessageW(g_main, WM_APP_YOUGAME, 0, 0);   // the row again
+        }).detach();
+      }
 #endif   // MELEE_YOUGAME_COMING_SOON: none of YouGame starts until it opens
       if (const char* ms = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_CAPTURE_MS") : nullptr)
         std::thread([ms = std::atoi(ms)] { Sleep(ms); PostMessageW(g_main, WM_APP + 41, 0, 0); }).detach();
+      // Test runs only: YouGame's Connect is pressed after this many ms (the hidden responsiveness check).
+      // A comma list ("5000,12000") presses it once at each time (Disconnect, then Connect again).
+      if (const char* ms = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_YG_CONNECT_MS") : nullptr; ms && *ms)
+        std::thread([list = std::string(ms)] {
+          uint64_t done = 0;
+          for (size_t at = 0; at < list.size();) {
+            const size_t comma = list.find(',', at);
+            const uint64_t when = (uint64_t)std::atoi(list.substr(at, comma == std::string::npos ? std::string::npos : comma - at).c_str());
+            if (when > done) Sleep((DWORD)(when - done));
+            done = std::max(done, when);
+            PostMessageW(g_main, WM_APP_YOUGAME_CONNECT, 0, 0);
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+          }
+        }).detach();
 #ifndef MELEE_NO_SLIPPI   // the public releases are the other build: this one must never install them over itself
+#ifndef MELEE_YOUGAME_NO_UPSTREAM_UPDATES   // upstream's releases have no YouGame plugin: never offer them over this build
       // Test runs skip the update check, unless MELEE_LAUNCHER_TEST_UPDATER=1 asks for the real release
       // list (the version picker test reads it; nothing installs without a click).
       if (!g_launcher_test || std::getenv("MELEE_LAUNCHER_TEST_UPDATER")) { host::updater::check(MELEE_PORT_VERSION); refresh_updater(); }
+#endif
       if (!g_launcher_test) PostMessageW(hwnd, WM_APP + 77, 0, 0);   // offer DLSS 5 once the window is up
 #endif
       SetTimer(hwnd, ID_TIMER, 500, nullptr);
@@ -2108,7 +2397,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PRINTCLIENT: {
       RECT r; GetClientRect(hwnd, &r); paint(hwnd, (HDC)wp, r); print_client_children(hwnd, (HDC)wp); return 0;
     }
-    case WM_APP + 41: capture_test_client(hwnd, "launcher-capture.bmp"); return 0;
+    case WM_APP + 41: place_play_children(); capture_test_client(hwnd, "launcher-capture.bmp"); return 0;
     case WM_PAINT: {
       PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
       paint(hwnd, dc, ps.rcPaint);
@@ -2129,7 +2418,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       g_seg_hot = build_seg_at(p);   // only the cursor changes over a segment, so nothing to repaint
       g_dog_hot = PtInRect(&g_dog_rect, p) != 0;
-      g_yg_hot = g_tab == 0 && !vanilla_active() && (PtInRect(&g_yg_link[0], p) || PtInRect(&g_yg_link[1], p));
+      g_yg_hot = g_tab == 0 && !vanilla_active() && (PtInRect(&g_yg_link[0], p) || PtInRect(&g_yg_link[1], p) || PtInRect(&g_yg_link[2], p));
       if (!g_tracking) { TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, hwnd, 0}; TrackMouseEvent(&t); g_tracking = true; }
       return 0;
     }
@@ -2143,12 +2432,26 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       break;
     case WM_LBUTTONDOWN: {
       POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-      RECT mods_line = LR(CX, 260, CW, 17);
+      RECT mods_line = LR(CX, play_layout().mods_y, CW, 17);
       RECT version_line = version_text_rect();
       if (g_tab == 0 && PtInRect(&version_line, p)) { show_changelog(); return 0; }
       if (g_tab == 0 && !vanilla_active() && PtInRect(&g_yg_link[0], p)) { yougame_connect(); return 0; }
+      if (g_tab == 0 && !vanilla_active() && PtInRect(&g_yg_link[2], p)) {
+        // One press, one toggle: a second press inside 350 ms (a bounce, a double click) changes nothing, and the
+        // box is drawn again at once so the press shows.
+        static uint64_t last_toggle = 0;
+        const uint64_t now = GetTickCount64();
+        if (now - last_toggle < 350) return 0;
+        last_toggle = now;
+        launcher::yougame::set_extension(!launcher::yougame::extension());
+        log_line("yougame: launch with the YouGame extension %s", launcher::yougame::extension() ? "on" : "off");
+        save_ini();
+        InvalidateRect(g_main, nullptr, FALSE);
+        UpdateWindow(g_main);
+        return 0;
+      }
       if (g_tab == 0 && !vanilla_active() && PtInRect(&g_yg_link[1], p)) {
-        ShellExecuteW(nullptr, L"open", widen(launcher::yougame::game_page()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        ShellExecuteW(nullptr, L"open", widen(launcher::yougame::open_target()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         return 0;
       }
       if (g_tab == 0 && PtInRect(&mods_line, p)) {
@@ -2301,9 +2604,39 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_YOUGAME:
       save_ini();
       if (g_tab == 0) InvalidateRect(hwnd, nullptr, FALSE);
+      // Connect was pressed while the check at start ran: it runs now, unless that check connected.
+      if (g_yg_connect_queued && !g_yg_start_check) {
+        g_yg_connect_queued = false;
+        const launcher::yougame::Account a = launcher::yougame::account();
+        if (!a.signed_in || (a.app && !launcher::yougame::listed_current())) yougame_connect();
+      }
+      // YouGame ended the saved sign-in (signed out on the site, or the session ran out): its sign-in page
+      // opens again, saying so. Never over a running game: then it opens when the game has closed.
+      if (launcher::yougame::take_expired()) {
+        log_line("yougame: the saved sign-in ended; asking for a new one%s", g_playing ? " when the game closes" : "");
+        if (g_playing) g_yg_reopen = true;
+        else { g_yg_again = true; yougame_connect(); g_yg_again = false; }
+      }
       return 0;
+    case WM_APP_YOUGAME_CONNECT:
+      if (g_launcher_test) { log_line("yougame: test: Connect pressed"); yougame_connect(); }
+      return 0;
+    case WM_APP_YOUGAME_WEB: {
+      std::unique_ptr<std::string> why((std::string*)lp);
+      g_yg_closed_at = GetTickCount64();
+      if (*why != "app") SetForegroundWindow(hwnd);   // back from the sign-in window
+      if (!wp && !why->empty()) MessageBoxW(hwnd, widen(*why).c_str(), L"YouGame", MB_OK | MB_ICONINFORMATION);
+      if (*why == "app") log_line("yougame: connected with the account signed in to the YouGame app");
+      else log_line("yougame: sign-in window closed (%s)", wp ? "signed in" : why->empty() ? "closed by the player" : why->c_str());
+      if (g_tab == 0) InvalidateRect(hwnd, nullptr, FALSE);
+      // Play opened it (yougame_sign_in_for_play): the game starts now, signed in or not.
+      if (g_yg_play_after) { g_yg_play_after = false; start_game(); }
+      return 0;
+    }
     case WM_APP_GAME_DONE:
       g_playing = false;
+      if (g_yg_reopen && !launcher::yougame::account().signed_in) { g_yg_reopen = false; g_yg_again = true; yougame_connect(); g_yg_again = false; }
+      g_yg_reopen = false;
       // The game closed to play a Gecko code only the Static Recomp runs (host::request_engine_switch):
       // that engine is picked, as a click on its GAME BUILD segment would, and started now.
       if (take_engine_switch_request()) {
@@ -2624,7 +2957,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   std::thread(mod_manager::rescan).detach();
   MSG m;
   while (GetMessageW(&m, nullptr, 0, 0)) {
-    if (g_yg_signin && IsDialogMessageW(g_yg_signin, &m)) continue;   // Tab and Enter in YouGame's sign-in
     if (!IsDialogMessageW(hwnd, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
   }
   return 0;

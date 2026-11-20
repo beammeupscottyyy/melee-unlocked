@@ -5,6 +5,11 @@
 #include "yougame_agent_paths.h"
 #endif
 #include "host.h"
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#include "squad_digest.h"
+#endif
+#include "session_logs.h"
 #include "sim_work.h"
 #include "audio.h"
 #include "cosmetic_mods.h"
@@ -15,12 +20,14 @@
 #include "memory_range.h"
 #include "guest_heap_trace.h"
 #include "disc_fst_paths.h"
+#include "startup_clock.h"
 #include <windows.h>
 #include <psapi.h>
 #include <bcrypt.h>
 #include "guest_registry.h"
 #include "guest_symbols.h"
 #include "gx_core.h"
+#include "pipeline_cache_store.h"
 #include "gx_shader.h"
 #include "authored_pose.h"
 #include "window.h"
@@ -54,7 +61,7 @@
 #include <filesystem>
 #include <fstream>
 
-namespace hle { void audio_tick(bool force); uint64_t audio_next_due(); }
+namespace hle { void audio_tick(bool force); uint64_t audio_next_due(); void audio_shift(uint64_t ticks); }
 
 namespace hle { void dvd_poll(); void dvd_settle(); }
 namespace host {
@@ -114,6 +121,32 @@ static void trace_ax_frame(const char* line) {
 }
 
 // ---------------- logging ----------------
+// Milliseconds since this process was created (Windows: the kernel's creation time, so the loader
+// and static initialisation count, as they do for the YouGame app's caps deadline). Elsewhere, since
+// this file's static initialisation, which runs before main.
+static const auto g_process_start = std::chrono::steady_clock::now();
+uint64_t startup_ms() {
+#ifdef _WIN32
+  static const uint64_t created = [] {
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return uint64_t(0);
+    return (uint64_t(c.dwHighDateTime) << 32) | c.dwLowDateTime;
+  }();
+  if (created) {
+    FILETIME n{};
+    GetSystemTimeAsFileTime(&n);
+    const uint64_t now = (uint64_t(n.dwHighDateTime) << 32) | n.dwLowDateTime;
+    if (now >= created) return (now - created) / 10000;
+  }
+#endif
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_process_start).count();
+}
+std::string startup_mark() { return startup::suffix(startup_ms()); }
+// Once, at the first real game frame on screen: where the startup timing ends.
+void startup_first_frame() {
+  static std::atomic<bool> told{false};
+  if (!told.exchange(true)) log("startup: first frame presented%s", startup_mark().c_str());
+}
 // Every line also goes to melee_port.log in the working directory (truncated at start), so a play
 // session can be inspected afterwards without the console window.
 static FILE* g_log_file = nullptr;
@@ -123,23 +156,29 @@ static void open_log_file() {
   tried = true;
   // Keep the previous session's log (a desync or crash report is often noticed only after relaunching).
   const std::string path = options.log_file.empty() ? "melee_port.log" : options.log_file;
-  const std::string previous = path.size() > 4 && path.compare(path.size() - 4, 4, ".log") == 0
-      ? path.substr(0, path.size() - 4) + ".prev.log" : path + ".prev";
-  std::remove(previous.c_str());
-  std::rename(path.c_str(), previous.c_str());
-  g_log_file = std::fopen(path.c_str(), "w");
+  const bool rotated = rotate_session_logs(path);
+  g_log_file = std::fopen(path.c_str(), rotated ? "w" : "a");
+  if (!rotated) {
+    std::fprintf(stderr,"log: could not rotate %s; appending to preserve the previous session\n",path.c_str());
+    if (g_log_file) std::fprintf(g_log_file,"log: could not rotate previous session; appending\n");
+  }
   // Which build wrote the log comes first, so a report always says it.
   if (g_log_file) {
     char exe[MAX_PATH] = "";
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
     const char* name = std::strrchr(exe, '\\');
-    std::fprintf(g_log_file, "Melee Unlocked %s, %s\n", MELEE_PORT_VERSION, name ? name + 1 : exe);
+    // The full YouGame build too (0.9.120-online-test.103), so a report says exactly which one.
+    std::fprintf(g_log_file, "%s\n", startup::log_header(MELEE_PORT_VERSION, name ? name + 1 : exe, MELEE_YOUGAME_BUILD).c_str());
     MEMORYSTATUSEX memory{};
     memory.dwLength = sizeof memory;
     if (GlobalMemoryStatusEx(&memory))
-      std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more Windows can hand out\n",
-                   memory.ullTotalPhys / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullAvailPageFile / 1073741824.0);
+      std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more the system can hand out%s\n",
+                   memory.ullTotalPhys / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullAvailPageFile / 1073741824.0,
+                   startup_mark().c_str());
     std::fprintf(g_log_file, "%s\n", cpu_power_line("at start").c_str());
+    // Started again by the last process after the graphics device was lost (restart_after_device_loss).
+    if (const char* lost = std::getenv("MELEE_DEVICE_LOST"))
+      std::fprintf(g_log_file, "started again after the graphics device was lost (restart %d)\n", std::atoi(lost));
   }
 }
 
@@ -253,7 +292,7 @@ void log_memory() {
   memory.dwLength = sizeof memory;
   if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&process, sizeof process) ||
       !GlobalMemoryStatusEx(&memory)) return;
-  log("memory: game %.2f GB, Windows %.1f GB free of %.1f, %.1f GB more it can hand out",
+  log("memory: game %.2f GB, system %.1f GB free of %.1f, %.1f GB more it can hand out",
       process.PrivateUsage / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullTotalPhys / 1073741824.0,
       memory.ullAvailPageFile / 1073741824.0);
 }
@@ -329,6 +368,11 @@ static std::atomic<bool> g_process_ending{false};
 void set_process_ending() { g_process_ending.store(true); }
 bool process_ending() { return g_process_ending.load(); }
 
+// die() is ending the process: a crash, an abort or a lost device. The caches are not flushed then
+// (the device may be gone, and an abort may hold the very locks a flush takes), and the savers are
+// frozen (no save starts or renames a file from then on); what they already wrote stays.
+static std::atomic<bool> g_dying{false};
+
 static std::mutex g_file_writes_mutex;
 static std::condition_variable g_file_writes_done;
 static int g_file_writes = 0;
@@ -337,14 +381,22 @@ void file_write_end() {
   { std::lock_guard<std::mutex> lock(g_file_writes_mutex); --g_file_writes; }
   g_file_writes_done.notify_all();
 }
+void mark_dying() { g_dying.store(true); }
+
 void wait_file_writes(unsigned max_ms) {
+  if (g_dying.load() && max_ms > 2000u) max_ms = 2000u;   // a crashing process never waits 20 s for a replay
   std::unique_lock<std::mutex> lock(g_file_writes_mutex);
   g_file_writes_done.wait_for(lock, std::chrono::milliseconds(max_ms), [] { return g_file_writes <= 0; });
 }
 
 [[noreturn]] void end_process(int code) {
-  wait_file_writes();
+  // A replay still being written is kept (upstream 0.9.110); a dying process waits less for it.
+  wait_file_writes();   // 2 s once dying (wait_file_writes caps it)
   set_process_ending();
+  // The shader and pipeline caches are saved as the game runs; this writes whatever is still new
+  // (bounded) so a process ended here never makes the next start compile again. Nothing to do when
+  // the renderer is already gone (its destructor saved).
+  if (!g_dying.load()) ::gx::cache_store::flush_all("exit", std::chrono::milliseconds(1500));
   log_flush();
   std::fflush(nullptr);
   TerminateProcess(GetCurrentProcess(), (UINT)code);
@@ -355,6 +407,8 @@ static void (*g_die_hook)(const char*) = nullptr;
 void set_die_hook(void (*hook)(const char*)) { g_die_hook = hook; }
 
 [[noreturn]] void die(const char* fmt, ...) {
+  ::gx::cache_store::freeze();
+  g_dying.store(true);
   log_flush();
   va_list ap; va_start(ap, fmt);
   std::fprintf(stderr, "\nFATAL: ");
@@ -460,8 +514,8 @@ static void prefetch_disc_image(const std::string& path) {
     }
     std::fclose(f);
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-    log("disc: image prefetched into the file cache (%llu MB in %.1f s)", (unsigned long long)(total >> 20),
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    log("disc: image prefetched into the file cache (%llu MB in %.1f s)%s", (unsigned long long)(total >> 20),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(), startup_mark().c_str());
   }); }).detach();
 }
 
@@ -603,9 +657,8 @@ static uint32_t disc_dol_offset() {
 }
 // Both engines are built for the retail main.dol: the recompiled one runs its code, the native one
 // reads its data. A modded disc (a patched DOL, m-ex and friends) fails the SHA-1 of NTSC 1.02.
-constexpr uint32_t kVanillaDolSize = 0x4385E0u;
 // True for the retail NTSC 1.02 main.dol (kVanillaDolSize bytes).
-static bool vanilla_dol_image(const std::vector<uint8_t>& image) {
+bool vanilla_dol_image(const std::vector<uint8_t>& image) {
   BCRYPT_ALG_HANDLE algorithm = nullptr;
   uint8_t digest[20];
   const uint8_t expected[20] = {0x08,0xe0,0xbf,0x20,0x13,0x4d,0xfc,0xb2,0x60,0x69,0x96,0x71,0x00,0x45,0x27,0xb2,0xd6,0xbb,0x1a,0x45};
@@ -1283,6 +1336,8 @@ void request_restart() {
   wchar_t exe[MAX_PATH];
   if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) { log("restart: cannot find this executable"); return; }
   std::wstring cmd = GetCommandLineW();
+  // The replacement reads the shader and pipeline caches as it starts: write them first.
+  ::gx::cache_store::flush_all("relaunch", std::chrono::milliseconds(3000));
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
   // The new process must not inherit the window or the adapter, so it waits for this one to go.
   if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -1292,6 +1347,32 @@ void request_restart() {
   CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
   log("restart: relaunched, shutting down this instance");
   request_exit(0);
+}
+
+bool restart_after_device_loss(const char* why, bool (*switch_backend)()) {
+  // MELEE_DEVICE_LOST="<restarts>:<unix seconds of the last one>", passed to the new process.
+  int restarts = 0;
+  long long last = 0;
+  if (const char* v = std::getenv("MELEE_DEVICE_LOST")) std::sscanf(v, "%d:%lld", &restarts, &last);
+  const long long now = (long long)std::time(nullptr);
+  if (now - last > 600) restarts = 0;   // a loss long after the last restart starts the count again
+  if (restarts >= 2) { log("device lost again (%s) after %d restarts: reporting it", why, restarts); return false; }
+  const bool switched = restarts >= 1 && switch_backend && switch_backend();
+  wchar_t exe[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
+  char env[64];
+  std::snprintf(env, sizeof env, "%d:%lld", restarts + 1, now);
+  SetEnvironmentVariableA("MELEE_DEVICE_LOST", env);
+  std::wstring cmd = GetCommandLineW();
+  STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    log("device lost (%s): the game could not start again (error %lu)", why, (unsigned long)GetLastError());
+    return false;
+  }
+  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  log("device lost (%s): the game starts again (restart %d%s, new process %lu)", why, restarts + 1,
+      switched ? ", on the other renderer" : "", (unsigned long)pi.dwProcessId);
+  end_process(0);
 }
 
 // The launcher this game belongs to: launcher.ini beside the game, or two folders up from
@@ -1377,6 +1458,8 @@ bool restart_with_mod_looks() {
   }
   cmd += L" --iso " + quote_argument(std::filesystem::u8path(options.mod_base_iso).wstring()) +
          L" --look-iso " + quote_argument(std::filesystem::u8path(options.iso).wstring());
+  // The new copy reads the shader and pipeline caches as it starts: write them first (as request_restart).
+  ::gx::cache_store::flush_all("relaunch", std::chrono::milliseconds(3000));
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
   if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
     log("restart: CreateProcess failed, error %lu", (unsigned long)GetLastError());
@@ -1403,6 +1486,10 @@ void (*native_state_snapshot)(MuStatePod*) = nullptr;
 bool retrace_due() { return cpu->tb >= g_next_retrace_tb && !g_in_retrace; }
 uint64_t next_retrace_tb() { return g_next_retrace_tb; }
 void advance_time(uint64_t ticks) { cpu->tb += ticks; }
+void shift_time(uint64_t ticks) {
+  cpu->tb += ticks; g_next_retrace_tb += ticks;   // the retrace keeps its phase in the frame
+  hle::audio_shift(ticks);
+}
 static void advance_frame() {
   if (cpu->tb < g_next_retrace_tb) cpu->tb = g_next_retrace_tb;   // idle: jump to the boundary
   g_next_retrace_tb += TB_PER_FRAME;
@@ -1435,6 +1522,17 @@ static void validate_alarm_queue(const char* where);
 // Set when the game hands over the frame's picture (the display copy): from then until the retrace it
 // is only waiting, so its polls may wait for real time without delaying any game work.
 static bool g_frame_submitted = false;
+std::function<void()> capture_native_boot_clock() {
+  const auto tb = cpu->tb, next = g_next_retrace_tb;
+  const auto retraces = g_retraces;
+  return [=] {
+    cpu->tb = tb; g_next_retrace_tb = next; g_retraces = retraces;
+    g_profiler_frame.store(retraces);
+    g_next_frame = std::chrono::steady_clock::now();
+    g_in_retrace = false; g_in_interrupt = false; g_frame_submitted = false;
+    g_completions.clear(); g_pe_finish_pending = false; g_pe_token_pending = false;
+  };
+}
 void note_frame_submitted() { g_frame_submitted = true; }
 
 // The game's own stack (64 KB on the console) running past its end. Calls that deep also run this
@@ -2943,6 +3041,9 @@ void current_scene(uint32_t* major, uint32_t* minor, uint32_t* match_frame) {
     *major = state.scene_major;
     *minor = state.scene;
     *match_frame = state.match_frame;
+  } else if (!ram) {
+    // No game at all (the launcher's settings window polls the pads every frame): no scene yet.
+    *major = *minor = *match_frame = 0;
   } else {
     *major = rd8(0x80479D30u);   // GameRouting::curr_mode (state_machine + 0)
     *minor = rd8(0x80479D33u);   // GameRouting::curr_state_id (state_machine + 3)
@@ -2988,6 +3089,63 @@ void agent_test_digest_state(MuStatePod* out) {
 }
 #endif
 
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+// Only the squad/local-peer command interceptor calls this. No test hook needed.
+static FILE* g_squad_confirmed = nullptr;
+static FILE* g_squad_presented_frontier = nullptr;
+static FILE* g_squad_late = nullptr;
+static squad_digest::Pending g_squad_pending;
+static int32_t g_squad_body = -1, g_squad_frontier = -1;
+static uint32_t g_squad_match_frame = 0, g_squad_late_same = 0, g_squad_late_unknown = 0;
+void squad_digest_observe(int32_t body, int32_t frontier, bool ending) {
+  if (!g_state_digest || !native_state_snapshot) return;
+  if (!g_squad_confirmed) {
+    g_squad_confirmed = std::fopen((options.state_digest + ".confirmed.csv").c_str(), "w");
+    g_squad_presented_frontier = std::fopen((options.state_digest + ".presented-frontier.csv").c_str(), "w");
+    g_squad_late = std::fopen((options.state_digest + ".late.csv").c_str(), "w");
+    if (!g_squad_confirmed || !g_squad_presented_frontier || !g_squad_late) die("cannot open squad digest");
+    squad_digest::header(g_squad_confirmed);
+    std::fprintf(g_squad_presented_frontier, "frame,match_frame,body_frame,confirmed_frontier\n");
+    squad_digest::late_header(g_squad_late);
+    std::fflush(g_squad_late);
+  }
+  if (!ending) {
+    MuStatePod state{};
+    read_digest_state(state); // exactly the presented digest's source, no new state fields
+    squad_digest::LateRow late{};
+    switch (g_squad_pending.sample(body, g_retraces, state, &late)) {
+    case squad_digest::Late::none: break;
+    case squad_digest::Late::same: ++g_squad_late_same; break; // e.g. a selftest rollback
+    case squad_digest::Late::unknown: ++g_squad_late_unknown; break;
+    case squad_digest::Late::different:
+      squad_digest::write_late(g_squad_late, late);
+      std::fflush(g_squad_late);
+      log("squad digest: confirmed body %d (match frame %u) re-simulated with a different state", late.body,
+          late.confirmed_match_frame);
+      break;
+    }
+    g_squad_match_frame = state.match_frame;
+    g_squad_body = body;
+  }
+  // Received inputs are not enough until their rollback has actually run. During
+  // catch-up publish only through this completed body, after replacing its row.
+  g_squad_frontier = std::min(body, frontier);
+  g_squad_pending.confirm(g_squad_frontier, [](const squad_digest::Row& row) {
+    squad_digest::write(g_squad_confirmed, row);
+  });
+  std::fflush(g_squad_confirmed);
+  if (ending) {
+    g_squad_pending.discard_tail(); // never promote an unconfirmed tail
+    g_squad_body = -1; // menu retraces can retain the VS counter; they are not match presentations
+    g_squad_match_frame = 0;
+    log("squad digest: %u late resims with the same state, %u beyond the kept window",
+        g_squad_late_same, g_squad_late_unknown);
+    log("squad digest: %u new bodies on a held match frame", g_squad_pending.held());
+  }
+}
+#endif
+
 static void digest_state() {
   if (!g_state_digest) return;
   MuStatePod state{};
@@ -3007,6 +3165,15 @@ static void digest_state() {
   }
   std::fputc('\n', g_state_digest);
   std::fflush(g_state_digest);
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  // A separate sidecar preserves the presented CSV schema for all existing tools.
+  if (g_squad_presented_frontier && state.match_frame == g_squad_match_frame && state.match_frame) {
+    std::fprintf(g_squad_presented_frontier, "%u,%u,%d,%d\n", g_retraces, state.match_frame,
+                 g_squad_body, g_squad_frontier);
+    std::fflush(g_squad_presented_frontier);
+  }
+#endif
 }
 
 // A local mailbox only. The launcher owns network presence and authentication; the simulation
@@ -3068,7 +3235,9 @@ static void publish_lobby_status() {
 }
 
 void publish_lobby_result(int winner_index, int end_method, int lras, const uint8_t* placements) {
-  if (yougame::active() && slippi::online::session_mode() >= 0) {
+  // session(): the app, or a YouGame row picked under Melee Unlocked's launcher (active() is the app only:
+  // under the launcher no result ever reached the room, so Ranked sets went unrecorded).
+  if (yougame::session() && slippi::online::session_mode() >= 0) {
     yougame::GameEnd end;
     end.winner = winner_index;
     end.end_method = end_method;
@@ -3084,6 +3253,7 @@ void publish_lobby_result(int winner_index, int end_method, int lras, const uint
     end.characters[1] = facts.characters[1];
     end.rng = facts.rng;
     for (int i = 0; i < 4; ++i) end.teams[i] = facts.teams[i];
+    end.gone = slippi::online::disconnected_ports();   // the netcode's own call: ranked as forfeits, never left out
     yougame::game_ended(end);
   }
   const auto& cfg = slippi::online::config();
@@ -3501,7 +3671,9 @@ void retrace() {
   QueryThreadCycleTime(GetCurrentThread(), &g_slow_frame_cycles);
   static const bool sim_times_wanted = [] { const char* v = std::getenv("MELEE_SIM_TIMES"); return v && *v; }();
   if (sim_times_wanted) QueryThreadCycleTime(GetCurrentThread(), &g_sim_frame_start_cycles);
-  g_tick_timing = {g_frame_time, g_sim_frame_start, 0, -1};
+  // The latency probe's newest press is carried on (tick_timing.h); without the trace it stays 0.
+  g_tick_timing.target = g_frame_time; g_tick_timing.wake = g_sim_frame_start;
+  g_tick_timing.pad = 0; g_tick_timing.pad_age = -1;
   if (native_retrace) {
     native_retrace();
   } else {

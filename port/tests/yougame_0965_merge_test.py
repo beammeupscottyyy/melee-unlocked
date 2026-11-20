@@ -51,30 +51,78 @@ class YouGame0965MergeTest(unittest.TestCase):
         self.assertIn("cleanup_connection(yougame::Leave::Over);", ranked)
         self.assertIn("if (yougame::ranked_hold()) remote_ready = 0;", ranked)
 
-    def test_initial_search_and_connection_skip_slippi_checks_in_yougame(self):
-        net = code(source("port/runtime/hle/slippi_net.cpp"))
-        for name, state in (("startMatchmaking", "INITIALIZING"),
-                            ("handleConnecting", "OPPONENT_CONNECTING")):
+    def test_initial_search_and_connection_check_the_selected_slippi_login(self):
+        from squad_wiring_test import without_squad
+        net = code(without_squad(source("port/runtime/hle/slippi_net.cpp")))
+        # v0.9.101: one shared version verification per search (User::CheckSessionCompatibility); every
+        # matchmaking and connect check goes through it, never the uncached CheckOnlineCompatibility.
+        for name in ("startMatchmaking", "handleConnecting"):
             with self.subTest(name=name):
-                body = function(net, name)
-                self.assertRegex(body, r"^\s*if \(!yougame::session\(\) && !local_peer.enabled\) \{")
-                check = body.split("if (!user_ || !user_->CheckSessionCompatibility(&error)) {", 1)[1]
-                self.assertIn("fail(", check.split("}", 1)[0])
-                self.assertIn("return;", check.split("}", 1)[0])
-                self.assertIn("if (is_mm_terminated_ || state_ != " + state + ") return;", check)
+                self.assertIn("CheckSessionCompatibility(&error)", function(net, name))
+                self.assertNotIn("CheckOnlineCompatibility(&error)", function(net, name))
         search = function(net, "startMatchmaking")
-        self.assertIn("startYouGameMatchmaking();", search)
+        # Standalone's gate and the agent short circuit must remain ahead of app routing.
+        self.assertRegex(search, r"^\s*if \(host::test_env::agent_copy\(\) && !local_peer.enabled\) \{")
+        self.assertLess(search.index("agent_lock::Operation::Matchmaking"),
+                        search.index("if (!yougame::session() && !local_peer.enabled)"))
+        self.assertIn("if (!user_ || !user_->CheckSessionCompatibility(&error)) {", search)
+        self.assertIn("if (is_mm_terminated_ || state_ != INITIALIZING) return;", search)
+        hook = search.index("if (yougame::agent_test::agent_script)")
+        self.assertLess(hook, search.index("slippi_user_.reset();", hook))
+        agent = search.split("if (yougame::agent_test::agent_script)", 1)[1].split("#endif", 1)[0]
+        self.assertIn("startYouGameMatchmaking();", agent)
+        self.assertIn("return;", agent)
+        self.assertIn("search_settings_.mode == UNRANKED && search_settings_.friend_room.empty()", search)
+        self.assertIn("User::GrantedSlippiUser(user_->dir())", search)
+        # Since blended Unranked (yougame_blend.h) the app's Slippi search runs beside YouGame's: the
+        # selected login's version is checked before its ticket, and a refusal stops Slippi's side only.
+        blend = function(net, "blendMatchmaking")
+        check = blend.split("slippi_user_->PollOnlineCompatibility(&error)", 1)[1]
+        refusal = check.split("if (version < 0) {", 1)[1].split("}", 1)[0]
+        self.assertIn("slippi_failed(", refusal)
+        self.assertNotIn("startYouGameMatchmaking", refusal)
+        self.assertLess(check.index("if (version < 0)"), check.index("openSlippiTicket("))
+        commit = blend.split("coord.matched(Side::Slippi", 1)[1]
+        self.assertLess(commit.index("yougame::prepare_slippi_match"), commit.index("ingest_ticket("))
+        ticket = function(net, "openSlippiTicket")
+        self.assertLess(ticket.index("yougame::with_native_udp(create)"), ticket.index("enet_host_create"))
+        connecting = function(net, "handleConnecting")
+        self.assertLess(connecting.index("agent_lock::Operation::PeerConnect"),
+                        connecting.index("if ((!yougame::session() || slippi_user_) && !local_peer.enabled)"))
+        self.assertIn("User* user = slippi_user_ ? slippi_user_.get() : user_;", connecting)
+        refusal = connecting.split("if (!user || !user->CheckSessionCompatibility(&error)) {", 1)[1].split("}", 1)[0]
+        self.assertIn("fail(", refusal)
+        self.assertIn("return;", refusal)
+        self.assertIn("if (is_mm_terminated_ || state_ != OPPONENT_CONNECTING) return;", connecting)
+
+    def test_slippi_transport_survives_identity_refresh_and_restores_yougame(self):
+        link = code(source("port/runtime/hle/yougame_link.cpp"))
+        prepare = function(link, "prepare_slippi_match")
+        self.assertLess(prepare.index("close_room(Leave::Quit)"), prepare.index("retired.wait_for"))
+        self.assertLess(prepare.index("retired.wait_for"), prepare.index("select_match_transport(true)"))
+        self.assertIn("if (!g_search_generation.current(epoch) || cancelled()) return false;", prepare)
+        self.assertIn("yg_enet_enable(0);", prepare)
+        select = function(link, "select_match_transport")
+        # The relay's own socket joins the direct case (g_relay_own).
+        self.assertIn("yg_enet_select(!slippi && ((g_direct && !g_own_udp_match) || g_relay_own));", select)
+        self.assertIn("yg_enet_select(!slippi && ((g_broker && !g_own_udp_match) || g_relay_own));", select)
+        self.assertEqual(function(link, "fetch_identity").count("select_match_transport(g_slippi_match)"), 2)
+        self.assertIn("select_match_transport(false);", function(link, "find_match"))
+        self.assertIn("select_match_transport(false);", function(link, "end_session"))
+        self.assertIn("if (g_slippi_match) return g_rank.header();", function(link, "ranked_header"))
 
     def test_both_relay_providers_precede_native_xinput(self):
         window = code(source("port/runtime/host/window.cpp"))
         state = function(window, "xinput_state")
-        bridge = state.index("if (yougame::relay_pads::active())")
         provider = state.index("if (controller_relay::active())")
+        bridge = state.index("if (yougame::relay_pads::active())")
         native = state.index("xinput_ask(")
-        self.assertLess(bridge, provider)
-        self.assertLess(provider, native)
-        self.assertIn("return yougame::relay_pads::read(idx, state);", state[:provider])
-        sample = state[provider:native]
+        # The provider first (0.9.66 had the raw relay first, which hid the provider: every relayed
+        # PlayStation and Switch pad also read as an Xbox pad).
+        self.assertLess(provider, bridge)
+        self.assertLess(bridge, native)
+        self.assertIn("return yougame::relay_pads::read(idx, state);", state[bridge:native])
+        sample = state[provider:bridge]
         self.assertIn("*state={};", sample)
         self.assertIn("if (!controller_relay::sample(CaptureDevice::XInputPad,idx,s)) return false;", sample)
         for field in ("wButtons", "bLeftTrigger", "bRightTrigger", "sThumbLX", "sThumbLY", "sThumbRX", "sThumbRY"):
@@ -127,8 +175,11 @@ class YouGame0965MergeTest(unittest.TestCase):
         self.assertIn('option(MELEE_REQUIRE_STREAMLINE ', port)
         self.assertIn("if(MELEE_REQUIRE_STREAMLINE AND NOT", port)
         self.assertEqual(port.count("IMGUI_IMPL_WIN32_DISABLE_GAMEPAD"), 2)
-        for target in ("stage_read_pin", "yougame_mode_policy", "yougame_agent_fight"):
+        for target in ("stage_read_pin", "yougame_agent_fight"):
             self.assertIn("add_executable(port_" + target + "_test", port)
+        # Mode policy is shared before the native-Linux early return.
+        self.assertIn("add_executable(port_yougame_mode_policy_test", root)
+        self.assertLess(root.index("add_test(NAME port_yougame_mode_policy "), root.index("  return()"))
         self.assertIn('option(YOUGAME_AGENT_TEST_HOOK ', port)
         self.assertIn("add_test(NAME port_yougame_0965_merge ", root)
 

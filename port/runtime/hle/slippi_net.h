@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "slippi_game_prep.h"
+#include "opponent_display.h"
 #include "slippi_mm_service.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -18,13 +20,27 @@
 #include <unordered_map>
 #include <vector>
 #include "early_input_rules.h"
+#include "../abi/mu_setup_hash.h"
+#include "../abi/mu_pick_preview.h"
+#include "../abi/mu_friends_lobby.h"
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#include "yougame_squad.h"
+#endif
 
 struct _ENetHost;
 struct _ENetPeer;
+namespace yougame::udp { struct EnetIngress; }
+namespace yougame { struct Search; struct Match; }
+namespace yougame::lobby { class Control; struct Plan; }
+namespace slippi { struct PortInputs; }
 
 namespace slippi {
 
 constexpr int ROLLBACK_MAX_FRAMES = 7;
+// How long a peer connection may take (NetplayClient::ThreadFunc), and how long a match setup
+// waits for every peer's setup hash before that peer counts as disconnected.
+constexpr uint64_t kConnectTimeoutMs = 8000;
 constexpr int ONLINE_LOCKSTEP_INTERVAL = 30;
 constexpr int REMOTE_PLAYER_MAX = 3;
 constexpr int PLAYER_COUNT_MAX = REMOTE_PLAYER_MAX + 1;
@@ -53,17 +69,44 @@ enum NetMsg : uint8_t {
   // Melee Unlocked only: a ping before the match (request or reply), sent only to a peer whose build
   // message said it answers them, so auto delay has a ping when the match is set up.
   NP_MSG_MU_PING = 0xE2,
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  NP_MSG_MU_SQUAD = 0xE3,
+#endif
+  // Melee Unlocked only: the hash of the match setup this side built (mu_setup_hash.h). Sent to
+  // every peer; only a peer whose build message carried MU_SETUP_HASH_CAP is waited for.
+  NP_MSG_MU_SETUP_HASH = 0xE6,
+  // Melee Unlocked only: the sender's live pick on the character screen (mu_pick_preview.h), sent
+  // only to a peer whose build message carried MU_PICK_PREVIEW_CAP. Display only: the match is
+  // still set up from 0x82 (and 0xE3).
+  NP_MSG_MU_PICK_PREVIEW = MU_PICK_PREVIEW_MSG,
   // Melee Unlocked only: arena room traffic (slippi_arena.h) on a room link, sent only to a peer
-  // whose build message said it takes it (capability bit 4). Never on a match connection's pads.
-  NP_MSG_MU_ARENA = 0xE3,
+  // whose build message said it takes it (MU_BUILD_CAPS2_ARENA). Never on a match connection's pads.
+  // Upstream numbers it 0xE3 and flags it with capability bit 0x10; this build already uses both
+  // (Squad Strike), so it rides 0xE7 and the second capability byte here.
+  NP_MSG_MU_ARENA = 0xE7,
   // Melee Unlocked only: Gecko codes offered, answered and agreed for the match (gecko_online.h),
-  // sent only to a peer whose build message said it takes them (capability bit 6).
-  NP_MSG_MU_GECKO = 0xE4,
+  // sent only to a peer whose build message said it takes them (MU_BUILD_CAPS2_GECKO). Upstream
+  // gives it this build's pick preview id and capability bit 0x40 (the setup hash here), so it
+  // rides 0xE8 and the second capability byte here.
+  NP_MSG_MU_GECKO = 0xE8,
   // Melee Unlocked only: the sender went to warm up in Training while staying connected, or came back
   // to the character select (slippi_warmup.h). Sent only to a peer whose build message said it takes
-  // it (capability bit 7); anyone else just sees a player who has not picked yet.
-  NP_MSG_MU_WARMUP = 0xE5,
+  // it; anyone else just sees a player who has not picked yet. Melee Unlocked 0.9.215 and 0.9.216
+  // number it 0xE5 and flag it with first capability bit 0x80; this build already uses 0xE5 (machine
+  // pads, slippi_port_inputs.h), so between builds with the third capability byte it rides 0xE9 and
+  // caps3 bit 0x10, and toward those two releases 0xE5 (NP_MSG_MU_WARMUP_UPSTREAM).
+  NP_MSG_MU_WARMUP = 0xE9,
 };
+static_assert(NP_MSG_MU_SETUP_HASH == MU_SETUP_HASH_MSG, "one setup hash id");
+// The warm-up message's id on the wire toward (and from) Melee Unlocked 0.9.215 and 0.9.216, which have
+// no third capability byte. Only ever read as warm-up from such a peer and outside machine pads.
+constexpr uint8_t NP_MSG_MU_WARMUP_UPSTREAM = 0xE5;
+// MU_BUILD third capability byte (this build on): 0x01 Squad Strike, 0x02 its friend rooms, 0x04 pick
+// previews, 0x08 setup hash, 0x10 warm-up messages (NP_MSG_MU_WARMUP, 0xE9).
+constexpr uint8_t MU_BUILD_CAPS3_WARMUP = 0x10;
+// First capability byte bit Melee Unlocked 0.9.215 and 0.9.216 read as warm-up (their 0xE5 messages).
+constexpr uint8_t MU_BUILD_CAPS_UPSTREAM_WARMUP = 0x80;
 
 // sf::Packet wire format: integers big-endian, bool as one byte, strings as u32 length + bytes.
 class Packet {
@@ -108,6 +151,7 @@ struct RemotePadOutput {
   uint32_t checksum = 0;
   uint8_t player_idx = 0;
   bool is_disconnected = false;
+  bool checksum_primary = true; // compare once per machine, though every port carries the checksum
   int32_t despawn_frame = 0;   // the frame a dropped player's fighter despawns on, 0 until settled
   std::vector<uint8_t> data;
 };
@@ -149,7 +193,16 @@ struct UserInfo {
 // The user record written by the Slippi Launcher (user.json in the Slippi user folder).
 class User {
  public:
-  explicit User(std::string user_dir);
+  // slippi_only loads a Slippi login without replacing the menu's YouGame identity.
+  // Under YouGame this reads only its explicit grant; standalone keeps upstream discovery.
+  explicit User(std::string user_dir, bool slippi_only = false);
+  // Every YouGame Slippi path uses only the account explicitly granted by its app.
+  // No ambient launcher discovery or server request when the grant is absent.
+  static std::unique_ptr<User> GrantedSlippiUser(const std::string& user_dir);
+  // A search's own copy of the menu's signed-in Slippi login (the launcher's Both Unranked): the same
+  // account with its own version check, read from no file and refreshed from no server. Null when
+  // `from` is not signed in.
+  static std::unique_ptr<User> SearchCopy(const User& from);
   bool AttemptLogin(bool rediscover = false);  // Log In rechecks shared launcher folders too.
   bool IsLoggedIn() const { return logged_in_; }
   UserInfo GetUserInfo() const { std::lock_guard<std::mutex> lock(mutex_); return info_; }
@@ -174,7 +227,10 @@ class User {
   int PollOnlineCompatibility(std::string* error, VersionFetch fetch = nullptr);
   void ResetOnlineCompatibility() { ++compatibility_generation_; compatibility_done_ = false; }
  private:
+  struct Copy {};
+  User(Copy, const User& from);
   std::string dir_;
+  bool slippi_only_ = false;
   std::string account_file_;
   bool account_discovered_ = false;
   UserInfo info_;
@@ -212,21 +268,61 @@ class DirectCodes {
 class NetplayClient {
  public:
   enum class ConnectStatus { UNSET, INITIATED, CONNECTED, FAILED, DISCONNECTED };
-  enum class DisconnectReason : uint32_t { UNSPECIFIED = 0, POOR_PERFORMANCE = 1 };
+  enum class DisconnectReason : uint32_t { UNSPECIFIED = 0, POOR_PERFORMANCE = 1
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    , SQUAD_PROTOCOL = 2
+#endif
+  };
 
   NetplayClient(std::vector<std::string> addrs, std::vector<uint16_t> ports, uint8_t remote_player_count, uint16_t local_port,
-                bool is_decider, uint8_t player_idx);
+                bool is_decider, uint8_t player_idx, bool own_udp = false, std::vector<std::string> public_fallbacks = {}
+#if MU_SQUAD
+                // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+                , bool squad_search = false, MuSquadSide squad_side = {}, bool squad_friend_room = false
+#endif
+                , const yougame::lobby::Plan* lobby_plan = nullptr);
   ~NetplayClient();
 
   bool IsDecider() const { return is_decider_; }
   uint8_t LocalPlayerPort() const { return player_idx_; }
   ConnectStatus GetSlippiConnectStatus() const { return status_.load(std::memory_order_acquire); }
+  // The opponent came from YouGame's rooms: SendBuild's first capability byte keeps YouGame's meanings.
+  void set_yougame_peer(bool on) { yougame_peer_.store(on); }
+  bool OwnUDPPortUnavailable() const { return own_udp_port_unavailable_; }
   std::vector<int> GetFailedConnections() const { return failed_connections_; }
   void StartSlippiGame();
-  void SendSlippiPad(std::unique_ptr<Pad> pad);
+  void SendSlippiPad(std::unique_ptr<Pad> pad, std::unique_ptr<Pad> partner = nullptr);
+  int RemoteMachineCount() const { return remote_player_count_; }
+  int RemotePortCount() const;
+  int SecondLocalPort() const;
+  bool IsLocalVirtualPort(int index) const;
   void SetMatchSelections(PlayerSelections& s);
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  void SetSquadSelection(const MuSquadSide& side);
+  bool SquadSetup(MuSquadSetup* out);
+  bool SquadCancelled() const { return squad_cancelled_.load(); }
+  // A friend room this side joined in Squad Strike because the friend picked it (their MU_BUILD came
+  // with MU_SQUAD_CAP); the game's character select asks for it with MU_SQUAD_OP_FRIEND.
+  bool SquadAdopted() const { return squad_adopted_.load(); }
+  // A friend room whose friend's build has not arrived yet: it may still turn the room into Squad
+  // Strike, so nobody locks in until it does (the joiner's lock-in is held, never sent plain).
+  // Reads the build mark before squad_search_: an adoption stores squad_adopted_, squad_search_, then
+  // the mark, so "not waiting" here always comes with the adoption already visible.
+  bool SquadFriendWaiting() const { return squad_friend_room_ && !squad_peer_build_.load() && !squad_search_.load(); }
+  // This game can't load Squad Strike (memory, disc identity): a build without either squad bit
+  // tells the friend, whose game cancels the room on screen.
+  void SquadFriendRefuse();
+  // What the player is told when a squad match is refused (set before CancelSquad).
+  const char* SquadCancelText() const { return squad_cancel_text_.load(); }
+  void CancelSquad(const char* reason);
+  // Cancel with this text for the player (a static string) instead of the generic one.
+  void RefuseSquad(const char* text, const char* reason);
+  bool SquadPeerDisconnect(uint32_t reason);
+#endif
   void ResendSelections();   // the same selection again, with a fresh Gecko lock
-  std::unique_ptr<RemotePadOutput> GetSlippiRemotePad(int index, int max_frame_count);
+  std::unique_ptr<RemotePadOutput> GetSlippiRemotePad(int index, int max_frame_count, int32_t frame = INT32_MAX);
   void DropOldRemoteInputs(int32_t finalized_frame);
   std::unordered_map<uint8_t, bool> GetActivePlayerIndices() const;
   void ForceDisconnectPlayer(uint8_t player_idx);
@@ -241,7 +337,7 @@ class NetplayClient {
   // Once a dropped player's last input is settled it repeats up to `frame` (Slippi 3.7.0).
   void FillDroppedPlayerInputs(int32_t frame);
   int LastPingMs() const { return (int)(last_ping_ms_.load(std::memory_order_relaxed)); }
-  // Each remote player's last ping (Teams has up to three), and how many there are. UI thread safe.
+  // Each remote machine's last ping (Teams has up to three), and how many there are. UI thread safe.
   int RemotePingMs(int index) const {
     return index >= 0 && index < REMOTE_PLAYER_MAX ? (int)remote_ping_ms_[index].load(std::memory_order_relaxed) : 0;
   }
@@ -255,10 +351,18 @@ class NetplayClient {
   uint8_t remote_sent_chat_message_id = 0;
   // The opponents' builds (NP_MSG_MU_BUILD), and when the connection completed. early_pads: the
   // build takes early inputs (a trailing byte older builds never sent and never read).
-  struct RemoteBuild { bool received = false, mod_view = false; std::string fingerprint, name; bool early_pads = false, pings = false, static_engine = false;
+  struct RemoteBuild { bool received = false, mod_view = false; std::string fingerprint, name; bool early_pads = false, pings = false;
                        uint32_t shield_rgb = 0;   // their own shield colour, 0x1000000 | RGB, 0 none sent
-                       uint8_t port = 0xFF;       // their in-game slot
-                       std::string ranked_rules_digest;
+                       uint8_t port = 0xFF;
+                       bool static_engine = false; std::string ranked_rules_digest;   // their in-game slot
+                       bool setup_hash = false;   // they send NP_MSG_MU_SETUP_HASH and wait for ours
+                       bool pick_previews = false;   // takes NP_MSG_MU_PICK_PREVIEW
+                       uint8_t caps2 = 0;   // the second capability byte (mu_friends_lobby.h), 0 when absent
+                       // Which MU_BUILD layout the peer speaks: 0 Melee Unlocked 0.9.200 to 0.9.216 (one byte:
+                       // 0x10 arena, 0x20 automatic L-cancel, 0x40 Gecko, 0.9.215 on 0x80 warm-up; arena, Gecko and
+                       // warm-up ride ids 0xE3, 0xE4 and 0xE5), 1 YouGame builds 1xx (two bytes, no warm-up),
+                       // 2 this build and later (three bytes; warm-up when caps3 has MU_BUILD_CAPS3_WARMUP).
+                       uint8_t layout = 2;
                        bool arena = false;         // takes arena room messages
                        bool auto_lcancel = false;     // presses for L-cancels this session (automatic L-cancel)
                        bool gecko = false;            // takes Gecko code messages (NP_MSG_MU_GECKO)
@@ -279,7 +383,13 @@ class NetplayClient {
   // The shield colour the opponent on in-game `slot` sent (0 none).
   uint32_t RemoteShieldColor(int slot);
   RemoteBuild GetRemoteBuild(int index);
-  int RemoteCount() { std::lock_guard<std::mutex> lk(build_mutex_); return remote_player_count_; }   // opponents on this connection
+  // Whether every remote machine has sent NP_MSG_MU_BUILD, which plain Slippi Dolphin never does.
+  bool EveryRemoteReadsGoneOwnFrames();
+  // The match setup hash (mu_setup_hash.h). SendSetupHash queues ours for every peer (any thread);
+  // GetSetupHash gives remote `index`'s latest one.
+  struct PeerSetupHash { bool received = false; MuSetupHash value{}; };
+  void SendSetupHash(uint64_t inputs, uint64_t setup);
+  PeerSetupHash GetSetupHash(int index);
   uint64_t ConnectedAtMs() const { return connected_at_ms_.load(std::memory_order_acquire); }
   // Early inputs. SendEarlyPad goes to the peers that take them (any thread: it only queues).
   // EarlyPads gives remote `index`'s early pads for frames after `latest` (its confirmed pads reach
@@ -289,6 +399,12 @@ class NetplayClient {
   // not take this build's early pads (Slippi Dolphin, and the Static Recomp). Any thread: it only queues.
   void SendSlippiPadSuggestion(int32_t target_frame, uint32_t seq, const uint8_t pad[host::early_input::kPadBytes]);
   void EarlyPads(int index, int32_t latest, std::vector<host::early_input::Entry>& out);
+  // Live pick previews (display only). SendPickPreview: the game thread, every CSS frame; sends
+  // to the peers that take them, only while CONNECTED, only on change, at most one per
+  // MU_PICK_PREVIEW_INTERVAL frames. RemotePickPreview: remote `index`'s latest preview and its
+  // port, false when none arrived since the last game start or that player is gone.
+  void SendPickPreview(const MuPickPreview& pick, uint32_t frame);
+  bool RemotePickPreview(int index, MuPickPreview* out, uint8_t* port);
   // Arena room links (one remote). SendArena queues one message for a peer that takes them (false
   // when it does not, or before its build message arrived); `bulk` sends it on its own reliable
   // channel so the live feed never holds up room messages. PopArena takes the oldest received.
@@ -305,7 +421,12 @@ class NetplayClient {
   struct FrameOffsetData { int idx = 0; std::vector<int32_t> buf; };
   struct ActiveConnectionInfo { uint8_t player_idx = 0; bool is_disconnected = false; };
 
-  uint8_t PlayerIdxFromPort(uint8_t port) const { return port > player_idx_ ? port - 1 : port; }
+  // Connection index, used only by machine-scoped messages and clocks.
+  uint8_t PlayerIdxFromPort(uint8_t port) const {
+    for (int i = 0; i < remote_player_count_; ++i) if (match_info_.remote[i].player_idx == port) return (uint8_t)i;
+    return REMOTE_PLAYER_MAX;
+  }
+  int SenderPort(_ENetPeer* peer) const;
   void OnData(Packet& packet, _ENetPeer* peer);
   void Send(Packet& packet);
   void Disconnect();
@@ -315,7 +436,7 @@ class NetplayClient {
   // dropped player, and after a short wait everyone settles on the same last input and despawn frame.
   bool ProcessPlayerDrops();
   void SendPlayerDropReport(uint8_t port);
-  void AddPlayerDropReportInputs(uint8_t pidx, int32_t last_frame, uint8_t count, const uint8_t* inputs);
+  void AddPlayerDropReportInputs(uint8_t port, int32_t last_frame, uint8_t count, const uint8_t* inputs);
   bool AreAllConnectionsDisconnected();
   void WriteSelections(Packet& p, const PlayerSelections& s);
   std::unique_ptr<PlayerSelections> ReadSelections(Packet& p);
@@ -328,9 +449,12 @@ class NetplayClient {
   // thread merges remote selections, the game thread reads, resets and sets its own; the player_idx
   // fields are written once in the constructor and read without it).
   // Selection receipt takes selection_mutex_, timing_mutex_ and pad_mutex_ together so its
-  // pre-start decision and queue reset are atomic. Other locks are taken alone, except
-  // chat_mutex_ then async_mutex_ (the chat-disabled reply is queued under chat_mutex_).
+  // pre-start decision and queue reset are atomic. Pad sends take pad_mutex_ before
+  // ack_mutex_ and async_mutex_; chat replies take chat_mutex_ before async_mutex_.
+  // Neither ACK receipt nor the async drain takes pad_mutex_.
   // async_mutex_ is never held while taking another, so no two are ever taken in opposite orders.
+  // SetMatchSelections also queues a lock-in's pick preview under selection_mutex_; that takes the
+  // leaves build_mutex_ and pick_mutex_ one at a time, never selection_mutex_ under them.
   std::mutex timing_mutex_, chat_mutex_, selection_mutex_;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   struct AsyncPacket {
@@ -346,9 +470,12 @@ class NetplayClient {
   std::deque<std::unique_ptr<Packet>> async_queue_;
 #endif
   _ENetHost* client_ = nullptr;
+  std::unique_ptr<yougame::udp::EnetIngress> own_udp_ingress_;
+  bool own_udp_port_unavailable_ = false;
   std::vector<_ENetPeer*> server_;
+  std::vector<std::string> public_fallbacks_; // parallel to remote seats, never additional players
   std::thread thread_;
-  uint8_t remote_player_count_ = 0;
+  uint8_t remote_player_count_ = 0; // real remote machines: server_, ACKs, clocks, builds and setup hashes
   std::atomic<bool> do_loop_{true};
   bool is_decider_ = false, has_game_started_ = false;
   std::array<bool, REMOTE_PLAYER_MAX> remote_game_started_{};   // under timing_mutex_
@@ -356,9 +483,11 @@ class NetplayClient {
   std::unordered_map<std::string, std::map<_ENetPeer*, ActiveConnectionInfo>> active_connections_;
   std::atomic<bool> player_active_[PLAYER_COUNT_MAX] = {};
   std::deque<std::unique_ptr<Pad>> local_pad_queue_;
-  std::deque<std::unique_ptr<Pad>> remote_pad_queue_[REMOTE_PLAYER_MAX];
-  // Each remote player's latest inputs, newest first: what another client may be missing if the player drops.
-  std::deque<Pad> remote_pad_history_[REMOTE_PLAYER_MAX];   // under pad_mutex_
+  std::unique_ptr<PortInputs> port_inputs_;
+  bool machine_pad_format_ = false;
+  // Each remote port's latest inputs, newest first: what another client may be missing if the
+  // player drops (Slippi 3.7.0). By port, like port_inputs_->pads; under pad_mutex_.
+  std::deque<Pad> remote_pad_history_[PLAYER_COUNT_MAX];
   std::atomic<int32_t> despawn_frames_[PLAYER_COUNT_MAX] = {};   // by port, 0 until settled
   uint64_t player_drop_times_ms_[PLAYER_COUNT_MAX] = {};         // network thread only
   struct ChecksumEntry { int32_t frame = 0; uint32_t value = 0; } remote_checksums_[REMOTE_PLAYER_MAX];
@@ -381,6 +510,7 @@ class NetplayClient {
   std::unique_ptr<PlayerSelections> remote_chat_message_selection_;
   std::mutex build_mutex_;
   RemoteBuild remote_build_[REMOTE_PLAYER_MAX];
+  PeerSetupHash setup_hash_[REMOTE_PLAYER_MAX];   // under build_mutex_
   std::atomic<uint64_t> connected_at_ms_{0};
   host::early_input::Buffer early_pads_[REMOTE_PLAYER_MAX];   // under pad_mutex_
   std::mutex arena_mutex_;                       // arena_inbox_ (network thread in, game thread out)
@@ -388,8 +518,42 @@ class NetplayClient {
   std::mutex gecko_mutex_;                       // gecko_inbox_ (network thread in, game thread out)
   std::deque<std::vector<uint8_t>> gecko_inbox_;
   std::atomic<int8_t> remote_warmup_[REMOTE_PLAYER_MAX] = {-1, -1, -1};   // NP_MSG_MU_WARMUP, by remote index
+  std::atomic<bool> yougame_peer_{false};
   std::atomic<int32_t> remote_pick_[REMOTE_PLAYER_MAX] = {-1, -1, -1};    // and the pick it carried
   void SendBuild();
+  // Pick previews. pick_mutex_ is a leaf: never held while taking another lock (SendAsync and
+  // build_mutex_ included). It guards everything below it here.
+  void QueuePickPreview(MuPickPreview pick, uint32_t frame, bool locked_now);
+  void SendLockedPickPreview();
+  std::mutex pick_mutex_;
+  MuPickPreviewSender pick_sender_{};
+  MuPickPreview pick_local_{};
+  bool pick_local_set_ = false;
+  uint8_t pick_sent_peers_ = 0;   // remote indices that took previews at the last send
+  MuPickPreview pick_remote_[REMOTE_PLAYER_MAX] = {};
+  uint8_t pick_remote_port_[REMOTE_PLAYER_MAX] = {};
+  bool pick_remote_set_[REMOTE_PLAYER_MAX] = {};
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  // squad_search_ starts as the chosen search; in a friend room it turns on (never off) when the
+  // friend's build arrives with MU_SQUAD_CAP, so it is read across threads.
+  std::atomic<bool> squad_search_{false};
+  bool squad_normal_logged_ = false, squad_friend_room_ = false;
+  std::atomic<bool> squad_advertised_{false}, squad_peer_cap_{false}, squad_cancelled_{false}, squad_adopted_{false};
+  // Friend rooms: the friend's build arrived (and whether it said it joins Squad Strike); a locked
+  // selection went either way or a game started (a late Squad Strike cancels, never adopts); this
+  // game refused Squad Strike (SquadFriendRefuse).
+  std::atomic<bool> squad_peer_build_{false}, squad_peer_friend_cap_{false}, squad_locked_seen_{false},
+      squad_refused_{false};
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  bool squad_test_late_lineup_ = false; // guarded by selection_mutex_
+#endif
+  MuSquadSide squad_local_{}, squad_transmitted_{}, squad_peer_{}, squad_incoming_{}; // selection_mutex_
+  bool squad_peer_pending_ = false, squad_peer_selected_ = false;
+  bool squad_peer_other_version_ = false; // the peer's last 0xE3 was another MU_SQUAD_VERSION; selection_mutex_
+  std::atomic<const char*> squad_cancel_text_{"Squad Strike setup didn't match. Match not started."};
+#endif
 };
 
 class Matchmaking {
@@ -397,7 +561,22 @@ class Matchmaking {
   // Slippi's mode ids. Ranked is backed by YouGame when launched by its app.
   enum OnlinePlayMode { RANKED = 0, UNRANKED = 1, DIRECT = 2, TEAMS = 3, PARTY = 4 };
   enum ProcessState { IDLE, INITIALIZING, MATCHMAKING, OPPONENT_CONNECTING, CONNECTION_SUCCESS, ERROR_ENCOUNTERED };
-  struct MatchSearchSettings { OnlinePlayMode mode = UNRANKED; std::string connect_code; std::vector<std::string> blocked_codes; std::string friend_room; };
+  struct MatchSearchSettings { OnlinePlayMode mode = UNRANKED; std::string connect_code; std::vector<std::string> blocked_codes; std::string friend_room;
+    // The 4-player Friends lobby (yougame_lobby.h): a YouGame room held by the host or joined from an
+    // invite (lobby_room), driven by the 4-door select through lobby_control. Never a Slippi search.
+    bool friends_lobby = false;
+    std::string lobby_room;
+    std::shared_ptr<yougame::lobby::Control> lobby_control;
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    bool squad = false;
+    MuSquadSide squad_side{};
+    std::string squad_budget;
+#endif
+    // Slippi's Unranked plays this game's gameplay (vanilla, native_online_policy.h); set by the
+    // online menu's search. Only the launcher's Both Unranked reads it: false searches YouGame alone.
+    bool slippi_gameplay = false;
+  };
   // True when an opponent in the match is on the Unranked block list (codes compared ignoring case
   // and spaces). Public for the unit test.
   static bool IsBlockedMatch(OnlinePlayMode mode, const std::vector<std::string>& blocked,
@@ -413,6 +592,7 @@ class Matchmaking {
     std::vector<UserInfo> players;          // in the ticket's order
     int local_player_index = 0;             // the local player's port - 1
     std::vector<std::string> remote_ips;    // "ip:port" per remote, in the ticket's order
+    std::vector<std::string> public_fallbacks; // same shape; empty when no same-router fallback
     bool is_host = false;
     std::vector<uint16_t> stages;
     uint32_t items = 0;
@@ -441,10 +621,8 @@ class Matchmaking {
   std::unique_ptr<NetplayClient> GetNetplayClient() { std::lock_guard<std::mutex> lk(result_mutex_); return std::move(netplay_client_); }
   int LocalPlayerIndex() const { std::lock_guard<std::mutex> lk(result_mutex_); return local_player_index_; }
   std::vector<UserInfo> GetPlayerInfo() const { std::lock_guard<std::mutex> lk(result_mutex_); return player_info_; }
-  std::string GetPlayerName(uint8_t port) const {
-    std::lock_guard<std::mutex> lk(result_mutex_);
-    return port < player_info_.size() ? player_info_[port].display_name : "";
-  }
+  display::Provider DisplayProvider() const { return display_provider_.load(); }
+  std::string GetPlayerName(uint8_t port) const;
   std::vector<uint16_t> GetStages() const { std::lock_guard<std::mutex> lk(result_mutex_); return allowed_stages_; }
   // Never more than REMOTE_PLAYER_MAX: callers index fixed per-remote arrays with it.
   uint8_t RemotePlayerCount() const {
@@ -471,7 +649,16 @@ class Matchmaking {
  private:
   void MatchmakeThread();
   void startMatchmaking();
-  void startYouGameMatchmaking();
+  // status: the Unranked status line while it searches (yougame_blend.h kSearch*); null for "searching".
+  void startYouGameMatchmaking(const char* status = nullptr);
+  bool youGameSearch(yougame::Search* search);     // false: the search has failed (an unreadable code)
+  void takeYouGameMatch(const yougame::Match& match);
+  // Blended Unranked (yougame_blend.h): YouGame's and Slippi's searches at once, first opponent wins.
+  void blendMatchmaking();
+  // Slippi's matchmaking client up to a queued ticket: "" once queued, else why not. `stop` ends it
+  // early; `avoid` is a port it must not take (the blend's YouGame port).
+  std::string openSlippiTicket(const UserInfo& me, const std::function<bool()>& stop, int avoid);
+  void dropSlippi();                       // ends Slippi's matchmaking client now
   void handleMatchmaking();
   void handleConnecting();
   void disconnectFromServer();
@@ -481,6 +668,10 @@ class Matchmaking {
   void fail(const std::string& message);      // the search ends with this error text
 
   User* user_;
+  // Separate from the menu's YouGame identity; never passed to YouGame's bridge or reporter.
+  std::unique_ptr<User> slippi_user_;
+  // Matchmaking thread publishes the selected route; only display code consumes it.
+  std::atomic<display::Provider> display_provider_{display::Provider::Unknown};
   _ENetHost* client_ = nullptr;
   _ENetPeer* server_ = nullptr;
   bool is_mm_connected_ = false;
@@ -517,8 +708,13 @@ class Matchmaking {
   int host_port_ = 0;
   uint16_t port_override_ = 0;
   std::vector<std::string> remote_ips_;
+  std::vector<std::string> public_fallbacks_;
   bool is_host_ = false;
 };
+
+// Launched by the app on the base listing: tells it whether Unranked can use a Slippi login when the
+// online menu first opens (yougame::slippi_link), read once off the game thread. Remixes send nothing.
+void announce_slippi_link(const std::string& user_dir);
 
 // Helpers shared with the EXI device.
 uint64_t time_us();

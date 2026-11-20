@@ -326,6 +326,40 @@ int main() {
           "a paired draw holding the previous frame is carried off that view");
     gx::set_authored_interpolate(false);
   }
+  // Menus interpolate, so every menu draw is shown between the previous frame and this one. A
+  // draw whose vertex stream cannot be blended (here a leftover texture-matrix selector differs, as
+  // on most menu ticks) must still advance its matrices with the rest: holding it at the current
+  // frame drew those pieces of a sliding menu row a tick ahead of the pieces that blended, which
+  // is the doubled Online menu rows at 180 Hz. A draw whose matrix binding really changed holds.
+  {
+    // assign, not resize: frame vertices use an allocator that leaves new elements unset.
+    gx::Frame ma, mb; ma.sequence = 10; mb.sequence = 11; ma.vertices.assign(6, gx::Vertex{}); mb.vertices.assign(6, gx::Vertex{});
+    gx::DrawCall row{}; row.identity = 21; row.object_generation = 3; row.vertex_count = 3; row.primitive = 0x90;
+    row.components = 0; row.matrix_index_a = 0; row.xf_regs[0x3F] = 0;
+    std::memcpy(row.normalMatrices, ident_n, sizeof ident_n);
+    rot_z(0, 0, row.posMatrices); ma.draws.push_back(row);
+    gx::DrawCall cap = row; cap.identity = 22; cap.first_vertex = 3; cap.components = gx::VB_HAS_POSMTXIDX;
+    ma.draws.push_back(cap);
+    rot_z(0, 6, row.posMatrices); mb.draws.push_back(row);   // the row slides 6 units this tick
+    rot_z(0, 6, cap.posMatrices); mb.draws.push_back(cap);
+    mb.vertices[0].pos[0] = 0.5f;          // rewritten text: the stream changed
+    mb.vertices[1].texmtx[3] = 5;          // leftover selector: the stream cannot blend
+    mb.vertices[3].pos[0] = 0.5f;          // the end cap is rewritten too, and its binding moved
+    mb.vertices[3].posmtx = 3;
+    gx::SubFrameSolver menu; menu.max_rotation = 3.0f; menu.set_menu_mode(true);
+    menu.set_frames(&ma, &mb);
+    check(menu.stats().paired == 2, "menu row and end cap pair");
+    std::vector<gx::DrawMatrices> mm;
+    menu.build(0.5, true, mm, true);
+    check(mm.size() == 2 && !mm[0].vertices && near(mm[0].pos[3], 3.0f),
+          "a menu draw that cannot blend its stream still advances with the rest of the menu");
+    check(near(mm[1].pos[3], 6.0f), "a menu draw whose matrix binding changed holds its current frame");
+    check(menu.stats().menu_advanced == 1, "unchanged menu route-6 bindings count as advanced");
+    check(menu.stats().menu_held == 1, "changed menu route-6 posmtx counts as held");
+    menu.build(0.75, true, mm, true);
+    check(menu.stats().menu_advanced == 1 && menu.stats().menu_held == 1,
+          "menu route-6 counters reset on each build");
+  }
   // Three shaken fighter draws must not outvote the stage's actual camera.
   // An unpaired piece of stage art should follow the camera pan alone.
   {
@@ -353,6 +387,37 @@ int main() {
     solver.set_frames(&before, &after); solver.build(.5, false, mats, true);
     std::printf("model-shake stage carry: %g (paired=%u carried=%u)\n", mats.back().pos[3], solver.stats().paired, solver.stats().carried);
     check(near(mats.back().pos[3], 3), "fighter hit shake cannot become the stage camera");
+  }
+  // Predict ahead, a slow pan (0.1 units, inside the near-static tolerance). A piece of the world with
+  // no authored pose moves by exactly the camera step and is carried with it; game text on the HUD's own
+  // perspective camera (the online name tags under the percents) repeats its matrices exactly and must be
+  // drawn where the game put it, not carried by a share of the world camera's step on every sub-frame.
+  {
+    gx::Frame before, after; before.sequence = 1; after.sequence = 2;
+    before.vertices.resize(3, gx::Vertex{}); after.vertices.resize(3, gx::Vertex{});
+    auto old_view = std::make_shared<gx::AuthoredPose>(), new_view = std::make_shared<gx::AuthoredPose>();
+    old_view->has_view = new_view->has_view = true;
+    old_view->view = new_view->view = NativeMelee::Identity(); new_view->view[3] = 0.1f;
+    gx::AuthoredJoint root; root.generation = 1; root.scale = {1,1,1}; root.world = NativeMelee::Identity();
+    old_view->joints.push_back(root); new_view->joints.push_back(root);
+    const float world_proj[7] = {1.5f, 0, 2.0f, 0, -1.0f, -2.0f, 0}, hud_proj[7] = {2.5f, 0, 3.3f, 0, -1.0f, -2.0f, 0};
+    gx::DrawCall camera{}; camera.identity = 300; camera.object_generation = 1; camera.vertex_count = 3; camera.primitive = 0x90;
+    std::memcpy(&camera.xf_regs[0x20], world_proj, sizeof world_proj);
+    std::memcpy(camera.normalMatrices, ident_n, sizeof ident_n);
+    gx::DrawCall world = camera; world.identity = 301; world.object_generation = 0;
+    gx::DrawCall hud = world; hud.identity = 302;
+    std::memcpy(&hud.xf_regs[0x20], hud_proj, sizeof hud_proj);
+    rot_z(0, 5, hud.posMatrices);
+    camera.authored_pose = old_view; rot_z(0, 0, camera.posMatrices); rot_z(0, 0, world.posMatrices);
+    before.draws = {camera, world, hud};
+    camera.authored_pose = new_view; rot_z(0, 0.1f, camera.posMatrices); rot_z(0, 0.1f, world.posMatrices);
+    after.draws = {camera, world, hud};
+    gx::SubFrameSolver pan; pan.max_rotation = 3.0f;
+    pan.set_frames(&before, &after);
+    pan.build(.5, false, mats, true);
+    std::printf("slow pan: world %g hud %g (paired=%u carried=%u)\n", mats[1].pos[3], mats[2].pos[3], pan.stats().paired, pan.stats().carried);
+    check(mats.size() == 3 && mats[1].pos[3] > 0.101f, "a world draw with no pose follows a slow pan ahead of the tick");
+    check(std::memcmp(mats[2].pos, hud.posMatrices, sizeof mats[2].pos) == 0, "HUD text on its own camera stays where the game drew it during a pan");
   }
   std::puts("sub-frame rigid fractions, cuts, blends, pairing and model-shake isolation passed");
 }

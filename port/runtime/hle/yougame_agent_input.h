@@ -14,16 +14,22 @@ struct InputState {
   bool ranked = false;  // Also covers a ranked teams/doubles room, regardless of mode id.
   unsigned players = 0;
   bool all_agents = false;
+  bool no_other_players = false;
 };
 inline constexpr bool ranked_mode(int mode) { return mode == 0; }
 inline constexpr bool gameplay_input_allowed(const InputState& s) {
   return !s.ranked && !ranked_mode(s.mode) && (s.mode == -1 ||
-      (s.mode >= 1 && s.mode <= 4 && s.players && s.all_agents));
+      (s.mode >= 1 && s.mode <= 4 && (s.no_other_players || (s.players && s.all_agents))));
+}
+inline InputState pre_room_input_state(uint64_t session, int mode, bool ranked = false) {
+  InputState s{session, mode, ranked || ranked_mode(mode)};
+  s.no_other_players = true;
+  return s;
 }
 // Consume only the server's room roster, including the local connection. Never coerce hn.
 template<class Json>
 InputState room_input_state(uint64_t session, int mode, bool ranked,
-                            const Json& participants, const std::string& me) {
+                            const Json& participants, const std::string& me, bool pending = false) {
   InputState s{session, mode, ranked || ranked_mode(mode)};
   if (!participants.is_array() || participants.empty()) return s;
   bool local = false;
@@ -35,6 +41,7 @@ InputState room_input_state(uint64_t session, int mode, bool ranked,
     if (p.is_object() && p.count("connectionId") && p["connectionId"].is_string() &&
         p["connectionId"] == me && !me.empty()) local = true;
   }
+  s.no_other_players = pending && local && s.players == 1;
   s.all_agents = s.all_agents && local;
   return s;
 }
@@ -53,6 +60,7 @@ class InputPolicy {
   bool allowed(const InputState& s, InputKey key, Log log) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Roster changes never reset the per-session diagnostics.
+    if (session_ != s.session) pre_room_ = 0;
     if (session_ != s.session || (offline_ && s.mode != -1)) {
       session_ = s.session;
       ranked_ = room_ = allowed_ = 0;
@@ -61,11 +69,12 @@ class InputPolicy {
     const unsigned bit = 1u << static_cast<unsigned>(key);
     const bool ok = gameplay_input_allowed(s);
     if (ok && offline_) return true;
-    unsigned& reported = ok ? allowed_ : (s.ranked || ranked_mode(s.mode)) ? ranked_ : room_;
+    unsigned& reported = ok ? (s.no_other_players ? pre_room_ : allowed_) : (s.ranked || ranked_mode(s.mode)) ? ranked_ : room_;
     if (!(reported & bit)) {
       reported |= bit;
       const std::string line = std::string("agent-test: ") + input_key_name(key) +
-          (ok ? " allowed: agent-only room (" + std::to_string(s.players) + " agent players)" :
+          (ok && s.no_other_players ? " allowed: no other player in the room yet" :
+           ok ? " allowed: agent-only room (" + std::to_string(s.players) + " agent players)" :
            (s.ranked || ranked_mode(s.mode)) ? " refused in ranked" : " refused: not an agent-only room");
       log(line.c_str());
     }
@@ -75,7 +84,7 @@ class InputPolicy {
   std::mutex mutex_;
   uint64_t session_ = 0;
   bool offline_ = false;
-  unsigned ranked_ = 0, room_ = 0, allowed_ = 0;
+  unsigned ranked_ = 0, room_ = 0, allowed_ = 0, pre_room_ = 0;
 };
 inline InputPolicy input_policy;
 // Adapter takes the room mutex and reads the current roster at each input boundary.

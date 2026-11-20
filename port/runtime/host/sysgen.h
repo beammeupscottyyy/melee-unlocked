@@ -21,7 +21,8 @@ std::string sha1(const std::vector<uint8_t>& bytes);
 struct Config {
   std::filesystem::path build_dir, sys_dir, data_dir;
 };
-// These callbacks use the existing boot disc/FST reader. Size is checked before allocation/read.
+// Boot supplies either the active disc reader or an independent retail base-image reader.
+// Size is checked before allocation/read.
 struct Disc {
   std::function<bool()> verify_retail;
   std::function<bool(const std::string&, size_t, std::vector<uint8_t>&)> read;

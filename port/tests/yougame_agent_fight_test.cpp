@@ -202,6 +202,11 @@ static void parsing(const char* scratch) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  _putenv_s("YOUGAME_AGENT_COPY", "1");
+#else
+  setenv("YOUGAME_AGENT_COPY", "1", 1);
+#endif  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   policy();
   injection();

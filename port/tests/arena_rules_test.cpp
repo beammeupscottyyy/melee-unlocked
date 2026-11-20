@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "arena_rules.h"
 #include "slippi_stage_pool.h"
+#include "../runtime/gx/arena_hand.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -597,6 +598,41 @@ TEST(doubles_never_draws_fountain) {
   }
   CHECK(!fountain);
   CHECK(all_singles);
+}
+
+// The online select's hand and the Arena card (gx/arena_hand.h). The card out of a room sits at 0.42 of
+// the picture from its top: 4.58 of the select's units above the middle, about 6 units tall (1280x720).
+TEST(hand_reaches_the_card) {
+  using namespace arena_hand;
+  const float top = 4.58f, bottom = -1.5f;
+  // A push at the edge level with the card, as before.
+  CHECK(pushing(2, 26.0f, 127) && level(2.0f, top, bottom) == 2);
+  // A gentle or diagonal push (45 to 60 to the side) is a push now; 50 and under used to miss.
+  CHECK(pushing(2, 26.0f, 45));
+  CHECK(pushing(2, 26.0f, 31));
+  CHECK(!pushing(2, 26.0f, 30) && !pushing(2, 25.0f, 127));
+  CHECK(pushing(1, -35.0f, -45) && !pushing(1, -34.0f, -127));
+  // Resting beside the card with the stick let go: at the limit, short of it, the card's lower part.
+  CHECK(beside(2, 26.0f, 2.0f, top, bottom));
+  CHECK(beside(2, 24.8f, 2.0f, top, bottom));
+  CHECK(beside(2, 26.0f, -2.0f, top, bottom));
+  CHECK(beside(2, 29.0f, 0.0f, top, bottom));          // m-ex's limit
+  // Not beside it: on Young Link (his row ends at 6), on Roy or the last column, under the card.
+  CHECK(!beside(2, 26.0f, 6.0f, top, bottom));
+  CHECK(!beside(2, 26.0f, 9.0f, top, bottom));
+  CHECK(!beside(2, 24.0f, 2.0f, top, bottom));
+  CHECK(!beside(2, 26.0f, -3.0f, top, bottom));
+  // The WARM UP card on the left: the same, from the left limit to just short of Dr. Mario's column.
+  CHECK(beside(1, -35.0f, 2.0f, top, bottom) && beside(1, -31.0f, 2.0f, top, bottom));
+  CHECK(!beside(1, -30.0f, 2.0f, top, bottom));
+  // The glove's lower part over the card from Young Link (point at 9): the longer push still lets it in,
+  // a rest there never does (picking Young Link).
+  CHECK(level(9.0f, top, bottom) == 1 && !beside(2, 26.0f, 9.0f, top, bottom));
+  CHECK(level(12.0f, top, bottom) == 0);
+  // In a panel: out of a room a hand let in short of the edge stays in; in a room the edge rules.
+  CHECK(at_side(2, 24.3f, false) && !at_side(2, 24.0f, false));
+  CHECK(at_side(2, 25.4f, true) && !at_side(2, 24.8f, true));
+  CHECK(at_side(1, -30.6f, false) && !at_side(1, -30.6f, true));
 }
 
 int main() {

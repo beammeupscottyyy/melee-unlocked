@@ -6,7 +6,8 @@
 #include <map>
 #include <tuple>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
+static int checks = 0;
+#define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 using yougame::agent_test::Settings;
 using json = nlohmann::json;
 
@@ -58,6 +59,25 @@ void inert_and_file_limits(Fixture& f) {
   std::puts("yougame_agent: gating, missing file, 4 KiB boundary and bad JSON ok");
 }
 
+void console_rollback_key(Fixture& f) {
+  for (bool on : {false, true}) {
+    const auto s = f.load_json({{"consoleRollback", on}});
+    CHECK(s.arguments.empty());
+    CHECK(s.environment == (std::vector<std::pair<std::string, std::string>>{{"MELEE_CONSOLE_ROLLBACK", on ? "1" : "0"}}));
+    CHECK(s.log == "agent-test.json applied default keys: consoleRollback");
+    CHECK(yougame::agent_test::map_keys({{"consoleRollback", on}}, yougame::agent_test::Engine::Static).environment.empty());
+    CHECK(yougame::agent_test::map_keys({{"consoleRollback", on}}, yougame::agent_test::Engine::Static).log ==
+          "agent-test.json; invalid/unknown or inapplicable keys ignored");
+  }
+  for (const auto& invalid : {json(0), json(1), json("true"), json(nullptr), json::array(), json::object()}) {
+    const auto s = f.load_json({{"consoleRollback", invalid}});
+    CHECK(s.environment.empty());
+    CHECK(s.log == "agent-test.json; invalid/unknown or inapplicable keys ignored");
+  }
+  CHECK(f.load_json({{"consoleRollback", false}, {"mute", true}}).log ==
+        "agent-test.json applied default keys: consoleRollback, mute");
+  CHECK(f.load(false).environment.empty());
+}
 void keys_and_types(Fixture& f) {
   CHECK(f.load_json({{"mute", true}}).arguments == std::vector<std::string>({"--volume", "0"}));
   for (const char* mode : {"unranked", "ranked", "direct", "teams"}) {
@@ -177,7 +197,7 @@ void script_keys_require_hook(Fixture& f) {
   const auto s = f.load_json({{"script", "ab_vs_source.txt"}, {"rng_seed", 305419896}, {"time_base", 0},
       {"frames", 7200}, {"frame_times", "ft.csv"}, {"sim_times", "sim.csv"}, {"replay_dir", "replays"},
       {"record_native", true}, {"slippi_menus", false}, {"no_gc_adapter", true}, {"early_rng_seed", "1@60"},
-      {"stopAt", 600}});
+      {"stopAt", 600}, {"openSettings", "video"}, {"uiClick", {{"frame", 1}, {"x", 0}, {"y", 0}}}});
   CHECK(s.arguments.empty() && s.environment.empty());
   CHECK(s.log == "agent-test.json; invalid/unknown or inapplicable keys ignored");
 }
@@ -193,14 +213,34 @@ void match_key_requires_hook(Fixture& f) {
   CHECK(s.log == "agent-test.json applied default keys: mute; invalid/unknown or inapplicable keys ignored");
 }
 
+void needs_agent_copy(Fixture& f) {
+  const std::string ignored = "agent-test.json ignored: not an agent test copy";
+  f.write(R"({"mute":true})");
+  for (const char* value : {"", "0", "11", "1 ", "true"}) {
+    CHECK(setenv("YOUGAME_AGENT_COPY", value, 1) == 0);
+    const auto s = f.load();
+    CHECK(s.arguments.empty() && s.environment.empty() && !s.agent_file && s.log == ignored);
+  }
+  CHECK(unsetenv("YOUGAME_AGENT_COPY") == 0);
+  CHECK(!f.load().agent_file && f.load().log == ignored);  // a copied file in a player's data folder
+  std::filesystem::remove(f.directory / "agent-test.json");
+  CHECK(f.load().log.empty());  // no file: still silent
+  CHECK(setenv("YOUGAME_AGENT_COPY", "1", 1) == 0);
+  CHECK(f.load_json({{"mute", true}}).agent_file);
+  std::filesystem::remove(f.directory / "agent-test.json");
+}
+
 int main(int argc, char** argv) {
   CHECK(argc == 2);
   Fixture fixture(argv[1]);
+  needs_agent_copy(fixture);
   inert_and_file_limits(fixture);
   keys_and_types(fixture);
+  console_rollback_key(fixture);
   code_and_logging(fixture);
   cli_precedence(fixture);
   pad_back_key(fixture);
   script_keys_require_hook(fixture);
   match_key_requires_hook(fixture);
+  std::printf("yougame_agent: 9 groups, %d checks passed\n", checks);
 }

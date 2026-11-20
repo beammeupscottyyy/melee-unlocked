@@ -101,6 +101,7 @@ static void linux_abort_note() {
 
 static volatile sig_atomic_t g_linux_crash_entered = 0;
 static void linux_crash_signal(int sig, siginfo_t* si, void* uc_void) {
+  ::gx::cache_store::freeze();   // first (async-signal-safe): no cache save starts or lands from here on
   if (g_linux_crash_entered) { signal(sig, SIG_DFL); raise(sig); return; }
   g_linux_crash_entered = 1;
   const ucontext_t* uc = static_cast<const ucontext_t*>(uc_void);

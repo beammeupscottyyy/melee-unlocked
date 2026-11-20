@@ -1,13 +1,487 @@
 cmake_minimum_required(VERSION 3.15)
 project(MeleeUnlocked LANGUAGES CXX)
+# MSVC reads source without a BOM in the system code page, so a machine set to a double-byte one
+# (a Windows test PC) fails on UTF-8 text such as an ellipsis (C2001). Every C and C++ file here is UTF-8;
+# set here so it reaches the root's own tests and every subdirectory.
+if(MSVC)
+  add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>")
+endif()
+option(MELEE_DOUBLES "Experimental console Doubles" OFF)
+if(MELEE_DOUBLES)
+  add_compile_definitions(MELEE_DOUBLES=1)
+endif()
+option(YOUGAME_FRIENDS_HANDOFF_DEFAULT "Experimental Friends live handoff agreement" OFF)   # off again: the copy never starts the match (no start-at-N), so joins relaunch at once
+if(YOUGAME_FRIENDS_HANDOFF_DEFAULT)
+  add_compile_definitions(YOUGAME_FRIENDS_HANDOFF_DEFAULT=1)
+endif()
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (10-31: Friends + Ranked on the main build)
+
+set(YOUGAME_COMPAT_TAG "" CACHE STRING "Isolate YouGame lobby compatibility to this branch tag")
+# Keep the tag literal, short enough for the Worker's 64-byte compatibility field, and log-safe.
+string(LENGTH "${YOUGAME_COMPAT_TAG}" YOUGAME_COMPAT_TAG_LENGTH)
+if(NOT "${YOUGAME_COMPAT_TAG}" MATCHES "^[A-Za-z0-9_-]*$" OR YOUGAME_COMPAT_TAG_LENGTH GREATER 16)
+  message(FATAL_ERROR "YOUGAME_COMPAT_TAG must be at most 16 ASCII letters, digits, underscores or hyphens")
+endif()
 
 include(port/tests/embed_view.cmake)
+include(port/tests/embed_toplevel.cmake)
+include(port/tests/boot_diagnostics.cmake)
+include(port/tests/session_diagnostics.cmake)
+include(port/tests/yougame_udp.cmake)
+
+enable_testing()
+find_package(Threads REQUIRED)
+add_executable(port_yougame_match_state_test port/tests/yougame_match_state_test.cpp)
+target_include_directories(port_yougame_match_state_test PRIVATE port/runtime/hle)
+target_compile_features(port_yougame_match_state_test PRIVATE cxx_std_17)
+target_link_libraries(port_yougame_match_state_test PRIVATE Threads::Threads)
+add_test(NAME port_yougame_match_state COMMAND port_yougame_match_state_test)
+set_tests_properties(port_yougame_match_state PROPERTIES TIMEOUT 10)
+add_executable(port_yougame_start_test port/tests/yougame_start_test.cpp)
+target_include_directories(port_yougame_start_test PRIVATE port/third_party/yougame_start)
+target_compile_features(port_yougame_start_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_start COMMAND port_yougame_start_test)
+add_executable(port_sdl_video_thread_test port/tests/sdl_video_thread_test.cpp)
+target_include_directories(port_sdl_video_thread_test PRIVATE port/runtime/host)
+target_compile_features(port_sdl_video_thread_test PRIVATE cxx_std_17)
+target_link_libraries(port_sdl_video_thread_test PRIVATE Threads::Threads)
+add_test(NAME port_sdl_video_thread COMMAND port_sdl_video_thread_test)
+add_executable(port_yougame_console_integration_test port/tests/yougame_console_integration_test.cpp)
+target_include_directories(port_yougame_console_integration_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_console_integration_test PRIVATE cxx_std_17)
+target_link_libraries(port_yougame_console_integration_test PRIVATE Threads::Threads)
+add_test(NAME port_yougame_console_integration COMMAND port_yougame_console_integration_test "${CMAKE_CURRENT_BINARY_DIR}")
+add_executable(port_css_join_test port/tests/css_join_test.cpp)
+target_include_directories(port_css_join_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_css_join_test PRIVATE cxx_std_17)
+target_link_libraries(port_css_join_test PRIVATE Threads::Threads)
+add_test(NAME port_css_join COMMAND port_css_join_test)
+add_executable(port_css_origin_test port/tests/css_origin_test.cpp port/runtime/hle/native_savestate.cpp)
+target_include_directories(port_css_origin_test PRIVATE port/runtime/hle)
+target_compile_features(port_css_origin_test PRIVATE cxx_std_17)
+target_link_libraries(port_css_origin_test PRIVATE Threads::Threads)
+add_test(NAME port_css_origin COMMAND port_css_origin_test)
+add_executable(port_yougame_console_engine_test port/tests/yougame_console_engine_test.cpp
+  port/runtime/hle/yougame_console_engine.cpp port/runtime/hle/native_savestate.cpp)
+target_include_directories(port_yougame_console_engine_test PRIVATE port/runtime/hle port/third_party
+  port/tests/console_pad_sdk sourceport/game/include port/runtime/abi)
+target_link_libraries(port_yougame_console_engine_test PRIVATE Threads::Threads)
+target_compile_features(port_yougame_console_engine_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_console_engine COMMAND port_yougame_console_engine_test
+  "${CMAKE_CURRENT_BINARY_DIR}")
+# Compiles game shim headers that need GCC/Clang (scalar_storage_order big-endian structs, __builtin_*):
+# MSVC cannot build them. The MinGW and Linux builds still run it.
+if(NOT MSVC)
+add_executable(port_yougame_console_pad_test port/tests/yougame_console_pad_test.cpp
+  port/runtime/hle/yougame_console_engine.cpp)
+target_include_directories(port_yougame_console_pad_test PRIVATE port/tests/console_pad_sdk
+  sourceport/game/include port/runtime/abi port/runtime/hle port/third_party)
+target_compile_features(port_yougame_console_pad_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_console_pad COMMAND port_yougame_console_pad_test)
+endif()
+add_executable(port_yougame_console_link_test port/tests/yougame_console_link_test.cpp
+  port/runtime/hle/yougame_console_link.cpp port/runtime/hle/yougame_console_engine.cpp)
+target_include_directories(port_yougame_console_link_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_console_link_test PRIVATE cxx_std_17)
+target_compile_definitions(port_yougame_console_link_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+target_link_libraries(port_yougame_console_link_test PRIVATE Threads::Threads)
+add_test(NAME port_yougame_console_link COMMAND port_yougame_console_link_test)
+if(MELEE_DOUBLES)
+  add_executable(port_yougame_doubles_test port/tests/yougame_doubles_test.cpp
+    port/runtime/hle/yougame_console_link.cpp port/runtime/hle/yougame_console_engine.cpp)
+  target_include_directories(port_yougame_doubles_test PRIVATE port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_doubles_test PRIVATE cxx_std_17)
+  target_compile_definitions(port_yougame_doubles_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  target_link_libraries(port_yougame_doubles_test PRIVATE Threads::Threads)
+  add_test(NAME port_yougame_doubles COMMAND port_yougame_doubles_test)
+  add_executable(port_yougame_doubles_runtime_test port/tests/yougame_doubles_runtime_test.cpp
+    port/runtime/hle/yougame_console_link.cpp port/runtime/hle/yougame_console_engine.cpp)
+  target_include_directories(port_yougame_doubles_runtime_test PRIVATE port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_doubles_runtime_test PRIVATE cxx_std_17)
+  target_compile_definitions(port_yougame_doubles_runtime_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  target_link_libraries(port_yougame_doubles_runtime_test PRIVATE Threads::Threads)
+  add_test(NAME port_yougame_doubles_runtime COMMAND port_yougame_doubles_runtime_test)
+  add_executable(port_yougame_doubles_four_peer_test port/tests/yougame_doubles_four_peer_test.cpp
+    port/runtime/hle/yougame_console_link.cpp port/runtime/hle/yougame_console_engine.cpp)
+  target_include_directories(port_yougame_doubles_four_peer_test PRIVATE port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_doubles_four_peer_test PRIVATE cxx_std_17)
+  target_compile_definitions(port_yougame_doubles_four_peer_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  target_link_libraries(port_yougame_doubles_four_peer_test PRIVATE Threads::Threads)
+  add_test(NAME port_yougame_doubles_four_peer COMMAND port_yougame_doubles_four_peer_test)
+  add_test(NAME port_doubles_wiring COMMAND "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
+    python3 "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/doubles_wiring_test.py")
+endif()
+add_test(NAME port_console_card_agreement COMMAND port_yougame_console_link_test --card-agreement)
+add_test(NAME port_console_room_refusals COMMAND port_yougame_console_link_test --room-refusals)
+add_test(NAME port_yougame_console_latency COMMAND port_yougame_console_link_test --latency)
+add_test(NAME port_console_watchdog COMMAND port_yougame_console_link_test --watchdog)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME port_agent_open_settings_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/agent_open_settings_wiring_test.py")
+add_test(NAME port_startup_window_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/startup_window_wiring_test.py")
+add_test(NAME port_css_join_adoption COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/css_join_adoption_test.py")
+add_test(NAME port_linux_test_targets COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/linux_test_targets_test.py")
+add_test(NAME port_css_join_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/css_join_wiring_test.py")
+add_test(NAME port_css_origin_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/css_origin_wiring_test.py")
+add_test(NAME port_sdl_video_thread_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/sdl_video_thread_wiring_test.py")
+add_test(NAME port_card_ring_zero_init COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/card_ring_zero_init_test.py")
+add_test(NAME port_stage_joint_key COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/stage_joint_key_test.py")
+add_test(NAME port_setjmp_done COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/setjmp_done_test.py")
+add_test(NAME port_tlut_obj_zero_init COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/tlut_obj_zero_init_test.py")
+add_test(NAME port_yougame_sound_mode COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_sound_mode_test.py")
+add_test(NAME port_gx_object_layout_source COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/gx_object_layout_test.py")
+add_executable(port_gx_object_layout_test port/tests/gx_object_layout_test.cpp)
+target_compile_features(port_gx_object_layout_test PRIVATE cxx_std_17)
+add_test(NAME port_gx_object_layout COMMAND port_gx_object_layout_test)
+add_test(NAME port_friends_order COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/friends_order_test.py")
+add_test(NAME port_slippi_agent_lock COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/slippi_agent_lock_test.py")
+add_test(NAME port_friends_disconnect COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/friends_disconnect_test.py")
+add_test(NAME port_friends4_css_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/friends4_css_wiring_test.py")
+add_test(NAME port_doubles_lobby_select COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/doubles_lobby_select_test.py")
+add_test(NAME port_doubles_partner_cycle COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/doubles_partner_cycle_test.py")
+add_test(NAME port_doubles_pair_colour COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/doubles_pair_colour_test.py")
+add_test(NAME port_round38_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/round38_wiring_test.py")
+add_test(NAME port_round38c COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/round38c_test.py")
+add_test(NAME port_round38b COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/round38b_test.py")
+add_test(NAME port_yougame_console_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_console_wiring_test.py")
+add_test(NAME port_console_input_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/console_input_wiring_test.py")
+add_test(NAME port_console_friends_flow COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/console_friends_flow_test.py")
+add_test(NAME port_console_save_boot COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/console_save_boot_test.py")
+add_executable(port_opponent_display_test port/tests/opponent_display_test.cpp)
+target_include_directories(port_opponent_display_test PRIVATE port/runtime/hle)
+target_compile_features(port_opponent_display_test PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(port_opponent_display_test PRIVATE /utf-8)
+endif()
+add_test(NAME port_opponent_display COMMAND port_opponent_display_test)
+add_executable(port_yougame_mode_policy_test port/tests/yougame_mode_policy_test.cpp)
+target_include_directories(port_yougame_mode_policy_test PRIVATE port/runtime/hle)
+target_compile_features(port_yougame_mode_policy_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_mode_policy COMMAND port_yougame_mode_policy_test)
+add_executable(port_yougame_display_defaults_test port/tests/yougame_display_defaults_test.cpp)
+target_include_directories(port_yougame_display_defaults_test PRIVATE port/runtime/gx)
+target_compile_features(port_yougame_display_defaults_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_display_defaults COMMAND port_yougame_display_defaults_test)
+add_executable(port_yougame_display_defaults_agent_test port/tests/yougame_display_defaults_test.cpp)
+target_include_directories(port_yougame_display_defaults_agent_test PRIVATE port/runtime/gx)
+target_compile_features(port_yougame_display_defaults_agent_test PRIVATE cxx_std_17)
+target_compile_definitions(port_yougame_display_defaults_agent_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+add_test(NAME port_yougame_display_defaults_agent COMMAND port_yougame_display_defaults_agent_test)
+add_test(NAME port_yougame_display_defaults_wiring COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_display_defaults_wiring_test.py")
+add_test(NAME port_pipeline_cache_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/pipeline_cache_wiring_test.py")
+add_executable(port_slippi_link_test port/tests/slippi_link_test.cpp)
+target_include_directories(port_slippi_link_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_slippi_link_test PRIVATE cxx_std_17)
+target_link_libraries(port_slippi_link_test PRIVATE Threads::Threads)
+add_test(NAME port_slippi_link COMMAND port_slippi_link_test)
+add_executable(port_slippi_address_test port/tests/slippi_address_test.cpp)
+target_include_directories(port_slippi_address_test PRIVATE port/runtime/hle)
+target_compile_features(port_slippi_address_test PRIVATE cxx_std_17)
+add_test(NAME port_slippi_address COMMAND port_slippi_address_test)
+add_test(NAME port_slippi_fallback COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/slippi_fallback_test.py")
+add_test(NAME port_slippi_link_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/slippi_link_wiring_test.py")
+
+# Blended Unranked's coordinator (yougame_blend.h) and its wiring; window-free, before Linux's return().
+add_executable(port_yougame_blend_test port/tests/yougame_blend_test.cpp)
+target_include_directories(port_yougame_blend_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_blend_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_blend COMMAND port_yougame_blend_test)
+# The local channel (a game started on its own finds a running YouGame app): names, folder checks,
+# hello lines, the playerPending schedule, and on Mac/Linux a fake host on a private socket folder.
+add_executable(port_yougame_channel_test port/tests/yougame_channel_test.cpp port/runtime/hle/yougame_channel.cpp)
+target_include_directories(port_yougame_channel_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_channel_test PRIVATE cxx_std_17)
+target_link_libraries(port_yougame_channel_test PRIVATE Threads::Threads)
+add_test(NAME port_yougame_channel COMMAND port_yougame_channel_test "${CMAKE_CURRENT_BINARY_DIR}/ygch")
+set_tests_properties(port_yougame_channel PROPERTIES TIMEOUT 30)
+add_test(NAME port_yougame_channel_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_channel_wiring_test.py" "${CMAKE_CURRENT_SOURCE_DIR}")
+add_executable(port_yougame_search_test port/tests/yougame_search_test.cpp)
+target_include_directories(port_yougame_search_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_search_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_search COMMAND port_yougame_search_test)
+# Release policies run with the legacy default and an actual branch compile definition.
+foreach(tag_variant default mixed)
+  add_executable(port_yougame_release_${tag_variant}_test port/tests/yougame_release_test.cpp)
+  target_include_directories(port_yougame_release_${tag_variant}_test PRIVATE port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_release_${tag_variant}_test PRIVATE cxx_std_17)
+  target_compile_definitions(port_yougame_release_${tag_variant}_test PRIVATE MELEE_PORT_VERSION="0.9.80")
+  if(tag_variant STREQUAL "mixed")
+    target_compile_definitions(port_yougame_release_${tag_variant}_test PRIVATE YOUGAME_COMPAT_TAG="mixed")
+  endif()
+  add_test(NAME port_yougame_release_${tag_variant} COMMAND port_yougame_release_${tag_variant}_test)
+endforeach()
+if(UNIX)
+  find_package(CURL REQUIRED)
+  add_executable(port_yougame_http_cancel_test port/tests/yougame_http_cancel_test.cpp)
+  target_include_directories(port_yougame_http_cancel_test PRIVATE port/linux/compat)
+  target_compile_features(port_yougame_http_cancel_test PRIVATE cxx_std_17)
+  target_link_libraries(port_yougame_http_cancel_test PRIVATE CURL::libcurl)
+  add_test(NAME port_yougame_http_cancel COMMAND port_yougame_http_cancel_test)
+endif()
+add_test(NAME port_yougame_blend_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_blend_wiring_test.py")
+add_test(NAME port_yougame_embed_focus_wiring COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_embed_focus_wiring_test.py")
+add_test(NAME port_yougame_0981_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0981_merge_test.py")
+add_test(NAME port_yougame_0982_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0982_merge_test.py")
+add_test(NAME port_yougame_0983_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0983_merge_test.py")
+
+add_executable(port_pacing_diagnostics_test port/tests/pacing_diagnostics_test.cpp)
+target_include_directories(port_pacing_diagnostics_test PRIVATE port/runtime/gx)
+target_compile_features(port_pacing_diagnostics_test PRIVATE cxx_std_17)
+add_test(NAME port_pacing_diagnostics COMMAND port_pacing_diagnostics_test)
+add_test(NAME port_pacing_diagnostics_wiring COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/pacing_diagnostics_wiring_test.py")
+
+find_package(Threads REQUIRED)
+add_executable(port_yougame_tourney_test port/tests/yougame_tourney_test.cpp)
+target_include_directories(port_yougame_tourney_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_tourney_test PRIVATE cxx_std_17)
+target_link_libraries(port_yougame_tourney_test PRIVATE Threads::Threads)
+add_test(NAME port_yougame_tourney COMMAND port_yougame_tourney_test)
+add_test(NAME port_yougame_tourney_wiring COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_tourney_wiring_test.py")
+
+add_test(NAME port_yougame_tourney_scene COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_tourney_scene_test.py")
+
+include(port/tests/relay_output.cmake)
+
+# Window-free compliance and hook diagnostics, available before Linux's return().
+add_executable(port_practice_ghost_placeholders_test port/tests/practice_ghost_placeholders_test.cpp)
+target_include_directories(port_practice_ghost_placeholders_test PRIVATE port/runtime/hle)
+target_compile_features(port_practice_ghost_placeholders_test PRIVATE cxx_std_17)
+add_test(NAME port_practice_ghost_placeholders COMMAND port_practice_ghost_placeholders_test)
+foreach(variant hook off)
+  add_executable(port_yougame_pad_trace_${variant}_test port/tests/yougame_pad_trace_test.cpp)
+  target_include_directories(port_yougame_pad_trace_${variant}_test PRIVATE port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_pad_trace_${variant}_test PRIVATE cxx_std_17)
+  if(variant STREQUAL "hook")
+    target_compile_definitions(port_yougame_pad_trace_${variant}_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  endif()
+endforeach()
+add_test(NAME port_yougame_pad_trace_hook COMMAND port_yougame_pad_trace_hook_test "${CMAKE_CURRENT_BINARY_DIR}/yougame-pad-trace-test")
+add_test(NAME port_yougame_pad_trace_absent COMMAND sh
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/agent_test_hook_absent.sh" $<TARGET_FILE:port_yougame_pad_trace_off_test>)
+add_test(NAME port_compliance_diagnostics_wiring COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/compliance_diagnostics_wiring_test.py")
+
+# Main build round 2: offline policies and source wiring on every platform.
+foreach(policy yougame_unranked yougame_release phob_mirror)
+  add_executable(port_${policy}_test port/tests/${policy}_test.cpp)
+  target_include_directories(port_${policy}_test PRIVATE port/runtime/hle port/runtime/host port/third_party)
+  target_compile_features(port_${policy}_test PRIVATE cxx_std_17)
+  add_test(NAME port_${policy} COMMAND port_${policy}_test)
+endforeach()
+target_compile_definitions(port_yougame_release_test PRIVATE MELEE_PORT_VERSION="0.9.80")
+add_executable(port_phob_mirror_hook_test port/tests/phob_mirror_test.cpp)
+target_include_directories(port_phob_mirror_hook_test PRIVATE port/runtime/hle port/runtime/host port/third_party)
+target_compile_features(port_phob_mirror_hook_test PRIVATE cxx_std_17)
+target_compile_definitions(port_phob_mirror_hook_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+add_test(NAME port_phob_mirror_hook COMMAND port_phob_mirror_hook_test "${CMAKE_CURRENT_BINARY_DIR}/phob-menu-agent-test")
+if(NOT WIN32)
+  add_test(NAME port_phob_mirror_hook_absent COMMAND sh
+    "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/agent_test_hook_absent.sh" $<TARGET_FILE:port_phob_mirror_test>)
+endif()
+foreach(policy yougame_unranked yougame_release phob_mirror)
+  add_test(NAME port_${policy}_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/${policy}_wiring_test.py")
+endforeach()
+
+# Main round 3: parser, chord lifecycle and stdin hand-off on every platform.
+foreach(variant off hook)
+  add_executable(port_yougame_shortcuts_${variant}_test port/tests/yougame_shortcuts_test.cpp)
+  target_include_directories(port_yougame_shortcuts_${variant}_test PRIVATE port/runtime/hle)
+  target_compile_features(port_yougame_shortcuts_${variant}_test PRIVATE cxx_std_17)
+  if(variant STREQUAL "hook")
+    target_compile_definitions(port_yougame_shortcuts_${variant}_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  endif()
+  add_test(NAME port_yougame_shortcuts_${variant} COMMAND port_yougame_shortcuts_${variant}_test)
+endforeach()
+add_test(NAME port_yougame_shortcuts_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_shortcuts_wiring_test.py")
+# Embedded Escape ownership (round 36), available on every OS before the Linux return.
+add_test(NAME port_yougame_escape_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_escape_wiring_test.py")
+# In-game menu (round 30): the quit confirm acts on the focused button; Settings never returns to the confirm.
+add_test(NAME port_ingame_menu_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/ingame_menu_wiring_test.py")
+
+add_executable(port_yougame_ranked_r1_test port/tests/yougame_ranked_r1_test.cpp)
+target_include_directories(port_yougame_ranked_r1_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_ranked_r1_test PRIVATE cxx_std_20)
+add_test(NAME port_yougame_ranked_r1 COMMAND port_yougame_ranked_r1_test)
+
+include(port/tests/ranked_opponent.cmake)
+include(port/tests/ranked_panel.cmake)
+
+foreach(part record policy switch)
+  add_executable(port_yougame_ranked_${part}_test port/tests/yougame_ranked_${part}_test.cpp)
+  target_include_directories(port_yougame_ranked_${part}_test PRIVATE port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_ranked_${part}_test PRIVATE cxx_std_20)
+  add_test(NAME port_yougame_ranked_${part} COMMAND port_yougame_ranked_${part}_test)
+endforeach()
+
+foreach(variant optional nosp)
+  add_executable(port_yougame_ranked_${variant}_test port/tests/yougame_ranked_optional_test.cpp)
+  target_include_directories(port_yougame_ranked_${variant}_test PRIVATE
+    port/runtime/hle port/runtime/abi port/third_party sourceport/game/include)
+  target_compile_features(port_yougame_ranked_${variant}_test PRIVATE cxx_std_20)
+  if(variant STREQUAL "nosp")
+    target_compile_definitions(port_yougame_ranked_${variant}_test PRIVATE MU_NO_SLIPPI=1)
+  endif()
+  add_test(NAME port_yougame_ranked_${variant} COMMAND port_yougame_ranked_${variant}_test)
+endforeach()
+
+add_test(NAME port_yougame_ranked_fix_wiring COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_ranked_fix_wiring_test.py")
+
+# Branch gate and the actual game/host practice bridge, before Linux's return().
+enable_language(C)
+# Compiles game shim C that needs GCC/Clang (scalar_storage_order big-endian structs, __builtin_*,
+# C compound literals in C++): MSVC cannot build it. The MinGW and Linux builds still run it.
+if(NOT MSVC)
+foreach(variant on off configured)
+  add_executable(port_yougame_ranked_branch_${variant}_test port/tests/yougame_ranked_branch_test.cpp
+    sourceport/game/shim/mu_ranked_set.c sourceport/game/shim/mu_ranked_setup_model.c)
+  target_include_directories(port_yougame_ranked_branch_${variant}_test PRIVATE
+    sourceport/game/include port/runtime/abi port/runtime/hle port/third_party)
+  target_compile_features(port_yougame_ranked_branch_${variant}_test PRIVATE cxx_std_17 c_std_11)
+  if(variant STREQUAL "on" OR (variant STREQUAL "configured" AND YOUGAME_RANKED_BRANCH))
+    target_compile_definitions(port_yougame_ranked_branch_${variant}_test PRIVATE YOUGAME_RANKED_BRANCH=1)
+  endif()
+  add_test(NAME port_yougame_ranked_branch_${variant} COMMAND port_yougame_ranked_branch_${variant}_test)
+endforeach()
+endif()
+
+# A2: compile presentation/input helpers with the actual A1 model, without HSD.
+enable_language(C)
+add_executable(port_ranked_setup_widgets_test port/tests/ranked_setup_widgets_test.cpp
+  sourceport/game/shim/mu_ranked_widgets.c sourceport/game/shim/mu_ranked_setup_model.c)
+target_include_directories(port_ranked_setup_widgets_test PRIVATE sourceport/game/shim sourceport/game/include port/runtime/abi port/runtime/hle)
+target_compile_definitions(port_ranked_setup_widgets_test PRIVATE MU_RANKED_WIDGETS_TEST)
+target_compile_features(port_ranked_setup_widgets_test PRIVATE cxx_std_17 c_std_11)
+foreach(group layout timers inputs characters walk)
+  add_test(NAME port_ranked_setup_widgets_${group} COMMAND port_ranked_setup_widgets_test ${group})
+endforeach()
+
+# Compiles game shim headers that need GCC/Clang (scalar_storage_order big-endian structs, __builtin_*):
+# MSVC cannot build them. The MinGW and Linux builds still run it.
+if(NOT MSVC)
+add_executable(port_ranked_setup_screen_test port/tests/ranked_setup_screen_test.cpp
+  sourceport/game/shim/mu_ranked_widgets.c sourceport/game/shim/mu_ranked_setup_model.c
+  sourceport/game/shim/mu_ranked_setup_online.c)
+target_include_directories(port_ranked_setup_screen_test PRIVATE sourceport/game/shim sourceport/game/include port/runtime/abi port/runtime/hle)
+target_compile_definitions(port_ranked_setup_screen_test PRIVATE MU_RANKED_WIDGETS_TEST YOUGAME_AGENT_TEST_HOOK)
+target_compile_features(port_ranked_setup_screen_test PRIVATE cxx_std_17 c_std_11)
+add_test(NAME port_ranked_setup_screen_cpu COMMAND port_ranked_setup_screen_test)
+endif()
+
+# A1: compile the allocation-free rules model as C, with C++ host drivers.
+enable_language(C)
+add_executable(port_ranked_setup_model_test port/tests/ranked_setup_model_test.cpp
+  sourceport/game/shim/mu_ranked_setup_model.c)
+target_include_directories(port_ranked_setup_model_test PRIVATE sourceport/game/include port/runtime/abi port/runtime/hle)
+target_compile_features(port_ranked_setup_model_test PRIVATE cxx_std_17 c_std_11)
+foreach(group stages colors timers interleave disconnects tiebreak mirror_idle)
+  add_test(NAME port_ranked_setup_${group} COMMAND port_ranked_setup_model_test ${group})
+endforeach()
+
+foreach(variant hook off branch)
+  add_executable(port_ranked_setup_cpu_${variant}_test port/tests/ranked_setup_cpu_test.cpp
+    sourceport/game/shim/mu_ranked_setup_model.c)
+  target_include_directories(port_ranked_setup_cpu_${variant}_test PRIVATE sourceport/game/include port/runtime/abi port/runtime/hle port/third_party)
+  target_compile_features(port_ranked_setup_cpu_${variant}_test PRIVATE cxx_std_17 c_std_11)
+  if(variant STREQUAL "hook")
+    target_compile_definitions(port_ranked_setup_cpu_${variant}_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  elseif(variant STREQUAL "branch")
+    target_compile_definitions(port_ranked_setup_cpu_${variant}_test PRIVATE YOUGAME_RANKED_BRANCH=1)
+  endif()
+  add_test(NAME port_ranked_setup_cpu_${variant} COMMAND port_ranked_setup_cpu_${variant}_test)
+endforeach()
+
+# Compiles game shim C that needs GCC/Clang (scalar_storage_order big-endian structs, __builtin_*,
+# C compound literals in C++): MSVC cannot build it. The MinGW and Linux builds still run it.
+if(NOT MSVC)
+foreach(variant hook off branch)
+  add_executable(port_ranked_setup_online_${variant}_test port/tests/ranked_setup_online_test.cpp
+    sourceport/game/shim/mu_ranked_setup_model.c sourceport/game/shim/mu_ranked_setup_online.c)
+  target_include_directories(port_ranked_setup_online_${variant}_test PRIVATE sourceport/game/include port/runtime/abi port/runtime/hle port/third_party)
+  target_compile_features(port_ranked_setup_online_${variant}_test PRIVATE cxx_std_17 c_std_11)
+  if(variant STREQUAL "hook")
+    target_compile_definitions(port_ranked_setup_online_${variant}_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+  elseif(variant STREQUAL "branch")
+    target_compile_definitions(port_ranked_setup_online_${variant}_test PRIVATE YOUGAME_RANKED_BRANCH=1)
+  endif()
+  add_test(NAME port_ranked_setup_online_${variant} COMMAND port_ranked_setup_online_${variant}_test)
+endforeach()
+
+add_test(NAME port_ranked_setup_cpu_absent COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/ranked_setup_absent_test.py"
+  $<TARGET_FILE:port_ranked_setup_cpu_off_test> $<TARGET_FILE:port_ranked_setup_online_off_test>)
+endif()
+
+include(tools/rank_badges.cmake)
+include(port/tests/ranked_ui.cmake)
+add_executable(port_yougame_ranked_reveal_test port/tests/yougame_ranked_reveal_test.cpp)
+target_include_directories(port_yougame_ranked_reveal_test PRIVATE port/runtime/abi)
+target_compile_features(port_yougame_ranked_reveal_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_ranked_reveal COMMAND port_yougame_ranked_reveal_test)
+add_executable(port_yougame_rank_badges_test port/tests/yougame_rank_badges_test.cpp)
+target_include_directories(port_yougame_rank_badges_test PRIVATE sourceport/game/shim/assets)
+target_compile_features(port_yougame_rank_badges_test PRIVATE cxx_std_17)
+add_dependencies(port_yougame_rank_badges_test mu_rank_badge_assets)
+add_test(NAME port_yougame_rank_badges COMMAND port_yougame_rank_badges_test)
+add_test(NAME port_yougame_rank_badge_source COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_rank_badge_source_test.py")
 
 # YouGame's rows show as Coming soon and nothing YouGame runs from the launcher, until YouGame opens.
-option(MELEE_YOUGAME_COMING_SOON "Show YouGame's online rows as Coming soon (launcher YouGame off)" ON)
+option(MELEE_YOUGAME_COMING_SOON "Show YouGame's online rows as Coming soon (launcher YouGame off)" OFF)
+# This build plays YouGame through its own launcher (sign-in, ticket, bridge on 127.0.0.1). It never looks for,
+# starts, installs or offers the YouGame app. OFF only for a build the YouGame app itself lists.
+option(MELEE_YOUGAME_NO_APP "YouGame through Melee Unlocked's launcher only, never the YouGame app" ON)
+if(MELEE_YOUGAME_NO_APP)
+  add_compile_definitions(MELEE_YOUGAME_NO_APP=1)
+endif()
+option(MELEE_YOUGAME_START_STAGING "Start and link YouGame Staging (test builds) instead of YouGame" OFF)
+if(MELEE_YOUGAME_START_STAGING)
+  add_compile_definitions(MELEE_YOUGAME_START_STAGING=1)
+endif()
+set(MELEE_YOUGAME_PROD_TRAY_FROM "" CACHE STRING "Windows: first YouGame (production) version that starts hidden in the tray")
+if(NOT "${MELEE_YOUGAME_PROD_TRAY_FROM}" STREQUAL "")
+  add_compile_definitions(MELEE_YOUGAME_PROD_TRAY_FROM="${MELEE_YOUGAME_PROD_TRAY_FROM}")
+endif()
 if(MELEE_YOUGAME_COMING_SOON)
   add_compile_definitions(MELEE_YOUGAME_COMING_SOON=1)
 endif()
+# A YouGame build carries the YouGame plugin; upstream's releases don't. The launcher's update check reads upstream's
+# release list, so in a YouGame build it would offer to replace this build with one that has no plugin. Off here.
+option(MELEE_YOUGAME_NO_UPSTREAM_UPDATES "Launcher: never offer upstream releases as updates (YouGame builds)" OFF)
+# (applied to the melee_unlocked launcher target only, in port/CMakeLists.txt)
 
 option(MELEE_BUILD_NATIVE_LINUX "Build the native Linux Source Port (ELF host and game)" OFF)
 if(MELEE_BUILD_NATIVE_LINUX)
@@ -17,6 +491,7 @@ if(MELEE_BUILD_NATIVE_LINUX)
   enable_testing()
   include(port/tests/sysgen.cmake)
   include(port/tests/settings_mouse.cmake)
+  include(port/tests/keyboard_navigation.cmake)
   include(port/tests/controller_profiles.cmake)
   add_subdirectory(port/linux)
   return()
@@ -24,6 +499,7 @@ endif()
 enable_testing()
 include(port/tests/sysgen.cmake)
 include(port/tests/settings_mouse.cmake)
+include(port/tests/keyboard_navigation.cmake)
 include(port/tests/controller_profiles.cmake)
 if(WIN32 OR APPLE)
   include(port/tests/production_integrity.cmake)
@@ -35,12 +511,14 @@ endif()
 add_test(NAME port_gc_adapter_guard COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/gc_adapter_guard_test.py")
 add_test(NAME port_yougame_0956_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0956_merge_test.py")
 add_test(NAME port_yougame_0962_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0962_merge_test.py")
+add_test(NAME port_yougame_ranked_menu_wiring COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_ranked_menu_wiring_test.py")
 add_test(NAME port_local_build_engine_wiring COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/local_build_engine_wiring_test.py")
 add_test(NAME port_akaneia_probe_wiring COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/akaneia_probe_wiring_test.py")
 add_test(NAME port_relay_pads_wiring COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/relay_pads_wiring_test.py")
 add_test(NAME port_yougame_0965_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0965_merge_test.py")
 add_test(NAME port_yougame_0968_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0968_merge_test.py")
 add_test(NAME port_yougame_0969_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0969_merge_test.py")
+add_test(NAME port_yougame_0971_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_0971_merge_test.py")
 add_test(NAME port_shader_auto_fit COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/shader_auto_fit_test.py")
 
 # Window-free agent hook checks, built on macOS/Linux only (use the bundled JSON header). Kept out of the
@@ -54,6 +532,19 @@ if(NOT WIN32)
   target_include_directories(port_slippi_netplay_receive_test PRIVATE port/runtime/hle port/runtime/host)
   target_compile_features(port_slippi_netplay_receive_test PRIVATE cxx_std_17)
   add_test(NAME port_slippi_netplay_receive COMMAND port_slippi_netplay_receive_test)
+  add_executable(port_slippi_gone_port_test port/tests/slippi_gone_port_test.cpp)
+  target_include_directories(port_slippi_gone_port_test PRIVATE port/runtime/hle)
+  target_compile_features(port_slippi_gone_port_test PRIVATE cxx_std_17)
+  target_compile_definitions(port_slippi_gone_port_test PRIVATE SLIPPI_ONLINE_CPP="${CMAKE_CURRENT_SOURCE_DIR}/port/runtime/hle/slippi_online.cpp" SLIPPI_NET_CPP="${CMAKE_CURRENT_SOURCE_DIR}/port/runtime/hle/slippi_net.cpp")
+  add_test(NAME port_slippi_gone_port COMMAND port_slippi_gone_port_test)
+  add_executable(port_local_partner_test port/tests/local_partner_test.cpp)
+  target_include_directories(port_local_partner_test PRIVATE port/runtime/hle port/runtime/host port/runtime/abi port/third_party)
+  target_compile_features(port_local_partner_test PRIVATE cxx_std_17)
+  add_test(NAME port_local_partner COMMAND port_local_partner_test)
+  add_executable(port_slippi_time_sync_test port/tests/slippi_time_sync_test.cpp)
+  target_include_directories(port_slippi_time_sync_test PRIVATE port/runtime/hle)
+  target_compile_features(port_slippi_time_sync_test PRIVATE cxx_std_17)
+  add_test(NAME port_slippi_time_sync COMMAND port_slippi_time_sync_test)
   add_executable(port_pad_mirror_posix_test port/tests/pad_mirror_posix_test.cpp)
   target_include_directories(port_pad_mirror_posix_test PRIVATE port/runtime/hle port/third_party)
   target_compile_features(port_pad_mirror_posix_test PRIVATE cxx_std_17)
@@ -89,6 +580,17 @@ if(NOT WIN32)
   target_include_directories(port_frame_queue_test PRIVATE port/runtime/gx port/runtime/host)
   target_compile_features(port_frame_queue_test PRIVATE cxx_std_17)
   add_test(NAME port_frame_queue COMMAND port_frame_queue_test)
+  add_executable(port_prewarm_only_test port/tests/prewarm_only_test.cpp)
+  target_include_directories(port_prewarm_only_test PRIVATE port/app)
+  target_compile_features(port_prewarm_only_test PRIVATE cxx_std_17)
+  add_test(NAME port_prewarm_only COMMAND port_prewarm_only_test)
+  add_test(NAME port_prewarm_only_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/prewarm_only_wiring_test.py")
+  add_executable(port_pipeline_cache_store_test port/tests/pipeline_cache_store_test.cpp)
+  target_include_directories(port_pipeline_cache_store_test PRIVATE port/runtime/gx)
+  target_compile_features(port_pipeline_cache_store_test PRIVATE cxx_std_17)
+  find_package(Threads REQUIRED)
+  target_link_libraries(port_pipeline_cache_store_test PRIVATE Threads::Threads)
+  add_test(NAME port_pipeline_cache_store COMMAND port_pipeline_cache_store_test "${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_store_test")
   if(APPLE)
     add_test(NAME port_mac_digest COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/mac/compare_digest_test.py")
     add_executable(port_mac_ws_frame_test port/linux/compat/tests/ws_frame_test.cpp)
@@ -108,6 +610,29 @@ if(NOT WIN32)
   target_include_directories(port_yougame_friends_test PRIVATE port/runtime/hle port/third_party)
   target_compile_features(port_yougame_friends_test PRIVATE cxx_std_17)
   add_test(NAME port_yougame_friends_test COMMAND port_yougame_friends_test)
+  foreach(friends4_test yougame_lobby_wire_test yougame_lobby_test yougame_lobby_screen_test friends4_setup_test
+          yougame_doubles_lobby_test)
+    add_executable(port_${friends4_test} port/tests/${friends4_test}.cpp)
+    target_include_directories(port_${friends4_test} PRIVATE port/runtime/hle port/runtime/abi port/third_party)
+    target_compile_features(port_${friends4_test} PRIVATE cxx_std_17)
+    add_test(NAME port_${friends4_test} COMMAND port_${friends4_test})
+  endforeach()
+  add_executable(port_squad_online_test port/tests/squad_online_test.cpp)
+  target_include_directories(port_squad_online_test PRIVATE port/runtime/hle port/runtime/host port/runtime/abi port/third_party)
+  target_compile_definitions(port_squad_online_test PRIVATE MU_SQUAD=1)
+  target_compile_features(port_squad_online_test PRIVATE cxx_std_17)
+  add_test(NAME port_squad_online_test COMMAND port_squad_online_test)
+  foreach(squad_wiring friends_squad squad_online squad)
+    add_test(NAME port_${squad_wiring}_wiring COMMAND "${Python3_EXECUTABLE}" -B
+      "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/${squad_wiring}_wiring_test.py")
+  endforeach()
+  foreach(squad_switch 0 1)
+    add_executable(port_friends_squad_lobby_${squad_switch}_test port/tests/friends_squad_lobby_test.cpp)
+    target_include_directories(port_friends_squad_lobby_${squad_switch}_test PRIVATE port/runtime/hle port/runtime/abi port/third_party)
+    target_compile_features(port_friends_squad_lobby_${squad_switch}_test PRIVATE cxx_std_17)
+    target_compile_definitions(port_friends_squad_lobby_${squad_switch}_test PRIVATE MU_SQUAD=${squad_switch})
+    add_test(NAME port_friends_squad_lobby_${squad_switch} COMMAND port_friends_squad_lobby_${squad_switch}_test)
+  endforeach()
   add_executable(port_yougame_ux_test port/tests/yougame_ux_test.cpp)
   target_include_directories(port_yougame_ux_test PRIVATE port/runtime/hle port/runtime/host port/third_party)
   target_compile_features(port_yougame_ux_test PRIVATE cxx_std_17)
@@ -218,10 +743,6 @@ if(NOT WIN32)
   target_include_directories(port_yougame_memcard_test PRIVATE port/runtime/hle)
   target_compile_features(port_yougame_memcard_test PRIVATE cxx_std_17)
   add_test(NAME port_yougame_memcard COMMAND port_yougame_memcard_test)
-  add_executable(port_yougame_mode_policy_test port/tests/yougame_mode_policy_test.cpp)
-  target_include_directories(port_yougame_mode_policy_test PRIVATE port/runtime/hle)
-  target_compile_features(port_yougame_mode_policy_test PRIVATE cxx_std_17)
-  add_test(NAME port_yougame_mode_policy COMMAND port_yougame_mode_policy_test)
   add_executable(port_host_stub_policy_test port/tests/host_stub_policy_test.cpp)
   target_include_directories(port_host_stub_policy_test PRIVATE port/runtime/ppc)
   target_compile_features(port_host_stub_policy_test PRIVATE cxx_std_17)

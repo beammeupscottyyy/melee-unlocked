@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "yougame_link.h"
 #include "yougame_relay_pads.h"
 #ifdef _WIN32
@@ -138,7 +139,7 @@ void state() {
     "pads: relayed pads have no rumble yet",
     "pads: relay lag p50 3 ms p95 5 ms over 5 lines"}));
   state.flush(); CHECK(logs.size() == 10);
-  // The pad's name never reaches the log: only the app's opaque id and the kind (pack-platform).
+  // The pad's name never reaches the log: only the app's opaque id and the kind.
   for (const auto& l : logs) CHECK(l.find("DualSense Wireless Controller") == std::string::npos);
   State empty([](const std::string&) {});
   CHECK(empty.accept(line(j), 1)); CHECK(empty.active()); // initial empty snapshot latches too
@@ -214,6 +215,57 @@ void startup_logging() {
   state.flush(); CHECK(logs.size() == 3);
 }
 
+// familyIndex, kind "hid" and duplicate numbers (yougame_controller_relay.h reads these).
+void families() {
+  Frame parsed; std::string reason;
+  auto with = [](json p, const char* kind, int family_index) {
+    p["kind"] = kind; p["familyIndex"] = family_index; return p;
+  };
+  // Optional: without it the seat is the number, as before.
+  { auto j = frame(); j["pads"] = json::array({pad(2)}); CHECK(parse(line(j), parsed, reason)); CHECK(parsed.pads[2].family_index == 2); }
+  { auto j = frame(); j["pads"] = json::array({with(pad(2), "ps", 0)}); CHECK(parse(line(j), parsed, reason)); CHECK(parsed.pads[2].family_index == 0); }
+  for (const json& value : {json(-1), json(4), json(1.5), json("0"), json(nullptr)}) {
+    auto j = frame(); j["pads"][0]["familyIndex"] = value;
+    CHECK(!parse(line(j), parsed, reason)); CHECK(!reason.empty());
+  }
+  // "hid" keeps its own 32-bit mask (bit 31 is the hat's Left); every other kind stays 16-bit.
+  { auto j = frame(); j["pads"][0]["kind"] = "hid"; j["pads"][0]["b"] = 0x80000001u;
+    CHECK(parse(line(j), parsed, reason)); CHECK(parsed.pads[0].buttons == 0x80000001u); }
+  { auto j = frame(); j["pads"][0]["b"] = 65536; CHECK(!parse(line(j), parsed, reason)); }
+  { auto j = frame(); j["pads"][0]["kind"] = "hid"; j["pads"][0]["b"] = uint64_t(UINT32_MAX) + 1; CHECK(!parse(line(j), parsed, reason)); }
+  // A number twice in one family (xbox and other are one family): the lower seat keeps it, whatever
+  // the array order, and the line still counts, so no pad is held on its last state.
+  { auto j = frame();
+    j["pads"] = json::array({with(pad(3), "other", 1), with(pad(1), "xbox", 1), with(pad(0), "ps", 1), with(pad(2), "switch", 1)});
+    CHECK(parse(line(j), parsed, reason));
+    CHECK(parsed.pads[1].family_index == 1 && parsed.pads[3].family_index == kNoFamilyIndex);
+    CHECK(parsed.pads[0].family_index == 1 && parsed.pads[2].family_index == 1); }
+
+  std::vector<std::string> logs;
+  State state([&](const std::string& s) { logs.push_back(s); });
+  auto j = frame();
+  j["pads"] = json::array({with(pad(0), "xbox", 0), with(pad(1), "other", 0)});
+  j["pads"][1]["id"] = "keyboard";
+  CHECK(state.accept(line(j), 1000)); CHECK(state.accept(line(j), 1001));   // the skip is logged once
+  CHECK(!state.owns_hid());
+  j["pads"][1]["kind"] = "hid"; j["pads"][1]["b"] = 0x80000000u;
+  CHECK(state.accept(line(j), 1002)); CHECK(state.owns_hid());
+  XINPUT_STATE xs{};
+  CHECK(state.read(0, &xs)); CHECK(!state.read(1, &xs));   // a raw HID pad has no Xbox layout
+  CHECK(state.snapshot().pads[1].buttons == 0x80000000u);
+  j["pads"] = json::array();
+  CHECK(state.accept(line(j), 1003)); CHECK(state.owns_hid());   // sticky, like the relay itself
+  CHECK(!state.snapshot().pads[0].present && !state.snapshot().pads[1].present);
+  CHECK(logs == std::vector<std::string>({
+    "pads: relay mode (app): non-adapter pads come from the YouGame app",
+    "pads: relay connect slot 0 dualsense xbox",
+    "pads: relay connect slot 1 keyboard other",
+    "pads: relay slot 1 keyboard skipped: its familyIndex is taken",
+    "pads: relay owns HID pads (the app sent a raw HID pad)",
+    "pads: relay disconnect slot 0 dualsense",
+    "pads: relay disconnect slot 1 keyboard"}));
+}
+
 void concurrent_activation() {
   State state([](const std::string&) {});
   std::mutex mutex; std::condition_variable cv;
@@ -237,6 +289,6 @@ void concurrent_activation() {
 }
 }
 int main() {
-  parser(); state(); eof_reset(); lag(); startup_logging(); concurrent_activation();
+  parser(); state(); eof_reset(); lag(); startup_logging(); concurrent_activation(); families();
   std::printf("yougame relay pads: %d/%d checks passed\n", checks, checks);
 }

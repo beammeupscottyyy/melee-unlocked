@@ -382,6 +382,19 @@ struct StageData* mu_mex_stage_data(int grkind);   /* an added row, NULL when lo
 void* mu_mex_stage_coll_table(int grkind);         /* an added row's collision table, NULL as above */
 int mu_mex_stage_usable(int grkind);               /* 1 when a match may load this internal id */
 const char* mu_mex_stage_lock_reason(int grkind);  /* why an added row is locked, NULL when usable */
+/* m-ex's own menu rows (shim/mu_mex_menu.c): the menu ACE puts under VS Mode's second row. */
+struct HSD_JObj;
+struct HSD_Text;
+struct StartMeleeData;
+void mu_mex_menu_load(void);                       /* mnMain_Scene_OnEnter, with MnMaAll */
+int mu_mex_games(void);                            /* rows of that menu (kind 34), 0 none */
+int mu_mex_games_locked(int row);
+int mu_mex_games_start(int row);                   /* 1: starts (VS Mode follows), 0: locked */
+void mu_mex_games_label(struct HSD_JObj* label, int menu_kind, int selection);
+void mu_mex_games_describe(struct HSD_Text* text, int menu_kind, int selection);
+int mu_mex_volleyball(void);                       /* the court's external id in a session, else -1 */
+void mu_mex_volleyball_end(void);
+void mu_mex_volleyball_rules(struct StartMeleeData* start);
 /* Native retail objects the translation matches against (gr/ground.c, mp/mplib.c, MU_NATIVE). */
 struct StageData* mu_ground_retail_stage(int grkind);         /* ids 0 to 70, NULL otherwise */
 void* mu_mplib_retail_coll(int grkind);                       /* ids 0 to 70, NULL otherwise */
@@ -576,6 +589,13 @@ int mu_online_pending(void);                       /* shim/mu_online.c */
 void mu_online_record_state(int* stable_finalized, int* game_over, int* disconnected);
 struct gm_80479D58_t* mu_gm_engine_state(void);    /* gm/gmscene.c */
 
+/* Same-process scene continuation for the canonical Friends CSS origin. */
+void mu_css_origin_arm(void** context);
+int mu_css_origin_resume(int bit);
+int mu_css_origin_skip_draw(void);
+int mu_css_join_locked(void);
+void mu_css_origin_boot(unsigned char* mode);
+
 /* Rollback snapshot exclusions (shim/mu_exclusions.c). A file that owns state outside the
  * simulation (audio driver and mixer state, host plumbing, renderer bridges) names it with
  * MU_EXCLUSIONS(name, MU_EXCLUDE(sym), ...); a rename is then a compile error, not a silent gap.
@@ -597,6 +617,12 @@ typedef struct MuExclusion {
  * sites those codes patch. Every hook does nothing unless an online match is running. */
 struct PADStatus;
 int mu_online_active(void);
+/* Console-only backend: never asserts Slippi online status or installs its rules. */
+void mu_console_match_setup(void);
+int mu_console_rollback_active(void);
+int mu_console_rumble_owned(void);
+int mu_online_scene_terminal(void); /* pre-break terminal confirmation; 1 re-runs the body */
+unsigned int mu_console_rollback_codes(void);
 unsigned int mu_online_codes(void);   /* MU_RC_* an online match plays with (0 offline) */
 int mu_online_is_test_run(void);      /* the host asked for a match without menus (kinds 1 and 2) */
 int mu_online_p2p_menus(void);        /* 1: a peer-to-peer session through the online menus (kind 3) */
@@ -627,6 +653,8 @@ void mu_online_audio_frame_begin(void);
 void mu_online_audio_frame_end(void);
 void mu_online_audio_rollback_end(void);
 void mu_online_audio_match_exit(void);
+void mu_online_audio_console_restore(int body);
+void mu_online_audio_console_commit(int body);
 void* mu_online_audio_state_address(void);
 unsigned int mu_online_audio_state_size(void);
 int mu_online_sfx_begin(int sound_id, int track, int* adopted_id);   /* PreventDuplicateSounds */
@@ -649,12 +677,26 @@ void mu_pad_motor(int port, int on);                                 /* shim/mu_
 #define MU_OPTION_SLIPPI_MENUS 0x8u
 enum { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS,
        MU_SLP_MODE_PARTY };
-enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_COUNT = 8 };
+enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_SLIPPI = 9, MU_SLP_OPT_TOURNAMENT = 10,
+#ifdef MELEE_DOUBLES
+       MU_SLP_OPT_DOUBLES = 11, MU_SLP_OPT_COUNT = 12
+#else
+       MU_SLP_OPT_COUNT = 11
+#endif
+};
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#ifdef MELEE_DOUBLES
+#define MU_SLP_OPT_SQUAD 12
+#else
+#define MU_SLP_OPT_SQUAD 11
+#endif
+#endif
 enum { MU_SLP_APP_LOGGED_OUT, MU_SLP_APP_LOGGED_IN, MU_SLP_APP_UPDATE };
 enum { MU_SLP_MM_IDLE, MU_SLP_MM_INITIALIZING, MU_SLP_MM_MATCHMAKING, MU_SLP_MM_OPPONENT_CONNECTING,
        MU_SLP_MM_CONNECTION_SUCCESS, MU_SLP_MM_ERROR };
 enum { MU_SLP_STATE_CSS, MU_SLP_STATE_SSS, MU_SLP_STATE_VS, MU_SLP_STATE_RESULTS,
-       MU_SLP_STATE_SPLASH };
+       MU_SLP_STATE_SPLASH, MU_SLP_STATE_GAME_SETUP };
 enum { MU_SLP_WINNER_NULL = -1, MU_SLP_WINNER_LOST = 0, MU_SLP_WINNER_WON = 1 };
 enum { MU_SLP_CB_NONE, MU_SLP_CB_CODE_LOCK_IN, MU_SLP_CB_SSS_LOCK_IN };
 enum { MU_SLP_STAGE_UNSET = 0, MU_SLP_STAGE_PICK = 1, MU_SLP_STAGE_RANDOM = 3 };
@@ -673,6 +715,21 @@ typedef struct MuSlippiMenuState {
     unsigned char code_scratch[64];
 } MuSlippiMenuState;
 
+/* An opponent's live pick on the online character screen (the host's 0xED read, display only:
+ * the match is still set up from the exchanged selections). By remote index, as the host numbers
+ * remote players; `port` is that player's in-game port. valid is 0 until a preview arrives on this
+ * character screen, and again once that player leaves or the game starts. */
+typedef struct MuOpponentPick {
+    unsigned char valid, port;
+    unsigned char char_id;      /* external fighter id while their coin is down, else 0xFF */
+    unsigned char color;        /* the costume their portrait shows */
+    unsigned char team_id;      /* 0-2 in Teams, else 0xFF */
+    unsigned char squad_count;  /* Squad Strike slots filled, 0-3 (0 outside Squad Strike) */
+    unsigned char kinds[3];     /* 0xFF past squad_count */
+    unsigned char colors[3];
+    unsigned char locked;       /* 1 once they locked in */
+} MuOpponentPick;
+
 typedef struct MuMatchState {
     unsigned char connection_state, local_ready, remote_ready, local_index, remote_index;
     unsigned int rng_offset;
@@ -688,6 +745,7 @@ typedef struct MuMatchState {
     char match_id[51];
     unsigned char alt_stage_mode;
     unsigned char raw[1030];   /* Slippi 3.7.0's MSRB: 3.6.4's 962 bytes, ranked info and bot flags */
+    MuOpponentPick opp_picks[3]; /* not part of the MSRB: filled from the 0xED read beside it */
 } MuMatchState;
 
 typedef struct MuSlippiSelections {
@@ -713,13 +771,35 @@ MuSlippiMenuState* mu_slippi_state(void);
 int mu_slippi_cmd(unsigned int cmd, const void* payload, unsigned int size, void* reply,
                   unsigned int reply_cap, unsigned int* reply_size);
 int mu_slippi_fetch_app_state(void);                      /* B9 (and FA: is Ranked offered) */
-/* FA, this fork's own: nonzero when the host offers Ranked (YouGame mode; Ranked v1 plays the
- * Unranked screens). mu_slippi_ranked_header also copies the Ranked character select's header
- * (game text, NUL-terminated) into `out`; it returns 0 and leaves `out` empty otherwise. */
+/* FA: menu visibility is independent of YouGame's Ranked presentation capability.
+ * A NULL output asks whether the hidden Ranked row is offered; a text output reads its header.
+ * available() allows the YouGame random-stage flow even while the menu row stays hidden. */
 int mu_slippi_ranked_available(void);
 int mu_slippi_yougame_pick(void);   /* the online mode was picked from a YouGame row (split menu) */
+int mu_slippi_pick_service(void);   /* 0 Slippi, 1 YouGame, 2 Both: the character select's header names it */
+int mu_slippi_match_service(void);  /* the found opponent's service: 0 not known, 1 Slippi, 2 YouGame */
 void mu_slippi_yougame_restart_older(void);   /* the offer's Start: the launcher restarts in YouGame's release */
+int mu_slippi_friends_available(void);
+int mu_slippi_yougame_menu(void);
+int mu_slippi_menu_option(int row);
+int mu_slippi_menu_count(void);
+int mu_slippi_menu_label_kind(int row);
+int mu_slippi_title_active(void);
+void mu_slippi_title_panel_init(struct HSD_GObj* panel);
+void mu_slippi_title_panel_update(struct HSD_GObj* panel, int canvas);
+void mu_slippi_signin_notice(struct HSD_GObj* menu);
+struct HSD_Text;
+void mu_slippi_menu_description(struct HSD_Text* text, const char* message);
+void mu_online_pages_describe(struct HSD_Text* text, int row);   /* shim/mu_online_pages.inc: each new online menu description */
+void mu_slippi_tournament_notice(struct HSD_GObj* menu, const char* message);
+struct HSD_JObj;
+void mu_slippi_friends_label(struct HSD_JObj* label, int menu_kind, int selection, int capture); /* shim/mu_menu_label.c */
+struct StaticModelSyms;
+void mu_slippi_menu_labels_init(struct StaticModelSyms* model, int menu_kind);
 int mu_slippi_ranked_header(char* out, unsigned int cap);
+/* FA presentation: header, opponent, score, stage note, result rating, result change. */
+int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap);
+int mu_slippi_ranked_lines(char lines[6][128]);
 int mu_slippi_app_state(void);
 const char* mu_slippi_user_name(void);
 const char* mu_slippi_user_code(void);
@@ -727,6 +807,10 @@ int mu_slippi_load_match_state(MuMatchState* out);        /* B3; 0 on success */
 const MuMatchState* mu_slippi_match_state(void);
 void mu_slippi_find_opponent(int mode, const unsigned char* code_sjis18);   /* B4 */
 void mu_slippi_set_selections(const MuSlippiSelections* s);                /* B5 */
+/* ED send: the local live pick, every online character-screen frame (the host sends on change). */
+void mu_pick_preview_send(unsigned char char_id, unsigned char color, unsigned char team_id,
+                          unsigned char squad_count, const unsigned char kinds[3],
+                          const unsigned char colors[3], unsigned char locked);
 void mu_slippi_cleanup_connections(void);                                   /* BA */
 unsigned int mu_slippi_new_seed(void);                                      /* BC */
 void mu_slippi_send_chat(int message_id);                                   /* BB */
@@ -747,6 +831,14 @@ int mu_slippi_first_unlocked(void);
 void mu_online_arm(int mode, int input_port);             /* shim/mu_online.c */
 /* Hook-site entry points (core's own decomp sites). */
 struct HSD_GObj;
+/* Shared Ranked hooks: track A setup, track B CSS ranks, track C CSS reveal. */
+void mu_ranked_setup_load(void* data);
+void mu_ranked_setup_think(void);
+void mu_ranked_setup_exit(void* data);
+void mu_ranked_rank_enter(void);
+void mu_ranked_rank_frame(void);
+void mu_ranked_reveal_enter(void);
+void mu_ranked_reveal_frame(void);
 void mu_slippi_scene_install(void);                       /* gm_801A4510 */
 unsigned char mu_slippi_boot_mode(unsigned char mode);    /* bootOnLeave */
 void mu_slippi_menu_prep(void);                           /* gmmenumode onEnter */
@@ -759,6 +851,7 @@ void mu_slippi_menu_soon(int canvas, int idle);
 struct HSD_JObj;
 void mu_slippi_menu_rows(struct HSD_JObj** rows, int count, void* cobj);   /* mnmain fn_8022AFEC */            /* mnmain: each frame; canvas -1 = new scene */
 int mu_slippi_css_text_heap(void);                        /* preloadState: 0 = vanilla size */
+void mu_slippi_log_online_rows(void);
 void mu_mnmain_install_online_menu(void);                 /* mn/mnmain.c */
 
 #endif
@@ -802,11 +895,12 @@ void mu_slippi_sss_set_slpcss(void* root);   /* CSS: the slpCSS symbol after Sce
 void* mu_slippi_sss_slpcss(void);            /* NULL until the CSS registered it */
 int mu_slippi_sss_frozen(void);              /* frozen Stadium cave byte */
 void mu_slippi_sss_frozen_flip(void);        /* CursorOnHoverStadium Z */
-void mu_slippi_sss_lock_in(int stage_behavior);          /* FN_TX_LOCK_IN: -2 random, -1 unset, 0+ pick */
-void mu_slippi_sss_report_pick(int chosen);
-void mu_css_frame(void);
-int mu_human_zelda_as_sheik(void);           /* Settings > Game > Zelda starts as Sheik; 0 online and in replays */                    /* every character select frame, any mode: the host's CSS features */
-void mu_slippi_css_hand(int port, float x, float y);   /* the CSS hand, each frame (arena rooms' side panels) */             /* the CSS pick to the host when it changes (arena rooms) */
+int mu_slippi_sss_lock_in(int stage_behavior);           /* FN_TX_LOCK_IN: -2 random, -1 unset, 0+ pick; 1 sent, 0 refused, -1 held */
+void mu_slippi_sss_report_pick(int chosen);              /* the CSS pick to the host when it changes (arena rooms) */
+void mu_css_frame(void);                                 /* every character select frame, any mode: the host's CSS features */
+int mu_human_zelda_as_sheik(void);                       /* Settings > Game > Zelda starts as Sheik; 0 online and in replays */
+int mu_host_button_label(int port, unsigned button_mask, char* out, int n); /* a keyboard port's key for a pad button, for prompts; 0 keeps the GameCube name */
+void mu_slippi_css_hand(int port, float x, float y);     /* the CSS hand, each frame (arena rooms' side panels) */
 void mu_slippi_sss_find_match(void);                     /* FN_TX_FIND_MATCH (B4, typed code) */
 void mu_slippi_sss_run_callback(int stage_behavior);     /* r13-0x5018 lock-in callback */
 #endif
@@ -818,10 +912,30 @@ struct CSSData;
 struct HSD_JObj;
 int mu_slippi_css_online(void);              /* flag on and major 8 state 0 */
 int mu_slippi_css_teams(void);               /* ... and the Teams mode */
+/* The 4-player Friends lobby's 4-door select (shim/mu_slippi_menu.c; screen in mu_friends4_css.inc,
+ * wire in port/runtime/abi/mu_lobby_wire.h). mu_slippi_css_online() is 0 there: it is Melee's VS select. */
+struct MuLobbyView;
+enum { MU_LOBBY_EXIT_NONE = 0, MU_LOBBY_EXIT_SSS = 1, MU_LOBBY_EXIT_SPLASH = 2 };
+int mu_lobby_css(void);                      /* the online major's select is the lobby's 4-door one */
+const struct MuLobbyView* mu_lobby_read(void);   /* this frame's view (READ), NULL when there is none */
+int mu_lobby_send(const unsigned char* request, unsigned int size);   /* 1 queued */
+void mu_lobby_css_exit(int where);           /* MU_LOBBY_EXIT_*: why the select is about to leave */
+int mu_lobby_curtain(void);                  /* the stage is picked: the select is passed through, hidden */
+void mu_lobby_curtain_frame(const struct MuLobbyView* v);
+int mu_lobby_watch_pads(struct PADStatus* status);   /* PADRead: a guest on the host's stage select only watches */
+void mu_lobby_watch_stage(void);
+int mu_lobby_partner_source(void); /* physical controller for the owned local partner, else -1 */
+/* Doubles: the partner door's tab, this machine's alone (never on the wire): FIND each home. */
+enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3, MU_LOBBY_WANTS = 4 };
+int mu_lobby_partner_want(void);
+void mu_lobby_set_partner_want(int want);
+void mu_lobby_pads(struct PADStatus* status);   /* PADRead: only this player's pad, on its own seat's door */
 void mu_slippi_css_enter(struct CSSData** css, unsigned char* char_chosen, signed char* ctrl_port,
                          unsigned char* scene_request, signed char* name_entry_port,
                          struct HSD_JObj** single_menu_root);   /* SceneLoadCSS */
 void mu_slippi_css_poll(void);               /* FetchMatchInfo: B3 per cursor think */
+/* mncharsel.c (mu_css_transfer.inc): door `door`'s live pick, fighter 0xFF while the coin is carried. */
+void mu_css_pick_preview(int door, int port, unsigned char* ck, unsigned char* color);
 int mu_slippi_css_inputs(unsigned int trigger);   /* HandleInputsOnCSS: 1 = both ready, start */
 void mu_slippi_css_text_init(void);          /* LoadCSSText */
 int mu_slippi_css_skip_return_sound(void);   /* SkipReturnToCssSound: 1 = skip the voice */

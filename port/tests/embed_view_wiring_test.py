@@ -22,6 +22,12 @@ class EmbedViewWiringTest(unittest.TestCase):
         self.assertIn('SetWindowRgn(h, region, TRUE)', geometry)
         self.assertIn('result.resize ? 0 : SWP_NOSIZE', geometry)
         self.assertNotIn('g_on_resize', geometry)
+        raise_fn = window.split('void raise_embed(HWND h) {', 1)[1].split('}', 1)[0]
+        self.assertIn('SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)', raise_fn)
+        self.assertIn('IsWindowVisible(h)', raise_fn)
+        self.assertEqual(geometry.count('raise_embed(h);'), 2)
+        self.assertIn('raise_embed(g_hwnd); log("window: in the YouGame player box");', window)
+        self.assertRegex(window, r'(?s)case kBoxShow: \{.*?ShowWindow\(h, visible \? SW_SHOWNA : SW_HIDE\);\s*raise_embed\(h\);\s*return 0;\s*\}')
         self.assertNotIn('ResizeBuffers', geometry)
         self.assertIn('if (g_embed_view.has_view && g_client_w == LOWORD(l) && g_client_h == HIWORD(l)) return 0;', window)
         self.assertIn('if (c.rfind("view", 0) == 0) return std::string("view");',
@@ -51,9 +57,20 @@ class EmbedViewWiringTest(unittest.TestCase):
                           r'#else\s*inline constexpr const char\* kCaps = ("[^\n]+?");\s*#endif', header)
         self.assertIsNotNone(match)
         supported, mac = (json.loads(json.loads(value)[3:])["caps"] for value in match.groups())
-        self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "view", "volume"])
-        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads"])
+        self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume", "match", "fullscreen"])
+        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "match", "fullscreen"])
+        toplevel = re.search(r'const char\* kToplevelCaps = ("[^\n]+?");', header)
+        self.assertIsNotNone(toplevel)
+        self.assertEqual(json.loads(json.loads(toplevel.group(1))[3:])["caps"],
+                         ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume", "toplevel", "match", "fullscreen"])
         self.assertEqual(header.count('kCaps ='), 2)
+
+    def test_stdio_init_logs_nothing(self):
+        # init runs before --log-file opens; a line here sends the run log to the default file.
+        link = source("port/runtime/hle/yougame_link.cpp")
+        block = link.split("  if (g_stdio) {\n    std::thread(read_stdin).detach();", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn("parity::signals.sync_match(-1);", block)
+        self.assertNotIn("log(", block)
 
     def test_proof_logs(self):
         for path in ("port/runtime/host/window.cpp", "port/linux/embed/yougame_embed_x11.c"):

@@ -108,7 +108,46 @@ void haybox_xinput_axes() {
 }
 }  // namespace
 
+// Two pads and no GameCube adapter: port 1 takes the first pad, the second plays as no port until the
+// player gives it one ("Play as P2" in the settings). Ports 2 to 4 never take a spare pad on their own.
+void port_offer() {
+  using host::DeviceKind; using host::PortSource;
+  host::InputDeviceFacts facts;
+  facts.xinput[0] = facts.xinput[1] = true;
+  auto sources = host::default_port_sources();
+  auto feed = [&](PortSource (&feeding)[4]) {
+    for (int port = 0; port < 4; ++port) feeding[port] = host::effective_port_source(sources, facts, port);
+  };
+  PortSource feeding[4];
+  feed(feeding);
+  CHECK(feeding[0].kind == DeviceKind::XInputPad && feeding[0].index == 0);
+  CHECK(feeding[1].kind == DeviceKind::GCAdapter && feeding[1].index == 1);   // no automatic P2
+  const PortSource pad2{DeviceKind::XInputPad, 1};
+  CHECK(host::port_playing(feeding, {DeviceKind::XInputPad, 0}) == 1);
+  CHECK(host::port_playing(feeding, pad2) == 0);
+  const int offer = host::open_port_for_pad(feeding, facts);
+  CHECK(offer == 1);
+  sources[offer] = pad2;   // what the button does
+  feed(feeding);
+  CHECK(feeding[0].kind == DeviceKind::XInputPad && feeding[0].index == 0);   // P1 keeps its pad
+  CHECK(host::port_playing(feeding, pad2) == 2);
+  CHECK(host::open_port_for_pad(feeding, facts) == 2);
+  // A port on the keyboard counts as playing; four connected ports leave nothing to offer.
+  sources = {{{DeviceKind::Keyboard, 0}, {DeviceKind::XInputPad, 0}, {DeviceKind::XInputPad, 1}, {DeviceKind::XInputPad, 1}}};
+  feed(feeding);
+  CHECK(host::open_port_for_pad(feeding, facts) == -1);
+  // The keyboard is one device: matched whatever its index.
+  CHECK(host::port_playing(feeding, {DeviceKind::Keyboard, 3}) == 1);
+  // Nothing plugged in at all: port 1 plays the keyboard, port 2 is the first open one.
+  facts = {};
+  sources = host::default_port_sources();
+  feed(feeding);
+  CHECK(feeding[0].kind == DeviceKind::Keyboard);
+  CHECK(host::open_port_for_pad(feeding, facts) == 1);
+}
+
 int main() {
+  port_offer();
   haybox_xinput_axes();
   coordinates();
   opposing_directions();

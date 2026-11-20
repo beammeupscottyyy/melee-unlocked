@@ -1,0 +1,128 @@
+#include "yougame_friends.h"
+#include "yougame_mode_policy.h"
+#include "yougame_parity.h"
+#include <cstdio>
+#include <cstdlib>
+static int checks = 0;
+#define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
+int main() {
+  using namespace yougame::friends;
+  for (const char* source : {"relayed", "adapter", "keyboard mapped START"}) {
+    (void)source;
+    InviteEdge e;
+    CHECK(!e.poll(true, 0x1000, false)); // Direct's empty code + START never invites.
+    CHECK(!e.poll(true, 0, false));
+    CHECK(!e.poll(true, 0x1000, false));
+  }
+
+  InviteEdge e;
+  CHECK(!e.poll(true, 0x100, false)); // A must still type on Direct
+  CHECK(!e.poll(true, 0, true));
+  CHECK(e.poll(true, 0x100, true));
+  CHECK(!e.poll(true, 0x100, true));
+  CHECK(!e.poll(false, 0x100, true));
+  CHECK(!e.poll(true, 0x100, true));   // still held after focus/connection came back: no press
+  CHECK(!e.poll(true, 0x100, true));
+  CHECK(!e.poll(true, 0, true));       // released
+  CHECK(e.poll(true, 0x100, true));    // a real press counts again
+  CHECK(!e.poll(true, 0, true));
+  CHECK(e.poll(true, 0x1000, true));
+  CHECK(!e.poll(true, 0x1000, true));
+  CHECK(!yougame::mode_policy::friends_offered(false));
+  CHECK(yougame::mode_policy::friends_offered(true));   // main build default, no -D flags
+  CHECK(!yougame::mode_policy::yougame_ranked_offered);
+  CHECK(version_reason({{"reason", "version"}}));
+  for (const auto& j : {json(), json::array(), json{{"reason", 1}}, json{{"reason", "Version"}}, json{{"error", "version"}}})
+    CHECK(!version_reason(j));
+  Events events;
+  events.online_menu(true, true);
+  CHECK(events.picker_context());
+  CHECK(events.poll_pad(3, true, 0x100));
+  CHECK(events.trigger() == "pad 4 buttons 0100");
+  CHECK(events.take_host());
+  CHECK(!events.take_host());
+  CHECK(!events.poll_pad(3, true, 0x100));
+  // An open picker counts as away: the A or START that closed it must be let go first.
+  CHECK(!events.poll_pad(3, true, 0));
+  events.picker_open(true);
+  CHECK(!events.poll_pad(3, true, 0x100));
+  CHECK(!events.take_host());
+  events.picker_open(false);
+  CHECK(!events.poll_pad(3, true, 0x100));  // still held from the picker
+  CHECK(!events.poll_pad(3, true, 0));
+  CHECK(events.poll_pad(3, true, 0x100));
+  CHECK(events.take_host());
+  events.notice("Signing in to YouGame...", 100);
+  CHECK(events.toast(101) == "Signing in to YouGame...");
+  CHECK(events.toast(6100).empty());
+  CHECK(events.push({{"type", "notice"}, {"reason", "version"}}, 10));
+  CHECK(events.toast(11) == kVersionDetail);
+  // A chat message is display only: its own line, never an invite, never a join.
+  const json message = {{"slug", "melee-unlocked"}, {"type", "notice"}, {"kind", "message"}, {"id", "m1"},
+                        {"from", "Ada"}, {"text", std::string(140, 'x')}};
+  CHECK(events.push(message, 20));
+  CHECK(events.message(21) == "Ada: " + std::string(140, 'x'));
+  CHECK(events.toast(21) == kVersionDetail);  // the version toast stays
+  CHECK(!events.push(message, 30));     // same id and line: dropped
+  CHECK(events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m1"}, {"from", "Ada"}, {"text", "again"}}, 30));
+  CHECK(events.message(31) == "Ada: again");  // the page restarted its counter
+  CHECK(events.push(message, 32));
+  CHECK(events.message(6031).size() == 145 && events.message(6032).empty());
+  CHECK(events.take_join(true).empty());
+  CHECK(!events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m2"}, {"from", "Ada"}, {"text", std::string(141, 'x')}}, 40));
+  CHECK(!events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m3"}, {"from", "Ada"}, {"text", "a\nb"}}, 40));
+  CHECK(!events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m4"}, {"text", "hi"}}, 40));
+  CHECK(events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m5"}, {"from", "Bo"}, {"text", "hi"}, {"room", "ABCD"}}, 50));
+  CHECK(events.message(51) == "Bo: hi" && events.take_join(true).empty());
+  CHECK(events.report_version());
+  CHECK(!events.report_version());
+  CHECK(events.take_version());
+  CHECK(!events.take_version());
+  events.request_host();
+  events.online_menu(false);
+  CHECK(!events.take_host());
+  CHECK(!events.online_menu() && !events.friend_entry() && !events.picker_context());
+  CHECK(!events.poll_pad(0, true, 0x1100));
+  CHECK(!events.take_host());
+
+  // Direct has no picker context, for empty and typed code alike.
+  Events direct;
+  CHECK(!direct.poll_pad(0, true, 0x1000));
+  direct.request_host();
+  CHECK(!direct.take_host() && !direct.picker_context());
+  direct.online_menu(true, false); // visible Online, another row hovered
+  direct.request_host();
+  CHECK(!direct.take_host());
+
+  // Match window.cpp's ownership: OverlayPad claims its chord before Friends sees
+  // the remaining buttons; settings capture and a settings-opening edge are skipped.
+  for (bool entry : {false, true}) {
+    Events input;
+    yougame::parity::OverlayPad overlay;
+    if (entry) input.online_menu(true, true);
+
+    auto poll = [&](uint16_t buttons, bool opened = false, bool capture = false) {
+      const auto event = overlay.poll(true, 0, true, buttons, 100);
+      if (!opened && !capture) input.poll_pad(0, true, buttons);
+      return event != nullptr;
+    };
+    CHECK(poll(0x1004));  // Down + START opens YouGame only
+    CHECK(!input.take_host());
+    CHECK(!poll(0x1000));  // releasing Down first still leaves START claimed
+    CHECK(!input.take_host());
+    CHECK(!poll(0));
+    CHECK(!poll(0x1000));  // plain START still invites once
+    CHECK(input.take_host() == entry);
+    CHECK(!poll(0x1000));
+    CHECK(!input.take_host());
+    for (uint16_t buttons : {0x1000, 0x0100}) {
+      poll(0);
+      poll(buttons, true, false);
+      CHECK(!input.take_host());
+      poll(0);
+      poll(buttons, false, true);
+      CHECK(!input.take_host());
+    }
+  }
+  std::printf("friends input: %d/%d checks passed\n", checks, checks);
+}

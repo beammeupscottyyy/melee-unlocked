@@ -7,6 +7,7 @@
 // line height in ems, because ImGui sizes a font by that height and CSS by the em.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "arena_panel.h"
+#include "arena_hand.h"
 #include "cosmetic_mods.h"
 #include "host.h"
 #include "render_options.h"
@@ -84,7 +85,8 @@ struct State {
   // The hand: pushed against the left (1) or right (2) edge of the character select it goes into
   // that side's panel; the button under it lights up and A presses it.
   int side = 0;
-  int push_side = 0, push_frames = 0, push_needed = 10;   // push_needed: kPushFrames or kPushFramesOverCard
+  int push_side = 0, push_frames = 0, push_needed = 10;   // push_needed: kPushFrames, kPushFramesOverCard or kRestFrames
+  float rest_y = 0;                         // out of a room: where the resting hand's count started (it must hold still)
   uint8_t hover = 0, hover_member = 0xFF;   // a Do and, for a player card, whose
   int stay_level = 2;                       // in a panel: how level the glove must stay (1 when it went in over the card from above)
   uint16_t swallow = 0;                     // panel buttons still held from the panel: kept from the game until let go
@@ -890,14 +892,19 @@ void submit_code() {
 void open_code_page() { g.page = Page::Code; g.code.clear(); g.recent_pick = -1; g.key_row = 0; g.key_col = 0; load_recent(); }
 
 // The character select's hand reaches the panels: held against the left or right edge of the
-// screen for a moment it goes into that side's panel. The hand keeps moving as it does everywhere
+// screen for a moment it goes into that side's panel (out of a room, also just resting beside the
+// ARENA or WARM UP card: beside_card). The hand keeps moving as it does everywhere
 // else: the button level with it lights up gold, A presses it, X, Y, R and Z do what their chips
 // say, and the hand is out again once it leaves the edge (or on B). In a panel the game still sees
 // the stick, but not those buttons.
-constexpr float kLeftEdge = -34.8f, kRightEdge = 25.8f;   // the hand's limits: -35, and 26 (29 with m-ex)
-constexpr float kEdgeSlack = 0.5f;        // in a panel, this far off the edge still counts as at it
-constexpr int kPushFrames = 10;
-constexpr int kPushFramesOverCard = 30;   // half a second: the glove only reaches the card from above
+// The ways in and their limits are plain functions of the hand's place (arena_hand.h, tested in
+// tests/arena_rules_test.cpp): a push at the edge, or out of a room a rest beside a card.
+using arena_hand::kLeftEdge;
+using arena_hand::kRightEdge;
+using arena_hand::kPushFrames;
+using arena_hand::kPushFramesOverCard;
+using arena_hand::kRestFrames;
+using arena_hand::kRestStill;
 constexpr uint16_t kPanelButtons = kA | kB | kX | kY | kZ | kR;
 float g_bar_y0 = 0, g_bar_y1 = 1;
 
@@ -911,19 +918,26 @@ void leave_panel() {
 // picture, sat a fifth off at the card's height (0.9.204, 2560x1440).
 float hand_unit() { return (g_bar_y1 - g_bar_y0) / 57.3f; }
 float hand_screen_y(float hy) { return (g_bar_y0 + g_bar_y1) * 0.5f - hy * hand_unit(); }
+// A window row as the select's height (up positive).
+float select_y(float screen_y) { return ((g_bar_y0 + g_bar_y1) * 0.5f - screen_y) / hand_unit(); }
 
-// How level the glove is with that side's buttons: 2 level with one, 1 only the glove's lower part
-// over one (it hangs about seven units below the point the game reports), 0 neither. In a room the
-// whole edge is the panel.
+// How level the glove is with that side's buttons (arena_hand::level, the best of them). In a room
+// the whole edge is the panel.
 int hand_level(int side, float hy, bool in_room) {
-  const float unit = hand_unit(), hand_y = hand_screen_y(hy);
   int level = 0;
   for (const Item& it : g_last_items) {
     if (it.side != side) continue;
-    if (in_room || (hand_y + 2.0f * unit >= it.y0 && hand_y - 5.0f * unit <= it.y1)) return 2;
-    if (hand_y + 7.0f * unit >= it.y0 && hand_y <= it.y1) level = 1;
+    if (in_room) return 2;
+    level = std::max(level, arena_hand::level(hy, select_y(it.y0), select_y(it.y1)));
   }
   return level;
+}
+
+// Out of a room: the hand beside one of that side's cards without a push (arena_hand::beside).
+bool beside_card(int side, float hx, float hy) {
+  for (const Item& it : g_last_items)
+    if (it.side == side && arena_hand::beside(side, hx, hy, select_y(it.y0), select_y(it.y1))) return true;
+  return false;
 }
 
 // The button level with the hand on that side, from last frame's buttons.
@@ -1044,10 +1058,12 @@ void handle_input(const Frame& f, const View& v) {
   float hx = 0, hy = 0;
   const bool have_hand = ar::css_hand(&hx, &hy);
   if (g.side == 0) {
-    // In: the hand held against an edge, the stick still pushing out.
+    // In: the hand held against an edge, the stick still pushing out; or, out of a room, the hand
+    // resting beside a card (beside_card).
     int want = 0;
-    if (have_hand && hx <= kLeftEdge && f.stick_x < -50) want = 1;
-    if (have_hand && hx >= kRightEdge && f.stick_x > 50) want = 2;
+    bool resting = false;
+    if (have_hand && arena_hand::pushing(1, hx, f.stick_x)) want = 1;
+    if (have_hand && arena_hand::pushing(2, hx, f.stick_x)) want = 2;
     // Only into a side that has buttons (out of a room the left has none: it went in and out every
     // 11 frames, taking a frame of input each time), and out of a room only beside the ARENA tab:
     // higher up the right edge the hand is on Ganondorf or Young Link, whose players hold the stick
@@ -1061,12 +1077,22 @@ void handle_input(const Frame& f, const View& v) {
       if (!level) want = 0;
       g.push_needed = level == 1 ? kPushFramesOverCard : kPushFrames;
     }
+    if (!want && have_hand && !v.active) {
+      if (beside_card(2, hx, hy)) want = 2;
+      else if (beside_card(1, hx, hy)) want = 1;
+      resting = want != 0;
+    }
+    if (resting) {
+      // Still: the count starts over whenever the hand moves on (it slides along the edge past the card).
+      if (want != g.push_side || std::fabs(hy - g.rest_y) > kRestStill) { g.rest_y = hy; g.push_side = want; g.push_frames = 0; }
+      g.push_needed = kRestFrames;
+    }
     {
       // MELEE_TEST_ARENA_HANDLOG=1 (tests): the hand and the push, every 15 frames while it is near an edge.
       static const bool log_hand = [] { const char* e = host::test_env::getenv("MELEE_TEST_ARENA_HANDLOG"); return e && *e == '1'; }();
       static int n = 0;
       if (log_hand && have_hand && (hx > 20.0f || hx < -29.0f) && ++n % 15 == 0)
-        host::log("arena panel: hand %.1f %.1f stick %d want %d", hx, hy, (int)f.stick_x, want);
+        host::log("arena panel: hand %.1f %.1f stick %d want %d%s", hx, hy, (int)f.stick_x, want, resting ? " resting" : "");
     }
     if (want && want == g.push_side) ++g.push_frames;
     else { g.push_side = want; g.push_frames = want ? 1 : 0; }
@@ -1075,7 +1101,8 @@ void handle_input(const Frame& f, const View& v) {
       g.stay_level = g.push_needed == kPushFramesOverCard ? 1 : 2;
       g.push_frames = 0;
       hover_nearest(want, hy);
-      host::log("arena panel: the hand went into the %s panel (on button %d)", want == 1 ? "left" : "right", (int)g.hover);
+      host::log("arena panel: the hand went into the %s panel (on button %d%s)", want == 1 ? "left" : "right", (int)g.hover,
+                resting ? ", resting beside the card" : "");
       g.prev_dir = dir;
       g.dir_at = f.time + 0.25;   // the push that brought the hand in moves nothing
     }
@@ -1084,7 +1111,8 @@ void handle_input(const Frame& f, const View& v) {
   // In a panel: the hand moves on as the game moves it (nothing holds it at a button), and the
   // button level with it lights up. Out once it leaves the edge or is level with no button, or on B.
   g.swallow |= f.buttons & kPanelButtons;
-  const bool at_edge = have_hand && (g.side == 1 ? hx <= kLeftEdge + kEdgeSlack : hx >= kRightEdge - kEdgeSlack);
+  // Out of a room the cards reach in further (a hand let in resting beside one stays in).
+  const bool at_edge = have_hand && arena_hand::at_side(g.side, hx, v.active);
   if (!at_edge || !(hand_level(g.side, hy, v.active) >= g.stay_level) || (pressed & kB)) { leave_panel(); return; }
   const uint8_t was = g.hover, was_member = g.hover_member;
   hover_nearest(g.side, hy);
@@ -1730,7 +1758,11 @@ bool wants_capture() { return g.page != Page::None; }
 uint16_t withheld_buttons() { return g.side != 0 && g.page == Page::None ? kPanelButtons : g.swallow; }
 
 void frame(const Frame& f) {
-  if (yougame::active()) { leave_panel(); g.page = Page::None; return; }   // rooms are a Slippi Direct feature
+  // Rooms are a Slippi Direct feature. Not on a YouGame row either (YouGame Friends under the launcher,
+  // session() and not only the app's active()): a room's links are Direct searches of their own beside
+  // the game's own, and a YouGame search closes the game's YouGame room (yougame_link begin_search), so
+  // the card there opened a room that never formed (0.9.990).
+  if (yougame::session()) { leave_panel(); g.page = Page::None; return; }
   if (!ar::rooms_enabled()) { leave_panel(); g.page = Page::None; return; }   // tests only: rooms off
   load();
   if (const int forced = ar::test_fixture_look(); forced >= 0) {   // tests only: the fixture's cycle

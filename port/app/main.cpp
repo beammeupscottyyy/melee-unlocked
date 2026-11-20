@@ -8,6 +8,13 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include "yougame_link.h"
+#include "yougame_update.h"
+#ifdef MELEE_SOURCE_PORT
+#include "replay_bar.h"
+#include "yougame_console_boot.h"
+#include "yougame_console_engine.h"
+#include "yougame_console_entry.h"
+#endif
 #include "yougame_mode_policy.h"
 #include "yougame_memcard.h"
 #include "host.h"
@@ -43,10 +50,14 @@
 #include "guest_registry.h"
 #include "gx_vulkan.h"
 #include "gx_backend.h"
+#include "settings_log.h"
 #include "gx_core.h"
+#include "pipeline_cache_store.h"
+#include "prewarm_only.h"
 #include "render_options.h"
 #include "gx_retro.h"
 #include "pc_settings.h"
+#include "yougame_display_defaults.h"
 #include "texture_pack.h"
 #include "cosmetic_mods.h"
 #include "disc_skin_scan.h"
@@ -67,6 +78,7 @@ namespace app { int run_settings_window(gx::RenderOptions& options, unsigned lon
 #endif
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_test.h"
+#include "yougame_ranked_cpu.h"
 #include "yougame_agent_script.h"
 #include "yougame_agent_pad.h"
 #include "yougame_agent_fight.h"
@@ -754,6 +766,9 @@ static void usage() {
               "           [--fps N|monitor|unlocked] [--frame-mode extrapolate|interpolate|authored|off] [--threaded-renderer]\n"
               "           [--fullscreen] [--backend d3d12|d3d11|vulkan] [--dlss off|dlaa|quality|balanced|performance|ultra] [--frame-times out.csv] [--music 0-100|--no-music] [--volume 0-100] [--audio-dump out.wav]\n"
               "           [--vanilla-only] [--no-mod-autodetect]\n"
+              "           [--prewarm-only] (hidden graphics cache preparation, no disc required; run from the same working directory as a normal launch)\n"
+              "           prewarm-only exits: 0 ok, 2 no renderer, 3 write failed, 4 already running,\n"
+              "                               5 save timeout, 6 unsupported backend, 64 usage\n"
               "           [--sys-dir folder] [--user-dir folder] [--sysgen-data-dir writable-data-folder]\n"
               "           [--settings-path file --load-settings --import-cosmetic file|--scan-disc-skins mod.iso|--select-cosmetic id|--deselect-cosmetic slot|--enable-project-effects|--restore-vanilla-cosmetics|--cosmetic-status]\n"
               "           [--capture out.ppm --capture-frame N] [--trace-calls] [--quiet]\n");
@@ -1099,6 +1114,7 @@ static bool graphics_driver_module(const char* path) {
 }
 
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS* info) {
+  ::gx::cache_store::freeze();   // first: no cache save starts or lands from a crashing process
   static volatile LONG entered = 0;
   if (InterlockedExchange(&entered, 1)) return EXCEPTION_CONTINUE_SEARCH;
   const EXCEPTION_RECORD* er = info->ExceptionRecord;
@@ -1331,11 +1347,11 @@ static void remember_iso(const std::string& iso) {
 
 // The runtime and the translated game are built for AVX2. Without it the first AVX2 instruction
 // kills the process before anything is logged, so say so plainly instead (this file is not AVX2).
-#ifndef MELEE_CPU_BASELINE_NAME
-#define MELEE_CPU_BASELINE_NAME "AVX2"
-#endif
 #ifdef __APPLE__
 #include "../mac/cpu_check.h"
+#endif
+#ifndef MELEE_CPU_BASELINE_NAME
+#define MELEE_CPU_BASELINE_NAME "AVX2"
 #endif
 static bool cpu_has_avx2() {
 #ifdef __APPLE__
@@ -1470,6 +1486,7 @@ static std::string playable_replay(const std::string& path) {
 // parser gives up on) used to end the game with a bare exception code. It is reported with its own
 // text instead, so the crash report says what failed.
 [[noreturn]] static void report_unhandled() {
+  ::gx::cache_store::freeze();   // first: no cache save starts or lands from a failing process
   // Quitting already: NVIDIA's frame generation threw from its own thread while the process was being
   // ended (std::system_error "device or resource busy"), and that came out as a crash report.
   if (host::process_ending()) TerminateProcess(GetCurrentProcess(), 0);
@@ -1609,8 +1626,13 @@ static int guarded_main(int argc, char** argv) {
   }
 }
 #ifdef _WIN32
+#include "standalone_launch_win.h"
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   attach_parent_console();
+#ifdef MELEE_SOURCE_PORT
+  // A plain double-click (no arguments at all): find the player's disc and start like MeleeUnlocked.bat.
+  if (__argc == 1) return standalone_launch::run();
+#endif
   return guarded_main(__argc, __argv);
 }
 #endif
@@ -1627,7 +1649,106 @@ int main(int argc, char** argv) {
 int main(int argc, char** argv) { return guarded_main(argc, argv); }
 #endif
 
+// Resolve the window API; graphics-only runs never read or change crashed-start recovery.
+static void prepare_render_backend(gx::RenderOptions& gfx) {
+  if (gfx.api == gx::RenderApi::Vulkan && !gx::vulkan_available()) {
+    host::log("vulkan: not usable on this system; starting on the default renderer");
+    gfx.api = gx::RenderApi::D3D12;
+  }
+  // A Linux driver fault cannot be caught by the renderer. Recover on the next launch instead of
+  // making the player repeat the same crash. Windows first retries with a cleared shader cache.
+#ifdef __linux__
+  constexpr int vulkan_failure_limit = 1;
+#else
+  constexpr int vulkan_failure_limit = 2;
+#endif
+  gx::vulkan_set_shader_cache(gfx.shader_cache);   // the start marker lives in the cache folder
+  if (!gfx.prewarm_only && gfx.api == gx::RenderApi::Vulkan && gx::vulkan_failed_starts() >= vulkan_failure_limit) {
+    host::log("vulkan: the last %d starts did not finish; starting on the default renderer (pick Vulkan in the settings to try it again)",
+              gx::vulkan_failed_starts());
+    gfx.api = gx::RenderApi::D3D12;
+  }
+  host::window_prefer_vulkan(gfx.api == gx::RenderApi::Vulkan);
+}
+
+static int run_prewarm_only(int argc, char** argv) {
+  g_crash_dialog = false;
+#ifdef _WIN32
+  SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
+#else
+  app::prewarm_only::install_crash_handlers();
+#endif
+  host::options.log_file = app::prewarm_only::log_path({});
+  try {
+    return app::prewarm_only::with_arguments(argc, argv, [&](const app::prewarm_only::Arguments& args) {
+      host::options.log_file = app::prewarm_only::log_path(args.log_file);
+      host::options.no_gc_adapter = true;
+      if (!args.sys_dir.empty()) host::options.sys_dir = args.sys_dir;
+      host::set_die_hook(app::prewarm_only::die_hook<host::end_process>);
+      gx::RenderOptions gfx;
+      gfx.prewarm_only = true;
+#ifdef MELEE_SOURCE_PORT
+      gfx.native_source = true;
+#endif
+      if (!args.settings_path.empty()) gfx.settings_path = args.settings_path;
+      int volume = 0;
+      gx::load_pc_settings(gfx, volume);
+      if (!args.shader_cache.empty()) { gfx.shader_cache = args.shader_cache; gfx.shader_cache_shared = true; }
+      if (!args.backend.empty()) {
+        if (args.backend == "vulkan" || args.backend == "vk") gfx.api = gx::RenderApi::Vulkan;
+        else if (args.backend == "d3d11" || args.backend == "dx11" || args.backend == "11") gfx.api = gx::RenderApi::D3D11;
+        else if (args.backend == "d3d12" || args.backend == "dx12" || args.backend == "12") gfx.api = gx::RenderApi::D3D12;
+        else { host::log("prewarm-only: unknown backend"); usage(); return app::prewarm_only::usage_error; }
+      }
+      if (gfx.api == gx::RenderApi::D3D11) {
+        host::log("prewarm-only: unsupported backend: d3d11 has no recipe prewarm");
+        return app::prewarm_only::unsupported_backend;
+      }
+      gfx.pc_settings = false;
+      gfx.fullscreen = gfx.exclusive_fullscreen = false;
+      gfx.slippi_spectator = false;
+      host::window_prefer_background(true);
+      prepare_render_backend(gfx);
+      // Since v0.9.104 the Vulkan cache sits under the shader cache folder (vulkan_set_shader_cache), as a
+      // normal launch with the same --shader-cache keeps it: lock that folder.
+      const auto root = std::filesystem::u8path(gfx.shader_cache.empty() ? "shadercache" : gfx.shader_cache);
+      const auto cache = gfx.api == gx::RenderApi::Vulkan ? root / "vulkan-v1" : root;
+      const int result = app::prewarm_only::with_cache_lock(cache, [&] {
+        const int status = app::prewarm_only::run([&] {
+          void* window = host::window_create(gfx.window_w, gfx.window_h, L"Melee Unlocked prewarm", false
+#ifdef _WIN32
+              , true
+#endif
+          );
+          if (!window) return std::unique_ptr<gx::Backend>{};
+          return std::unique_ptr<gx::Backend>(gx::create_render_backend(window, gfx.window_w, gfx.window_h, gfx));
+        }, [] {
+          return ::gx::cache_store::flush_all_result("prewarm-only", std::chrono::seconds(30));
+        }, [](const gx::PrewarmStats& stats, long long ms, app::prewarm_only::SaveResult saved) {
+          host::log("prewarm-only: backend=%s recipes=%llu cache_hits=%llu compiled=%llu ms=%lld saved=%s",
+                    stats.backend, (unsigned long long)stats.recipes, (unsigned long long)stats.cache_hits,
+                    (unsigned long long)stats.compiled, ms, gx::cache_store::flush_result_name(saved));
+        }, [](const char* error) { host::log("prewarm-only: renderer failed: %s", error); });
+        // A timed-out saver can still own the driver; end_process releases the window/device.
+        if (status != app::prewarm_only::save_timeout) host::window_destroy();
+        return status;
+      });
+      if (result == app::prewarm_only::already_running) host::log("prewarm-only: already running");
+      return result;
+    }, [](const char* error) { host::log("prewarm-only: %s", error); usage(); });
+  } catch (const std::exception& e) {
+    host::log("prewarm-only: %s", e.what());
+    return app::prewarm_only::no_renderer;
+  }
+}
+
 static int melee_main(int argc, char** argv) {
+  // --prewarm-only must run from the same working directory as a normal launch.
+  if (app::prewarm_only::requested(argc, argv)) {
+    const int result = run_prewarm_only(argc, argv);
+    host::log_flush();
+    host::end_process(result);   // Windows too: skip CRT/DLL unload inside graphics drivers
+  }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   const auto agent_process_start = yougame::agent_test::PadBack::Clock::now();
 #endif
@@ -1661,8 +1782,22 @@ static int melee_main(int argc, char** argv) {
 #else
   constexpr auto agent_engine = yougame::agent_test::Engine::Static;
 #endif
-  const auto agent_test = yougame::agent_test::load(yougame::active(), std::getenv("YOUGAME_DATA"), agent_engine);
+  // The app may start the game through Melee Unlocked's own launcher (launcher(), not active()); an AGENT TEST
+  // copy started that way reads its agent-test.json too. YOUGAME_AGENT_COPY=1 still gates it inside load().
+  const auto agent_test = yougame::agent_test::load(yougame::active() || yougame::launcher(), std::getenv("YOUGAME_DATA"), agent_engine);
+  yougame::display_defaults::agent_test_run = agent_test.agent_file;   // the FPS counter's default (read with the settings)
+  host::test_env::agent_run = agent_test.agent_file;   // Slippi Launcher search and refresh off
+  yougame::ranked_cpu::practice_allowed = agent_test.agent_file;
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  // Install after harness admission below; install is intentionally first-writer-only.
+#if !defined(MELEE_SOURCE_PORT) || defined(MELEE_NO_SLIPPI)
   yougame::net_test::install(agent_test.net);
+#endif
+#else
+  yougame::net_test::install(agent_test.net);
+#endif
+  yougame::ranked_cpu::enabled = agent_test.ranked_cpu;
   for (const auto& [name, value] : agent_test.environment) _putenv_s(name.c_str(), value.c_str());
 #endif
   user_gecko::set_sources_allowed(yougame::mode_policy::mod_sources(yougame::active()).folders);
@@ -1686,6 +1821,9 @@ static int melee_main(int argc, char** argv) {
   // cores, Windows can move a throttled process onto the efficiency cores, and the game then runs
   // slow for as long as it stays there. The game sleeps most of each frame, so this costs no power
   // while it waits. Ignored by Windows versions without the setting.
+#ifdef _WIN32
+  DWORD timer_resolution_error = 0, timer_fallback_error = 0;
+#endif
   {
     PROCESS_POWER_THROTTLING_STATE throttling{};
     throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
@@ -1694,12 +1832,22 @@ static int melee_main(int argc, char** argv) {
     throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4 /* PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION */;
     throttling.StateMask = 0;   // execution speed never throttled, timer resolution never ignored
     if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling)) {
+#ifdef _WIN32
+      timer_resolution_error = GetLastError();
+#endif
       // Windows 10 does not know the timer bit and refuses the whole request: ask for the speed part alone.
       throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+#ifdef _WIN32
+      if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling))
+        timer_fallback_error = GetLastError();
+#else
       SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling);
+#endif
     }
   }
   host::Options& o = host::options;
+  bool match_arg = false, boot_match_arg = false;   // --match given; --boot-match (hook builds) asked VS from the menu
+  (void)match_arg; (void)boot_match_arg;
   bool ram_translator = false;
   bool headless = false, hidden = false, threaded = false, fps_requested = false;
   bool scripted = false, allow_matchmaking = false;   // automated runs stay off Slippi's servers
@@ -1707,6 +1855,14 @@ static int melee_main(int argc, char** argv) {
   std::string card_self_test_dir;
   std::string replay_arg;   // Source engine --replay
 #if defined(MELEE_SOURCE_PORT) && !defined(MELEE_NO_SLIPPI)
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  bool squad_test_invalid_lineup = false;
+  bool squad_test_net_delay = false;
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  yougame::net_test::Config squad_net_config;
+#endif
+#endif
   bool online_test_arg = false;   // --online-test was given: a Slippi test match, never with --p2p-*
 #endif
   std::string cosmetic_import, cosmetic_scan_disc, cosmetic_select, cosmetic_deselect;
@@ -1753,7 +1909,34 @@ static int melee_main(int argc, char** argv) {
   // melee_port.log let it rotate the game's log away at its start, so a player's log held only the
   // panel's three lines and every desync line of the match was lost.
   if (settings_window_only && host::options.log_file.empty()) host::options.log_file = "melee_settings.log";
+#ifdef _WIN32
+  // Log only after the early --log-file parse, so the report uses the game's chosen run log.
+  host::log("timing: timeBeginPeriod(1) %s", timer_resolution.raised ? "ok" : "failed");
+  const bool timer_unsupported = timer_resolution_error == ERROR_INVALID_PARAMETER ||
+      timer_resolution_error == ERROR_NOT_SUPPORTED || timer_resolution_error == ERROR_CALL_NOT_IMPLEMENTED ||
+      timer_resolution_error == ERROR_INVALID_FUNCTION;
+  if (timer_resolution_error)
+    host::log("timing: timer resolution never ignored %s (%lu); execution-speed fallback %s (%lu)",
+              timer_unsupported ? "unsupported" : "denied", (unsigned long)timer_resolution_error,
+              timer_fallback_error ? "failed" : "ok", (unsigned long)timer_fallback_error);
+  else host::log("timing: timer resolution never ignored ok (0)");
+  HANDLE diagnostic_token = nullptr;
+  DWORD is_appcontainer = 0, token_bytes = 0;
+  if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &diagnostic_token)) {
+    const BOOL readable = GetTokenInformation(diagnostic_token, TokenIsAppContainer,
+        &is_appcontainer, sizeof is_appcontainer, &token_bytes);
+    const DWORD token_error = readable ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(diagnostic_token);
+    if (readable) host::log("timing: sandbox appcontainer %s", is_appcontainer ? "yes" : "no");
+    else host::log("timing: sandbox appcontainer unknown (%lu)", (unsigned long)token_error);
+  } else host::log("timing: sandbox appcontainer unknown (%lu)", (unsigned long)GetLastError());
+#endif
   yougame::relay_pads::logging_ready();
+  // Started on its own: look for a running YouGame app on a background thread (yougame_channel.h). The
+  // settings window's standby process never does: only the game holds a connection.
+  if (!settings_window_only) yougame::start_channel(automated);
+  // YouGame's start hook, before the game window exists (its window must never sit behind ours).
+  if (!settings_window_only) yougame::start_hook_at_boot(automated);
   gfx.pc_settings = !automated;
   // In YouGame's player box the app reports a stop from the exit code; a dialog there only kept the
   // process alive behind the frozen picture (yougame_mode_policy.h). The report files are still written.
@@ -1796,6 +1979,9 @@ static int melee_main(int argc, char** argv) {
   // same option paths as flags, after saved settings and before CLI.
   if (!agent_test.log.empty()) host::log("[yougame] %s", agent_test.log.c_str());
   if (!agent_test.unsupported_online.empty()) host::log("[yougame] %s", agent_test.unsupported_online.c_str());
+  yougame::box_present::agent_compositor.store(agent_test.box_present_compositor);
+  if (agent_test.rumble_test) yougame::relay_pads::arm_rumble_test(
+      std::chrono::duration<double, std::milli>(agent_process_start.time_since_epoch()).count());
   yougame::agent_test::agent_script = agent_test.agent_script;
 #ifndef MELEE_SOURCE_PORT
   yougame::agent_test::static_match = yougame::agent_test::StaticMatch(
@@ -1826,6 +2012,17 @@ static int melee_main(int argc, char** argv) {
     if (host::gameplay::vanilla_only() && host::gameplay::conflicts_with_vanilla(a)) {
       std::fprintf(stderr, "--vanilla-only cannot be combined with %s; launch the mod listing without --vanilla-only\n", a.c_str());
       return 2;
+    }
+    if (a == "--resume") {
+      const char* value = i + 1 < argc && argv[i + 1][0] != '-' ? argv[++i] : "";
+      if (yougame::update::resume(value) == yougame::update::Resume::Online) {
+#ifdef MELEE_SOURCE_PORT
+        source_port::set_resume_online();
+#else
+        host::log("resume: online ignored (Online boot menu unavailable)");
+#endif
+      } else host::log("resume: unknown value ignored"); // one bounded line, no untrusted argv text
+      continue;
     }
     if (a == "--vanilla-only") continue;   // resolved before settings were loaded
     if (a == "--no-mod-autodetect") {
@@ -1936,7 +2133,7 @@ static int melee_main(int argc, char** argv) {
     // The launcher restarted this game in the release YouGame is on: open that YouGame mode at once.
     else if (a == "--online-mode") { const std::string m = next(); yougame::set_online_mode_arg(m == "direct" ? 2 : m == "ranked" ? 1 : 0); }
     else if (a == "--dump") gfx.dump_path = next();
-    else if (a == "--shader-cache") gfx.shader_cache = next();
+    else if (a == "--shader-cache") { gfx.shader_cache = next(); gfx.shader_cache_shared = true; }
     else if (a == "--trace-func") { const char* spec = next(); uint32_t addr = (uint32_t)std::strtoul(spec, nullptr, 16); uint32_t limit = 40;
       if (const char* colon = std::strchr(spec, ':')) limit = (uint32_t)std::strtoul(colon + 1, nullptr, 10);
       if (!addr) { std::string name(spec, std::strchr(spec, ':') ? std::strchr(spec, ':') - spec : std::strlen(spec));
@@ -2110,7 +2307,16 @@ static int melee_main(int argc, char** argv) {
       for (const auto& d : host::audio_list_devices()) std::printf("%s\t%s\n", d.id.c_str(), d.name.c_str());
       return 0;
     }
-    else if (a == "--match") { if (!source_port::set_match(next())) {
+    // Test-only: --boot-match starts the --match VS match from the main menu, as agent-test.json's
+    // bootMatch does inside an app session, so a bare scripted run needs no menu input.
+    else if (a == "--boot-match") {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+      boot_match_arg = true;
+#else
+      std::fprintf(stderr, "--boot-match is test-only: it needs a YOUGAME_AGENT_TEST_HOOK build\n"); return 2;
+#endif
+    }
+    else if (a == "--match") { match_arg = true; if (!source_port::set_match(next())) {
       std::fprintf(stderr, "--match <stage>:<p1>[:<p2>...], each player <kind>[/c<level>][/x<costume>]\n"); return 2; } }
     else if (a == "--card-self-test") card_self_test_dir = next();
     else if (a == "--mod-dir") source_port::set_mod_directory(next());
@@ -2126,8 +2332,29 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--slippi-menus") { const std::string v = next();
       if (v != "on" && v != "off") { std::fprintf(stderr, "--slippi-menus on|off\n"); return 2; }
       source_port::set_slippi_menus(v == "on"); }
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    else if (a == "--squad-test-invalid-lineup") squad_test_invalid_lineup = true;
+    else if (a == "--squad-test-net-delay") {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+      squad_test_net_delay = true;
+      if (!yougame::net_test::parse_squad_delay(next(), &squad_net_config)) {
+        std::fprintf(stderr, "--squad-test-net-delay <ms>[:<jitter_ms>]: delay 1..250, jitter 0..100; requires --online-test squad and --local-peer\n");
+        return 2;
+      }
+#else
+      std::fprintf(stderr, "--squad-test-net-delay <ms>[:<jitter_ms>] requires MU_SQUAD + YOUGAME_AGENT_TEST_HOOK, --online-test squad and --local-peer\n");
+      return 2;
+#endif
+    }
+#endif
     else if (a == "--online-test") { online_test_arg = true; if (!source_port::set_online_test(next())) {
-      std::fprintf(stderr, "--online-test direct|unranked|ranked|teams[:<character>[:<color>]] (with --local-peer; ranked needs YouGame mode)\n"); return 2; } }
+      std::fprintf(stderr, "--online-test direct|unranked|ranked|teams[:<character>[:<color>]]"
+#if MU_SQUAD
+        // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+        "|squad:<ck>/<color>[,...]"
+#endif
+        " (with --local-peer; ranked needs YouGame mode)\n"); return 2; } }
 #endif
 #endif
     else if (a == "--settings-window") {}
@@ -2153,6 +2380,27 @@ static int melee_main(int argc, char** argv) {
       return 2;
     }
   }
+#endif
+#if MU_SQUAD
+#ifdef MELEE_SOURCE_PORT
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  if (!source_port::check_squad_test(slippi::Matchmaking::local_peer.enabled, squad_test_invalid_lineup, squad_test_net_delay)) {
+    std::fprintf(stderr, "--online-test squad:<ck>/<color>[,...] requires --local-peer; --squad-test-invalid-lineup and --squad-test-net-delay require squad mode\n");
+    return 2;
+  }
+#endif
+#endif
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#ifdef YOUGAME_AGENT_TEST_HOOK
+#ifdef MELEE_SOURCE_PORT
+  if (squad_test_net_delay) {
+    squad_net_config.squad_cancel_test = squad_test_invalid_lineup;
+    yougame::net_test::install(squad_net_config);
+  } else
+    yougame::net_test::install(agent_test.net);
+#endif
+#endif
 #endif
   if ((hidden || headless || scripted) && !allow_matchmaking) slippi::Matchmaking::server_allowed = false;
   if (slippi::Matchmaking::local_peer.test_stage >= 0) {
@@ -2184,6 +2432,8 @@ static int melee_main(int argc, char** argv) {
   // Cosmetic catalog/profile storage follows --settings-path just like controller and video
   // settings. Configure it for normal, standalone-settings, and automated diagnostic launches.
   host::cosmetics::configure(gfx.settings_path);
+  // In the YouGame app nothing is downloaded or run beside a verified build: only the patch tool it ships.
+  host::cosmetics::set_tool_recovery(!yougame::active());
   // Tests: MELEE_BUILD_LOOKS=<patch folder> builds the exact looks' packs from --iso and exits (0 ready, 1 not).
   if (const char* looks = std::getenv("MELEE_BUILD_LOOKS"); looks && *looks) {
     std::string message;
@@ -2310,8 +2560,110 @@ static int melee_main(int argc, char** argv) {
 #ifdef MELEE_SOURCE_PORT
   if (!card_self_test_dir.empty()) return source_port::card_self_test(card_self_test_dir.c_str()) ? 0 : 1;
 #endif
+#if defined(MELEE_SOURCE_PORT) && defined(YOUGAME_AGENT_TEST_HOOK)
+  if (boot_match_arg) {
+    if (!match_arg) { std::fprintf(stderr, "--boot-match needs --match <stage>:<p1>[:<p2>...]\n"); return 2; }
+    if (yougame::active()) { std::fprintf(stderr, "--boot-match is for bare runs; in a YouGame session use agent-test.json bootMatch\n"); return 2; }
+    yougame::agent_test::boot_match.store(true, std::memory_order_release);
+    host::log("agent-test: --boot-match: VS from the main menu");
+  }
+#endif
   if (o.iso.empty()) { usage(); return 2; }
   if (!host::disc_open(o.iso)) { std::fprintf(stderr, "cannot open ISO %s\n", o.iso.c_str()); return 1; }
+  // The window, and with it the YouGame app's caps line (a toplevel window's caps carry its handle),
+  // before the slow startup work: Sys generation, the retail-disc check, the card and the disc prefetch.
+  // On a PC with 0.6 GB free they took about 90 s (11-15, pc4), past the 30 s the app gives a first run
+  // to send caps, and the app then kept the game in child mode with a frozen picture. The window stays
+  // black (its class brush) until the first frame. Only the render thread's window (every normal
+  // launch) moves: that thread answers the window's messages while this one works. Without it this
+  // thread owns the window and pumps it only once the game runs, so that window is still made below,
+  // just before the game. Window and renderer only: nothing here reads or writes game state.
+  {
+    const char* version = MELEE_PORT_VERSION;
+    std::wstring base = L"Melee Unlocked ";
+    for (const char* c = version; *c; ++c) base += (wchar_t)(unsigned char)*c;
+#ifdef MELEE_SOURCE_PORT
+    base += L"  |  Source Port";
+#else
+    base += L"  |  Static Recomp";
+#endif
+    // Players see just the name; the version, engine and rates stay behind the Performance overlay.
+    host::window_title_debug() = base;
+  }
+#ifdef _WIN32
+  // Embedded in YouGame (child or toplevel): the app owns placement and size; never change display
+  // modes under its window. A saved exclusive choice from a standalone run is ignored here.
+  if (yougame::embedded()) gfx.exclusive_fullscreen = false;
+#endif
+  std::unique_ptr<gx::Backend> backend;
+  bool window_made = false;
+  auto make_window = [&] {
+    window_made = true;
+    // Vulkan chosen but not usable here: choose the fallback before creating the SDL window. For both paths
+    // (upstream v0.9.86): the threaded renderer (every normal launch) makes its window too, and without this a
+    // Linux Vulkan choice got an OpenGL window whose Vulkan surface could not be created, so the game stopped.
+    if (!headless) {
+      prepare_render_backend(gfx);
+    }
+    if (!headless && threaded) {
+      backend = gx::create_threaded_backend(gfx, !hidden);
+    } else if (!headless) {
+#ifdef __APPLE__
+      // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
+      // can't embed there, so it starts in full screen on its own, as before.
+      const bool box_without_parent = yougame::embedded() && !std::getenv("YOUGAME_EMBED_PARENT");
+      const bool defer_fullscreen = (gfx.fullscreen || box_without_parent) && !hidden;
+      if (defer_fullscreen) host::window_prefer_simple_fullscreen();
+      void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden && !defer_fullscreen);
+      if (defer_fullscreen) host::window_defer_fullscreen_show();
+#else
+      void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden
+#ifdef _WIN32
+          , true
+#endif
+      );
+      if (gfx.fullscreen && !gfx.exclusive_fullscreen) host::window_set_fullscreen(true);
+#endif
+      int client_w = gfx.window_w, client_h = gfx.window_h;
+#ifdef _WIN32
+      if (yougame::embed_toplevel()) host::window_client_size(&client_w, &client_h);
+#endif
+      // As on the render thread (threaded_backend.cpp): the window keeps answering while the renderer starts.
+      host::window_responsive([&] { backend.reset(gx::create_render_backend(hwnd, client_w, client_h, gfx)); });
+      host::window_set_resize_callback([renderer = backend.get()](int w, int h) { gx::render_resize(renderer, w, h); });
+      host::g_has_window = true;
+    }
+    if (backend) host::log("startup: window and renderer ready%s", host::startup_mark().c_str());
+  };
+#ifdef _WIN32
+  if (threaded && !headless) make_window();
+#endif
+#ifndef MELEE_NO_SLIPPI
+  // A bare run without --sys-dir gets the compiled default, a source-tree path relative to the working
+  // folder. A packaged build carries its Sys beside the exe (the app and the launcher always pass it),
+  // so use that when the default is not there instead of failing Sys generation at boot.
+  if (o.sys_dir == "port/slippi_sys" && !std::filesystem::exists(std::filesystem::u8path(o.sys_dir))) {
+    wchar_t self[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, self, MAX_PATH)) {
+      const auto beside = std::filesystem::path(self).parent_path() / L"Sys";
+      if (std::filesystem::is_directory(beside)) {
+        o.sys_dir = beside.u8string();
+        host::log("sys: no --sys-dir given; using %s beside the exe", o.sys_dir.c_str());
+      }
+    }
+  }
+#endif
+#if defined(_WIN32) && defined(MELEE_SOURCE_PORT)
+  // Started with some arguments but no --user-dir (say, --iso alone): generate the two managed Sys
+  // files into the same AppData folder a double-click uses, instead of failing the whole start.
+  if (sysgen_user_dir.empty() && sysgen_data_dir.empty()) {
+    const auto fallback = standalone_launch::data_dir();
+    if (!fallback.empty()) {
+      sysgen_data_dir = (fallback / L"User").u8string();
+      host::log("sys: no --user-dir given; generating into %s", sysgen_data_dir.c_str());
+    }
+  }
+#endif
   host::prepare_sys_assets(sysgen_user_dir, sysgen_data_dir);
 #ifdef MELEE_SOURCE_PORT
   // The profile picked in the settings panel, unless the command line gave its own mod layers. A
@@ -2373,18 +2725,23 @@ static int melee_main(int argc, char** argv) {
     source_port::mods::ScanOptions check;
     std::string verification;
     const auto disc = source_port::mods::identify_vanilla(std::filesystem::u8path(o.iso), check, &verification);
-    if (!verification.empty()) host::log("gameplay: %s", verification.c_str());
+    if (!verification.empty()) host::log("gameplay: %s%s", verification.c_str(), host::startup_mark().c_str());
     if (disc.kind != source_port::mods::Kind::Vanilla) {
       host::log("--vanilla-only requires an unmodified Melee NTSC 1.02 ISO. %s", disc.message.c_str());
       std::fprintf(stderr, "--vanilla-only requires an unmodified Melee NTSC 1.02 ISO. %s\n", disc.message.c_str());
       host::log_flush();
-      return 2;
+      // Tell the player and leave without a crash report: by now background work has started, and
+      // returning from main ended in abort ("the game stopped itself") in place of this message.
+      if (!automated)
+        MessageBoxA(nullptr, ("This disc image cannot be used for the standard game. " + disc.message).c_str(),
+                    "Melee Unlocked", MB_ICONINFORMATION | MB_OK);
+      ExitProcess(2);
     }
     // A card can itself carry executable mods (20XX TE). Keep this listing's saves separate,
     // without moving, copying or clearing any of the player's ordinary or modded card files.
     o.card_dir = (std::filesystem::u8path(o.card_dir) / "VanillaOnly").u8string();
     explicit_card_dir = true;
-    host::log("gameplay: verified retail disc; vanilla-only memory card %s", o.card_dir.c_str());
+    host::log("gameplay: verified retail disc; vanilla-only memory card %s%s", o.card_dir.c_str(), host::startup_mark().c_str());
   }
   remember_iso(o.iso);   // so the launcher can offer this disc without being told again
   // Controllers do not count as activity to Windows, so a session played only on a pad let the
@@ -2392,17 +2749,6 @@ static int melee_main(int argc, char** argv) {
   // Held by this thread for as long as the game runs; Windows drops it when the process exits.
   if (!hidden) SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
 
-  {
-    const char* version = MELEE_PORT_VERSION;
-    std::wstring base = L"Melee Unlocked ";
-    for (const char* c = version; *c; ++c) base += (wchar_t)(unsigned char)*c;
-#ifdef MELEE_SOURCE_PORT
-    base += L"  |  Source Port";
-#else
-    base += L"  |  Static Recomp";
-#endif
-    host::window_title_base() = base;
-  }
 #ifdef __APPLE__
   // Embedded launch belongs to YouGame, including when --fullscreen is also supplied.
   // Decide before hiding a regular fullscreen launch; the panel still needs permission to show.
@@ -2414,50 +2760,8 @@ static int melee_main(int argc, char** argv) {
     gx::RenderOptions::live_slippi_spectator() = false;
   }
 #endif
-  std::unique_ptr<gx::Backend> backend;
-  // Vulkan chosen but not usable here (no 1.3 GPU, or a driver that cannot map memory): start on the
-  // default renderer, which on Linux must be decided before the window is made. For both paths: the
-  // threaded renderer (every normal launch) makes its window too, and without this a Linux Vulkan
-  // choice got an OpenGL window whose Vulkan surface could not be created, so the game stopped.
-  if (!headless) {
-    if (gfx.api == gx::RenderApi::Vulkan && !gx::vulkan_available()) {
-      host::log("vulkan: not usable on this system; starting on the default renderer");
-      gfx.api = gx::RenderApi::D3D12;
-    }
-    // A Linux driver fault cannot be caught by the renderer. Recover on the next launch instead of
-    // making the player repeat the same crash. Windows first retries with a cleared shader cache.
-#ifdef __linux__
-    constexpr int vulkan_failure_limit = 1;
-#else
-    constexpr int vulkan_failure_limit = 2;
-#endif
-    gx::vulkan_set_shader_cache(gfx.shader_cache);   // the start marker lives in the cache folder
-    if (gfx.api == gx::RenderApi::Vulkan && gx::vulkan_failed_starts() >= vulkan_failure_limit) {
-      host::log("vulkan: the last %d starts did not finish; starting on the default renderer (pick Vulkan in the settings to try it again)",
-                gx::vulkan_failed_starts());
-      gfx.api = gx::RenderApi::D3D12;
-    }
-    host::window_prefer_vulkan(gfx.api == gx::RenderApi::Vulkan);
-  }
-  if (!headless && threaded) {
-    backend = gx::create_threaded_backend(gfx, !hidden);
-  } else if (!headless) {
-#ifdef __APPLE__
-    // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
-    // can't embed there, so it starts in full screen on its own, as before (native-experience-lead #15888).
-    const bool box_without_parent = yougame::embedded() && !std::getenv("YOUGAME_EMBED_PARENT");
-    const bool defer_fullscreen = (gfx.fullscreen || box_without_parent) && !hidden;
-    if (defer_fullscreen) host::window_prefer_simple_fullscreen();
-    void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden && !defer_fullscreen);
-    if (defer_fullscreen) host::window_defer_fullscreen_show();
-#else
-    void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden);
-    if (gfx.fullscreen && !gfx.exclusive_fullscreen) host::window_set_fullscreen(true);
-#endif
-    backend.reset(gx::create_render_backend(hwnd, gfx.window_w, gfx.window_h, gfx));
-    host::window_set_resize_callback([renderer = backend.get()](int w, int h) { gx::render_resize(renderer, w, h); });
-    host::g_has_window = true;
-  }
+  // Made here unless it was made right after the disc opened (above).
+  if (!window_made) make_window();
   // Texture packs: scan before the game starts so the settings list is right, and decode up front
   // when the player asked for that, with the wait shown in the title bar rather than as a silent
   // half minute. Decoding runs on its own thread, so the game keeps booting while it works.
@@ -2489,13 +2793,17 @@ static int melee_main(int argc, char** argv) {
   arm_test_crash(automated);   // no-op unless MELEE_TEST_CRASH is set on a hidden run
   // The settings that decide how a match feels, in one line, so a report on stutter or lag says them.
   {
+    const char* saved_backend = gfx.api == gx::RenderApi::D3D11 ? "D3D11" : gfx.api == gx::RenderApi::Vulkan ? "Vulkan" : "D3D12";
+    const auto backend_label = app::settings_backend_label(saved_backend,
+        backend ? gx::started_render_backend() : "none (headless)");
     static const char* const subframes[] = {"off", "extrapolate", "interpolate", "authored", "authored + interpolate"};
-    host::log("settings: %s, frame cap %s, sub-frame %s, internal resolution %s, upscaler %d, vsync %s, %s",
-              gfx.api == gx::RenderApi::D3D11 ? "D3D11" : gfx.api == gx::RenderApi::Vulkan ? "Vulkan" : "D3D12",
+    host::log("settings: %s, frame cap %s, sub-frame %s, internal resolution %s, upscaler %d, vsync %s, %s%s",
+              backend_label.c_str(),
               gfx.fps_cap < 0 ? "monitor" : gfx.fps_cap == 0 ? "off" : std::to_string((int)gfx.fps_cap).c_str(),
               subframes[std::min<size_t>((size_t)gfx.subframe, 4)],
               gfx.efb_scale ? ("x" + std::to_string(gfx.efb_scale)).c_str() : "auto", gfx.dlss_mode,
-              gfx.vsync ? "on" : "off", gfx.exclusive_fullscreen ? "exclusive fullscreen" : "windowed or borderless");
+              gfx.vsync ? "on" : "off", gfx.exclusive_fullscreen ? "exclusive fullscreen" : "windowed or borderless",
+              host::startup_mark().c_str());
     // The picture's colour and filtering settings, so a report about colours (11-17: menu outlines
     // looking white instead of gold) says what was set.
     host::log("settings: picture brightness %.2f, contrast %.2f, vibrance %.2f, sharpening %d%%, MSAA %d, SSAA %d, "
@@ -2540,6 +2848,15 @@ static int melee_main(int argc, char** argv) {
   static std::unique_ptr<gx::Backend>* backend_at_exit = &backend;
   auto shutdown = [](int) {
     host::set_process_ending();
+    // The shader and pipeline caches are written while the renderer still runs (the app ends a game
+    // that has not exited 5 s after it asked, and a Friends join relaunches the game), but asked for
+    // first and waited for last: a slow first save never holds back the Friends Leave below.
+    const auto caches_due = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
+    const auto caches = ::gx::cache_store::request_flush_all("exit");
+    // Join the console link service before tearing down the host/bridge.
+    yougame::console::console_engine().end("window closed");
+    yougame::console::wait_friends_retired(2000);   // a Leave just before quitting still leaves the room
+    ::gx::cache_store::wait_flush_all(caches, caches_due);   // what is left of the 3 s
     host::report_sim_work();
     g_profiler.report();   // no-op without --profile
     backend_at_exit->reset();
@@ -2563,6 +2880,20 @@ static int melee_main(int argc, char** argv) {
   // this returns at once and the run is what it was.
   source_p2p::start(hidden || headless || scripted);
   if (g_profile) g_profiler.start();   // the native game runs on this thread; shutdown() reports
+  if (yougame::active()) {
+    // Hello launches and pending manual relaunches enter before loading/running the game DLL.
+    if (yougame::console::requests.pending()) yougame::console_boot_ready();
+    yougame::console::responsive_wait([] { return yougame::wait_identity(10000); }, [] { host::window_pump(); });
+    yougame::console::take_pending_launch();
+    yougame::console::boot(yougame::console::take_request(),
+        [](const auto& q, auto& c, auto& e) { return yougame::console::start_session(q, c, e); },
+        [](auto link, const auto& c) { return yougame::console::console_begin(std::move(link), c); },
+        [] { yougame::console_boot_ready(); }, [] { host::window_pump(); },
+        [](const char* text) { screen_label::show(text, 12.0); },
+        [](const std::string& text) { host::log("%s", text.c_str()); });
+  }
+  if (host::exit_requested()) { shutdown(0); host::end_process(0); }
+  host::log("startup: starting the game%s", host::startup_mark().c_str());
   const int source_code = source_port::run(shutdown);
   shutdown(source_code);
   host::end_process(source_code);   // everything is saved: do not run the libraries' unload code
@@ -2672,7 +3003,7 @@ static int melee_main(int argc, char** argv) {
       companions.push_back({item.kind, item.target_path, item.path});
     gx::texpack::set_cosmetic_companions(std::move(companions));
   }
-  host::log("boot: entering __start at %08X", 0x8000522Cu);
+  host::log("boot: entering __start at %08X%s", 0x8000522Cu, host::startup_mark().c_str());
   int code = 0;
   if (g_profile) g_profiler.start();
   try {
@@ -2686,6 +3017,7 @@ static int melee_main(int argc, char** argv) {
     if (throw_at_exit && std::strcmp(throw_at_exit, "before") == 0) test_throw();
     host::set_process_ending();   // tearing the renderer down can make a driver thread throw
     if (throw_at_exit && std::strcmp(throw_at_exit, "before") != 0) test_throw();
+    ::gx::cache_store::flush_all("exit", std::chrono::milliseconds(3000));   // caches before the teardown (see the source path)
     backend.reset();
     code = stop.code;
   } catch (const LoadContextUnwind&) {

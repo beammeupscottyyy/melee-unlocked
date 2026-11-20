@@ -1143,6 +1143,13 @@ int main(int argc, char** argv) {
   check(host::cosmetics::set_random_stage_skins(false,&error), "disable random stage skins");
   pick=host::cosmetics::plan_stage_skin(stage_fst.data(),(uint32_t)stage_fst.size(),"GrNBa.dat",102);
   check(pick.ok && host::cosmetics::applied_asset(stage_start)==stage_id, "disabling random restores saved fixed stage");
+  // A lockstep (Friends) session serves the game's own stage over a saved pick, and the pick comes back after.
+  host::cosmetics::set_lockstep_probe([] { return true; });
+  pick=host::cosmetics::plan_stage_skin(stage_fst.data(),(uint32_t)stage_fst.size(),"GrNBa.dat",103);
+  check(pick.ok && host::cosmetics::applied_asset(stage_start).empty(), "a lockstep session serves the standard stage over the saved one");
+  host::cosmetics::set_lockstep_probe(nullptr);
+  pick=host::cosmetics::plan_stage_skin(stage_fst.data(),(uint32_t)stage_fst.size(),"GrNBa.dat",104);
+  check(pick.ok && host::cosmetics::applied_asset(stage_start)==stage_id, "after the lockstep session the saved stage is back");
   g_disc_bytes.clear();
   g_disc_bytes = visual_dat();
   g_disc_target = "EfFxData.dat";
@@ -1884,6 +1891,12 @@ int main(int argc, char** argv) {
     held = 0x20 | 0x40;
     pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 23);
     check(pick.ok && host::cosmetics::applied_asset(retail_at) == neon_id, "L comes before R when both are held, as on the disc");
+    host::cosmetics::set_lockstep_probe([] { return true; });
+    held = 0x20;
+    pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 30);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at).empty(),
+          "in a lockstep session no alternate is picked, by button or at random: both games load the standard stage");
+    host::cosmetics::set_lockstep_probe(nullptr);
     held = 0;
     pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 24);
     const std::string any = host::cosmetics::applied_asset(retail_at);

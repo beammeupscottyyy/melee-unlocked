@@ -1,33 +1,95 @@
 // Host-only YouGame presentation and overlay protocol; no platform or game state.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <cstdint>
+#include <string>
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include <chrono>
 #include <limits>
 #endif
 
 namespace yougame::parity {
-inline constexpr const char* kMenuHint = "Escape / YouGame menu (D-pad + Start)";
+inline constexpr const char* kSettingsHint = "F1: game settings";
+inline constexpr const char* kMenuHint = "Shift+Tab / YouGame menu (D-pad + Start)";
+// 11-01: YouGame hints over the game fade out within 5 s of the game starting, and a friend's
+// new message or invite brings them back for another 5 s. `notice` is the toast text on screen now
+// (empty when none); a different non-empty text is a new notice. UI thread only.
+class CornerHintFade {
+ public:
+  static constexpr double kShown = 4.5, kFade = 0.5;
+  float alpha(const std::string& notice, double now) {
+    if (start_ < 0 || (!notice.empty() && notice != notice_)) start_ = now;
+    notice_ = notice;
+    const double t = now - start_;
+    return t < kShown ? 1.0f : float(std::clamp((kShown + kFade - t) / kFade, 0.0, 1.0));
+  }
+ private:
+  double start_ = -1;
+  std::string notice_;
+};
 #if defined(_WIN32) || defined(__linux__)
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"view\",\"volume\"]}";
+inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"match\",\"fullscreen\"]}";
 #else
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\"]}";
+inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"match\",\"fullscreen\"]}";
 #endif
+inline constexpr const char* kToplevelCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"toplevel\",\"match\",\"fullscreen\"]}";
+inline constexpr const char* caps(bool toplevel) { return toplevel ? kToplevelCaps : kCaps; }
 inline constexpr const char* kReady = "yg {\"ready\":true}";
+inline constexpr const char* kMatchOn = "yg {\"match\":1}";
+inline constexpr const char* kMatchOff = "yg {\"match\":0}";
 inline constexpr const char* kDown = "yg {\"overlay\":\"down\"}";
 inline constexpr const char* kUp = "yg {\"overlay\":\"up\"}";
 inline constexpr const char* kCancel = "yg {\"overlay\":\"cancel\"}";
+
+// Embedded Escape is handled before ImGui on every host. Return only the key state
+// needed to cancel a rebind; neither bindings nor ImGui NavCancel get a second action.
+// Shift+Escape belongs to the app even during capture; plain Escape only cancels capture.
+template <class Relay, class Back>
+bool embedded_escape(bool down, bool shift, bool repeat, bool capturing, Relay relay, Back back) {
+  if (!down || repeat) return false;
+  if (shift) relay("shift-escape");
+  else if (capturing) return true;
+  else { relay("escape"); back(); }
+  return false;
+}
+
+// Esc while the game's YouGame box shows (signin_overlay.cpp), before every other Esc owner. `take`
+// presses the box's Back and says whether it did (yougame::sign_in_escape); a taken press keeps its
+// repeats and its release too, so neither the game, the Esc menu nor ImGui sees that Esc. Window thread only.
+class BoxEscape {
+ public:
+  template <class Take>
+  bool key(bool down, bool repeat, Take take) {
+    if (down && !repeat) held_ = take();
+    else if (!down && held_) { held_ = false; return true; }
+    return held_;
+  }
+ private:
+  bool held_ = false;
+};
 
 class Signals {
  public:
   using Writer = void (*)(const char*);
   // Startup only. Publish the writer after caps, so ready can never overtake caps.
-  void start(bool stdio, Writer writer) {
+  void start(bool stdio, Writer writer, bool toplevel = false) {
     if (!stdio || !writer) return;
-    std::call_once(caps_, [&] { writer(kCaps); writer_.store(writer); });
+    std::call_once(caps_, [&] { writer(caps(toplevel)); writer_.store(writer); });
+  }
+  // The match state (cap "match"): sent once right after caps, even when 0, then on every change.
+  // `in` is 1 or 0 from the scene, -1 to resend nothing new. Returns the state written, or -1 when
+  // nothing was (no app, or the app already has it); the caller logs it.
+  int sync_match(int in) {
+    std::lock_guard<std::mutex> lock(match_mutex_);
+    if (in >= 0) match_ = in != 0;
+    auto writer = writer_.load();
+    if (!writer || match_sent_ == int(match_)) return -1;
+    writer(match_ ? kMatchOn : kMatchOff);
+    match_sent_ = match_;
+    return match_sent_;
   }
   void emit(const char* line) const {
     if (line) if (auto writer = writer_.load()) writer(line);
@@ -41,6 +103,11 @@ class Signals {
     return true;
   }
 #endif
+  // A console boot waits for room/link setup before simulation can present a frame.
+  // Keep this explicit: ordinary launches still become ready on their first present.
+  void console_boot_ready() {
+    if (auto writer = writer_.load()) if (!ready_.exchange(true)) writer(kReady);
+  }
   // Called after a successful swap of a visible game frame, never a loading panel.
   void presented(bool eligible
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -61,6 +128,9 @@ class Signals {
   std::atomic<Clock::duration::rep> first_present_{kNotPresented};
 #endif
   std::once_flag caps_;
+  std::mutex match_mutex_;
+  bool match_ = false;
+  int match_sent_ = -1;
   std::atomic<Writer> writer_{nullptr};
   std::atomic<bool> ready_{false};
 };
@@ -108,6 +178,15 @@ class OverlayKey {
     return was_down ? kUp : nullptr;
   }
 #endif
+  // End a real chord on its first modifier release, retaining the main-key reservation.
+  const char* modifiers_released() {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+    if (scripted_) return nullptr;
+#endif
+    const bool was_down = down_;
+    down_ = false;
+    return was_down ? kUp : nullptr;
+  }
   const char* cancel() {
 #ifdef YOUGAME_AGENT_TEST_HOOK
     scripted_ = false;
@@ -138,8 +217,14 @@ class OverlayPad {
     const bool held = connected && (buttons & start);
     const bool pressed = held && !was_start_[port];
     was_start_[port] = held;
-    if (!stdio) return nullptr;
     if (!held) claimed_[port] = false;
+    if (!stdio) {
+      // A game started on its own: the same chord asks the local channel's app (standalone_menu).
+      if (pressed && (buttons & down) && !(buttons & z) && !legacy_settings && standalone_menu && standalone_menu())
+        claimed_[port] = true;
+      if (claimed_[port]) buttons &= static_cast<uint16_t>(~start);
+      return nullptr;
+    }
     const bool chord = pressed && (buttons & down) && !(buttons & z) && !legacy_settings;
     if (chord) claimed_[port] = true;
     // Keep Start suppressed until its release, including when Down is released first.
@@ -149,6 +234,7 @@ class OverlayPad {
     release_at_ = now_ms + 100;
     return key_.tab(true, true, true, false).line;
   }
+  bool (*standalone_menu)() = nullptr;   // true when it took the press (yougame::channel_menu_key)
  private:
   OverlayKey key_;
   bool was_start_[4]{}, claimed_[4]{};

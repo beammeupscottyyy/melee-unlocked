@@ -18,6 +18,11 @@
 #include <melee/gm/types.h>
 #include <melee/mn/types.h>
 #include <mu_native.h>
+#include <mu_ranked.h>
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad.h"
+#endif
 
 extern char mnNameNew_CurrentNameText[];
 
@@ -60,7 +65,7 @@ static CSSData* online_css_data(void)
 
 int mu_online_abi_command(unsigned int command, const unsigned char* payload, unsigned int size,
                           unsigned char* response, unsigned int capacity, unsigned int* response_size);
-#define CMD_ARENA_PICK 0xEE
+#define CMD_ARENA_PICK 0xDC /* upstream 0xEE: MU_MAKER_COMMAND in this build */
 
 /* An arena room shows every player's portrait: the character and costume on this screen go to the
  * host whenever they change (Slippi's external id, 0xFF for none; the costume; picked or not), the
@@ -97,8 +102,11 @@ void mu_slippi_sss_report_pick(int chosen)
     mu_online_abi_command(CMD_ARENA_PICK, payload, sizeof payload, reply, sizeof reply, &got);
 }
 
-/* FN_TX_LOCK_IN. stage_behavior: -2 random, -1 unset (use the opponent's), 0+ that stage id. */
-void mu_slippi_sss_lock_in(int stage_behavior)
+/* FN_TX_LOCK_IN. stage_behavior: -2 random, -1 unset (use the opponent's), 0+ that stage id.
+ * Returns 1 once the selections went to the host, 0 when Squad Strike refused the lock-in (its
+ * reason is on screen): then there is nothing to search with. -1: a friend room's lock-in held
+ * until the friend's game is heard from (nonzero, so whatever follows runs as it always did). */
+int mu_slippi_sss_lock_in(int stage_behavior)
 {
     MuSlippiMenuState* s = mu_slippi_state();
     MuSlippiSelections sel;
@@ -131,11 +139,23 @@ void mu_slippi_sss_lock_in(int stage_behavior)
     }
     sel.alt_stage_mode = s->frozen_toggle;
     sel.online_mode = s->mode;
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    /* A friend room: never locked in before the friend's game said whether it plays Squad Strike. */
+    if (s->mode == MU_SLP_MODE_DIRECT && !gmSquad_OnlineFriendLockIn())
+        return gmSquad_OnlineFriendHeld() ? -1 : 0;
+    if (gmSquad_OnlineLive(s->mode)) {
+        if (!gmSquad_OnlineSelect(sel.char_id, sel.char_color)) return 0;
+        /* A friend room has no search to check the memory floors and disc identity: lock-in does. */
+        if (gmSquad_OnlineFriend() && !gmSquad_OnlineBudget()) return 0;
+    }
+#endif
     mu_slippi_set_selections(&sel);
+    return 1;
 }
 
 /* FN_TX_FIND_MATCH: 2 of every 3 bytes of the typed name, 9 slots (the ninth reads past the eighth
- * letter, as on the console). The Ranked game-prep counters it also resets are not ported. */
+ * letter, as on the console). asm HandleInputsOnCSS.asm:334-343 resets prep. */
 void mu_slippi_sss_find_match(void)
 {
     unsigned char code[18];
@@ -144,6 +164,7 @@ void mu_slippi_sss_find_match(void)
         code[i * 2] = (unsigned char) mnNameNew_CurrentNameText[i * 3];
         code[i * 2 + 1] = (unsigned char) mnNameNew_CurrentNameText[i * 3 + 1];
     }
+    mu_ranked_set_reset();
     mu_slippi_find_opponent(mu_slippi_state()->mode, code);
 }
 
@@ -152,8 +173,7 @@ void mu_slippi_sss_run_callback(int stage_behavior)
 {
     switch (mu_slippi_state()->callback) {
     case MU_SLP_CB_CODE_LOCK_IN:
-        mu_slippi_sss_lock_in(stage_behavior);
-        mu_slippi_sss_find_match();
+        if (mu_slippi_sss_lock_in(stage_behavior)) mu_slippi_sss_find_match();
         break;
     case MU_SLP_CB_SSS_LOCK_IN:
         mu_slippi_sss_lock_in(stage_behavior);

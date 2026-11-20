@@ -136,4 +136,53 @@ void fill_rect(ImDrawList* dl, float x0, float y0, float x1, float y1, uint32_t 
 }  // namespace gold
 void font_ensure();   // the game's font, loaded from the disc at first use
 
+// Play while searching: the banner while a kept search runs outside its character select, and the
+// question on the character select. Drawn over everything else of the game, never in a match of
+// that search. Every time below is in milliseconds; the look follows only these numbers (no clock of
+// its own), so a picture of one moment is always the same.
+struct SearchBanner {
+  int stage = 0;               // 0 nothing, 1 searching, 2 opponent found (counting down, then going back)
+  std::string service;         // "YouGame", "Slippi", "YouGame and Slippi"
+  std::string mode;            // "Unranked", "Ranked", "Friends", "Squad Strike"
+  uint32_t elapsed_ms = 0;     // the search's own time (the timer)
+  uint32_t shown_ms = 0;       // since the banner came in (slide in)
+  uint32_t found_ms = 0;       // since the opponent was found
+  int countdown_ms = -1;       // found: until the way back (0 going back, -1 waiting for a safe moment)
+  uint32_t clock_ms = 0;       // a running clock for what moves while searching
+  float leave = 0.0f;          // 0..1 sliding out
+  float hold = 0.0f;           // 0..1 L+R held toward going back to the search
+  int look = 0;                // 0 the slim pill (the default), 1 orange letters, 2 a ticker strip, 3 a red ribbon
+  int scene_major = -1, scene_minor = -1;   // where it is drawn: the height that keeps it clear of the screen's own parts
+};
+constexpr int kSearchBannerLooks = 4;
+const char* search_banner_name(int look);
+// The picture (game_x0..game_y1) inside the window (display_w x display_h).
+void draw_search_banner(const SearchBanner& b, float display_w, float display_h, float game_x0, float game_y0,
+                        float game_x1, float game_y1);
+
+// A notice in the banner's look (a dark plate, centred on the picture, its top at `top_frac` of the
+// picture's height): a title, an optional line under it, and buttons as hints ("U:Search|V:Keep training").
+struct Notice {
+  std::string title, detail, keys;
+  uint32_t shown_ms = 0;   // since it came up (it drops in)
+  bool alert = false;      // a red rim (a disconnect)
+};
+void draw_notice(const Notice& n, float display_w, float display_h, float game_x0, float game_y0, float game_x1,
+                 float game_y1, float top_frac);
+
+// The question on the online character select while a search runs. look 1: asked when the player
+// starts to leave (B), a small box; 2: a card in the left bar beside the select (warm up, or leave and
+// keep the place); 3: one line under the select's own search text. `answer` 0 none yet, 1 keep, 2 cancel.
+struct KeepAsk {
+  int look = 1;
+  bool asking = false;         // look 1: the box is up
+  uint32_t shown_ms = 0;
+  uint32_t clock_ms = 0;
+  float hold = 0.0f;           // L+R toward the warm-up
+  int answer = 0;
+};
+constexpr int kKeepAskLooks = 3;
+void draw_keep_ask(const KeepAsk& k, float display_w, float display_h, float game_x0, float game_y0, float game_x1,
+                   float game_y1);
+
 }  // namespace practice_menu

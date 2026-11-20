@@ -38,6 +38,7 @@ constexpr float kTrueAspectMax = 64.0f / 27.0f;
 constexpr float kTrueAspectMin = 4.0f / 3.0f;
 
 struct RenderOptions {
+  bool prewarm_only = false;   // device and startup caches only; never present or start the game
   // The decompiled Source Port shares the host UI and renderers with Legacy, but it does not run
   // the translated guest's Slippi/Gecko patch hooks. Keep that distinction explicit in the UI and
   // in presentation defaults without changing the user's saved Legacy settings.
@@ -295,8 +296,10 @@ struct RenderOptions {
   bool online_return_training = false;
   static bool& live_online_return_training() { static bool value = false; return value; }
   // After an online session: straight into a Training match, then "search again?" (native_practice.cpp).
-  bool online_back_to_training = true;
-  static bool& live_online_back_to_training() { static bool value = true; return value; }
+  // Off by default (owner 11-19: players were sent into Training after every session). Saved as
+  // online_training_after; the older key online_back_to_training (saved on by default) is not read.
+  bool online_back_to_training = false;
+  static bool& live_online_back_to_training() { static bool value = false; return value; }
   // Warm-up room (native_practice.cpp, slippi_warmup.h; Game tab, Online). warmup_button: the WARM UP
   // button on the online character select (L+R works either way). warmup_turn_instant: in an arena
   // room, the player's turn takes them back from Training at once instead of after a 3 second
@@ -308,6 +311,14 @@ struct RenderOptions {
   // dragged and sized with the mouse).
   bool warmup_button = true;
   static bool& live_warmup_button() { static bool value = true; return value; }
+  // Play while searching (native_practice.cpp, a kept search): leaving the search screen while a search
+  // runs. 0 ask on the character select (the default; nothing else changes until the player says yes),
+  // 1 keep searching without asking, 2 never (leaving stops the search, as before). Saved as keep_search.
+  int keep_search = 0;
+  static int& live_keep_search() { static int value = 0; return value; }
+  // The banner while a kept search runs: 0 a slim pill at the top (the default), 1 orange letters. Saved as search_banner.
+  int search_banner = 0;
+  static int& live_search_banner() { static int value = 0; return value; }
   // The warm-up's panel and boxes in the black bar: 0 a rounded box with space all round (the default),
   // 1 a side card: flush in the bar as the Arena corner cards (a gold wash, a gold edge on the picture's
   // side), level with the room's match window; 2 the side card at the top of the bar, the match window too.
@@ -404,13 +415,18 @@ struct RenderOptions {
   bool window_pinned = false;
   AspectMode aspect = AspectMode::Auto;   // --aspect, or "aspect" in port-settings.ini
   bool vsync = true;  // Fresh installs synchronize scanout; a saved explicit choice still wins.
+  // The player never chose V-Sync (no "vsyncchoice 1" in the file): off once the display is found to
+  // run G-Sync or FreeSync (frames are held under its refresh, so nothing tears), on otherwise.
+  bool vsync_auto = false;
+  // The display's variable refresh as the frame pacer last detected it: 1 on, 0 off, -1 not known yet.
+  static std::atomic<int>& live_variable_refresh() { static std::atomic<int> value{-1}; return value; }
   bool widescreen = false;    // Slippi Widescreen 16:9 code on (present at 16:9 and tell the game)
   // EXPERIMENTAL: widen the frustum in the renderer rather than running the Gecko code, so the HUD
   // and the 2D layer keep their authored size and nothing is written to guest memory. Mutually
   // exclusive with `widescreen`: both together would widen twice. See gx_shader.h.
   bool true_widescreen = false;
   // The aspect True widescreen widens to: 16:9, 16:10, the player's own W:H, or the window's shape.
-  // Presentation only. "truewsaspect" and "truewscustom W H" in the ini; files without them keep 16:9.
+  // Presentation only. "truewsaspect" and custom W:H in the ini; default to the window's shape.
   TrueAspect true_aspect = TrueAspect::Wide16_9;
   int true_custom_w = 21, true_custom_h = 9;
   // Custom texture packs: replace game textures with PNGs from Load/Textures/GALE01, using
@@ -472,6 +488,8 @@ struct RenderOptions {
   uint32_t capture_burst = 0;  // if set, capture this many consecutive presented frames from capture_frame
   uint64_t capture_sim_frame = 0;  // if set, the burst starts at the first presented frame whose simulation sequence >= this
   std::string shader_cache = "shadercache";   // directory for compiled shader blobs and the D3D12 pipeline library
+  bool shader_cache_shared = false;  // --shader-cache named it: another build (YouGame's copies) may use it too, so
+                                     // the other builds' shader folders are never pruned from it
   std::string dump_path;      // write a text dump of draw state + shaders at dump_frame
   uint32_t dump_frame = 0;
 };

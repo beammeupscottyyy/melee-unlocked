@@ -17,6 +17,7 @@ namespace gx { void settings_guest_options_frame(uint8_t menu, uint16_t selectio
 #include "audio.h"
 #include "native_pose_bridge.h"
 #include "replay_control.h"
+#include "yougame_parity.h"   // yg {"match":1|0} for the app, with or without Slippi
 #include "rtx_semantics.h"
 #include "../abi/mu_rtx_tokens.h"
 #ifdef MELEE_NO_SLIPPI
@@ -926,6 +927,13 @@ void bp_write(uint32_t value) {
           static uint16_t last_scene = 0xFFFF;
           const uint16_t scene = (uint16_t)(g_frame.scene_major << 8 | g_frame.scene_minor);
           if (scene != last_scene) { host::log("scene: major %02X minor %02X (frame %llu)", g_frame.scene_major, g_frame.scene_minor, (unsigned long long)g_frame.sequence); host::note_scene_memory(); last_scene = scene; }
+          static int last_match = -1;
+          const int in_match = frame_in_app_match(g_frame) ? 1 : 0;
+          if (in_match != last_match) {
+            last_match = in_match;
+            const int sent = yougame::parity::signals.sync_match(in_match);
+            if (sent >= 0) host::log("yougame: match %d", sent);
+          }
         }
         g_frame.time = host::now_seconds(); // completed snapshot availability anchors presentation
         g_frame.tick = host::tick_timing();
@@ -1381,6 +1389,37 @@ uint32_t hud_scales_packed() {
   const auto clamp_percent = [](int p) { return (uint32_t)std::clamp(p, 75, 175); };
   return clamp_percent(g_stock_hud_scale.load(std::memory_order_relaxed)) |
          clamp_percent(g_damage_hud_scale.load(std::memory_order_relaxed)) << 8;
+}
+
+bool supports_game_reset() { return !g_backend || g_backend->supports_game_reset(); }
+
+std::function<void()> capture_boot_state() {
+  // Capture the command processor, not decoded resources keyed by old host addresses.
+  const auto bp = g_bp; const auto cp = g_cp; const auto xf = g_xf;
+  const std::vector<uint8_t> tmem(g_tmem, g_tmem + sizeof g_tmem);
+  const auto frame = g_frame; const auto fifo = g_buf;
+  const auto pos = g_buf_pos, need = g_parse_need;
+  const auto mask = g_bp_mask;
+  const auto sequence = g_frame_sequence, tmem_generation = g_tmem_generation, fifo_batch = g_fifo_batch;
+  std::array<int32_t,16> colors{}, kcolors{};
+  std::memcpy(colors.data(), g_tev_colors, sizeof g_tev_colors);
+  std::memcpy(kcolors.data(), g_tev_kcolors, sizeof g_tev_kcolors);
+  return [=] {
+    if (g_backend) g_backend->reset_game_state();
+    g_bp = bp; g_cp = cp; g_xf = xf;
+    std::memcpy(g_tmem, tmem.data(), sizeof g_tmem);
+    std::memcpy(g_tev_colors, colors.data(), sizeof g_tev_colors);
+    std::memcpy(g_tev_kcolors, kcolors.data(), sizeof g_tev_kcolors);
+    g_bp_mask = mask; g_buf = fifo; g_buf_pos = pos; g_parse_need = need;
+    g_tmem_generation = tmem_generation; g_fifo_batch = fifo_batch; g_frame_sequence = sequence;
+    g_frame = frame; g_texture_snapshots.clear();
+    g_stock_roots = {}; g_damage_roots = {}; g_native_hud = {};
+    g_native_pose_scopes.clear(); g_native_pose_skinned_scopes.clear(); g_native_pose_scope_ids.clear();
+    g_native_draw_scopes.clear(); g_native_object_scopes.clear();
+    g_native_owner = 0xFF; g_native_skinned = false;
+    g_native_draw_audit.reset(false);
+    mark_discontinuity();
+  };
 }
 
 void init(Backend* backend) {

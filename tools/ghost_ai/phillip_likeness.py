@@ -197,8 +197,8 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, nargs="+", default=[1.0])
     ap.add_argument("--split", default="test")
     ap.add_argument("--data", type=Path,
-                    default=Path(os.environ.get("MELEE_GHOST_AI_HOME", "C:/Users/Chandler/NEW project/ghost-ai")))
-    ap.add_argument("--upstream", type=Path, default=Path("C:/Users/Chandler/NEW project/ghost-ai/teacher/upstream"))
+                    default=Path(os.environ.get("MELEE_GHOST_AI_HOME", "<path-to-your-ghost-ai-folder>")))
+    ap.add_argument("--upstream", type=Path, default=Path("<path-to-your-ghost-ai-folder>/teacher/upstream"))
     ap.add_argument("--out", type=Path)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()

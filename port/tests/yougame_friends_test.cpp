@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <regex>
 #include <vector>
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
@@ -21,6 +22,20 @@ int main() {
   CHECK(!ticket("mu-build", "abcd2345").count("afterMatch"));
   CHECK(picker() == json({{"type", "mpFriend"}, {"mode", "singles"}, {"players", 2}}));
   CHECK(!picker().count("username"));
+  CHECK(version_request(picker()));
+  CHECK(version_request(expected));
+  for (const auto& ordinary : {
+      json{{"type", "mpTicket"}, {"mode", "singles"}, {"players", 2}, {"ranked", false}},
+      json{{"type", "mpTicket"}, {"mode", "singles"}, {"players", 2}, {"ranked", true}},
+      json{{"type", "mpTicket"}, {"mode", "singles"}, {"players", 2}, {"direct", "ABC#1"}},
+      team_ticket("mu-build", "mutabc123"), json{{"type", "mpRank"}}})
+    CHECK(!version_request(ordinary));
+  CHECK(expire_joined(kJoined, 100, 100) == kJoined);
+  CHECK(expire_joined(kJoined, 100, 10099) == kJoined);
+  CHECK(expire_joined(kJoined, 100, 10100).empty());
+  CHECK(expire_joined(kJoined, 100, 50000).empty());
+  for (const char* status : {kWaiting, kFailed, kVersion, "offline", "playing opponent"})
+    CHECK(expire_joined(status, 100, 50000) == status);
   CHECK(kPickerTimeout == 600000);
   {
     std::string code;
@@ -43,10 +58,64 @@ int main() {
     CHECK(!direct_code_from_game("AB-C#1", &code));
   }
 #if defined(_WIN32) || defined(__linux__)
-  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"view\",\"volume\"]}");
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"match\",\"fullscreen\"]}");
 #else
-  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\"]}");
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"match\",\"fullscreen\"]}");
 #endif
+  {
+    // The match state follows caps once, even when 0, then only changes reach the app.
+    static std::vector<std::string> lines;
+    lines.clear();
+    yougame::parity::Signals signals;
+    CHECK(signals.sync_match(1) == -1);   // no app yet: remembered, not written
+    signals.start(true, [](const char* line) { lines.push_back(line); });
+    CHECK(signals.sync_match(-1) == 1);
+    CHECK(lines.size() == 2 && lines[1] == "yg {\"match\":1}");
+    CHECK(signals.sync_match(1) == -1 && signals.sync_match(-1) == -1);
+    CHECK(signals.sync_match(0) == 0 && lines.back() == "yg {\"match\":0}");
+    yougame::parity::Signals fresh;
+    fresh.start(true, [](const char* line) { lines.push_back(line); });
+    CHECK(fresh.sync_match(-1) == 0 && lines.back() == "yg {\"match\":0}");   // 0 is still sent once
+    CHECK(fresh.sync_match(0) == -1);
+  }
+
+  for (int mode : {0, 1, 2, 3, 4}) {
+    std::string code = "stale";
+    CHECK(search_code(mode, "lain#504", &code) && code == "LAIN#504");
+    CHECK(search_code(mode, "", &code) && code.empty());
+    code = "stale";
+    const bool expected = mode != 2 && mode != 3;
+    CHECK(search_code(mode, "\x83\x65", &code) == expected);
+    if (expected) CHECK(code.empty());
+    CHECK(search_code(mode, "AB-C#1", &code) == expected);
+    if (expected) CHECK(code.empty());
+  }
+
+  {
+    std::string code, room;
+    CHECK(team_room_code("LAIN#504", &room) && room == "mutlain504");
+    CHECK(search_code(3, "\x82\x6B\x82\x60\x82\x68\x82\x6D\x81\x94\x82\x54\x82\x4F\x82\x53", &code));
+    CHECK(team_room_code(code, &room) && room == "mutlain504");
+    const json expected_team = {
+      {"type", "mpTicket"}, {"players", 4}, {"mode", "teams"}, {"room", room}, {"ranked", false},
+      {"lobby", {{"version", 1}, {"minPlayers", 4}, {"maxLocalPlayers", 1}, {"compatibility", "mu-build"}}}
+    };
+    CHECK(team_ticket("mu-build", room) == expected_team);
+    for (const char* bad : {"", "AB", "ABCDEFGHIJ", "ABC-123", "ABC/123", "ABC 123", "###"})
+      CHECK(!team_room_code(bad, &room));
+    for (int length = 3; length <= 9; ++length) {
+      for (char c : std::string("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")) {
+        CHECK(team_room_code(std::string(length, c) + "#", &room));
+        CHECK(std::regex_match(room, std::regex("^[a-z0-9]{6,12}$")));
+        CHECK(team_ticket("mu-build", room).at("room") == room);
+      }
+    }
+    for (const char* bad : {"", "mutab", "mutabcdefghij", "mutABC123", "mutabc/12", "xxxabc123"}) {
+      try { team_ticket("mu-build", bad); CHECK(false); }
+      catch (const std::runtime_error& e) { CHECK(std::string(e.what()) == kTeamCodeError); }
+    }
+    CHECK(std::string(kTeamWaiting) == "Waiting for your team...");
+  }
 
   // Exercise the same picker -> ticket path used by matchmaking, with no room opened
   // by a failed picker and no ticket ever sent with an empty room.
@@ -82,8 +151,62 @@ int main() {
   CHECK(!own.push({{"type", "join"}, {"room", "Ab12"}}, 4));
   CHECK(own.take_join(false).empty());
   CHECK(own.take_join(true) == "OtherRoom"); // own push cannot displace a different invite
-  own.current_room({}); // cleanup permits joining that room again
-  CHECK(own.push({{"type", "join"}, {"room", "Ab12"}}, 5));
+  own.current_room({}); // stale old-room pushes must not displace the next invite
+  CHECK(!own.push({{"type", "join"}, {"room", "Ab12"}}, 5));
+  CHECK(own.push({{"type", "join"}, {"room", "NewRoom"}}, 6));
+  CHECK(!own.push({{"type", "join"}, {"room", "Ab12"}}, 7));
+  CHECK(own.take_join(true) == "NewRoom");
+  // A fresh invite can revive a retired room, but cannot replace another queued invite.
+  CHECK(own.push({{"type","notice"},{"kind","invite"},{"from","Friend"},{"text","Play again"},{"room","Ab12"}},8));
+  CHECK(own.push({{"type","join"},{"room","NewerRoom"}},9));
+  CHECK(!own.push({{"type","join"},{"room","Ab12"}},10));
+  CHECK(own.take_join(true) == "NewerRoom");
+  CHECK(!own.push({{"type","join"},{"room","Ab12"}},11)); // fresh acceptance was consumed
+  CHECK(own.push({{"type","notice"},{"kind","invite"},{"from","Friend"},{"text","Play again"},{"room","Ab12"}},12));
+  CHECK(own.push({{"type","join"},{"room","Ab12"}},13));
+  CHECK(own.take_join(true) == "Ab12");
+  // The invite's room size (a hint for the first try): 4, or the Friends lobby's compatibility key; none
+  // said is 0. The room decides (room_kind below).
+  CHECK(own.push({{"type","join"},{"room","Size4Room"},{"players",4}},14));
+  CHECK(own.take_join(true) == "Size4Room" && own.join_players() == 4);
+  CHECK(own.push({{"type","join"},{"room","Size0Room"}},15));
+  CHECK(own.take_join(true) == "Size0Room" && own.join_players() == 0 && !own.join_doubles());   // bare: 1v1 first
+  CHECK(own.push({{"type","join"},{"room","CompatRoom"},{"compatibility","mu:friends-lobby-1"}},16));
+  CHECK(own.take_join(true) == "CompatRoom" && own.join_players() == 4);
+  CHECK(own.push({{"type","join"},{"room","OtherCompat"},{"compatibility","mu-0.9.105"}},17));
+  CHECK(own.take_join(true) == "OtherCompat" && own.join_players() == 0);
+  CHECK(own.push({{"type","join"},{"room","Size2Room"},{"players",2},{"compatibility","friends-lobby-1"}},18));
+  CHECK(own.take_join(true) == "Size2Room" && own.join_players() == 2);   // the page's size wins
+  // The room decides lobby or 1v1: nothing heard is -1; a room the search joined the wrong way queues its
+  // join again with its kind (even a room retired or tracked as current), and its kind stays known.
+  CHECK(own.room_kind("Size0Room") == -1);
+  own.room_decided("Size0Room", true);                 // an invite with no size, into a Friends lobby room
+  CHECK(own.room_kind("Size0Room") == 1);
+  CHECK(own.take_join(true) == "Size0Room" && own.join_players() == 4);
+  own.room_decided("Size4Room", false);                // said 4, but the room is a 1v1 friend room
+  CHECK(own.take_join(true) == "Size4Room" && own.join_players() == 2 && own.room_kind("Size4Room") == 0);
+  own.room_seen("Size2Room", false);                   // seen as it was joined: recorded, nothing queued
+  CHECK(own.room_kind("Size2Room") == 0 && own.take_join(true).empty());
+  own.room_decided("", true);                          // no room: nothing
+  CHECK(own.take_join(true).empty());
+  // lobby_mismatch is also a different build's refusal: a 1v1 invite that said players:2 (or carried any
+  // compatibility key) fails with it and is never tried the other way; only an invite that said nothing is.
+  CHECK(own.push({{"type","join"},{"room","Mm2Room"},{"players",2}},19));
+  CHECK(own.take_join(true) == "Mm2Room" && !own.mismatch_reroutes("Mm2Room"));
+  CHECK(own.push({{"type","join"},{"room","MmKeyRoom"},{"compatibility","mu-0.9.105"}},20));
+  CHECK(own.take_join(true) == "MmKeyRoom" && own.join_players() == 0 && !own.mismatch_reroutes("MmKeyRoom"));
+  CHECK(own.push({{"type","join"},{"room","Mm4Room"},{"compatibility","mu:friends-lobby-1"}},21));
+  CHECK(own.take_join(true) == "Mm4Room" && !own.mismatch_reroutes("Mm4Room"));
+  CHECK(own.push({{"type","join"},{"room","MmBareRoom"}},22));
+  CHECK(own.take_join(true) == "MmBareRoom" && own.mismatch_reroutes("MmBareRoom"));
+  own.room_decided("MmBareRoom", true);                // rerouted once: known now, and the requeue is hinted
+  CHECK(own.take_join(true) == "MmBareRoom" && !own.mismatch_reroutes("MmBareRoom"));
+  CHECK(!own.mismatch_reroutes(""));
+  {
+    yougame::friends::Events many;                     // bounded: the 33rd room starts the record over
+    for (int i = 0; i < 33; ++i) many.room_seen("Room" + std::to_string(i), true);
+    CHECK(many.room_kind("Room32") == 1 && many.room_kind("Room0") == -1);
+  }
   own.current_room("Ab12"); // discard an own-room push queued just before ticket request
   CHECK(own.take_join(true).empty());
   own.hello({{"room", "Ab12"}});
@@ -124,15 +247,12 @@ int main() {
   }
 
   CHECK(kFirstCssWinner == 1);
-  CHECK(!native_ready(true, 2, "", ""));
+  CHECK(native_ready(true, 2, "", ""));
   CHECK(!native_ready(true, 2, "", "abcd2345"));
   CHECK(native_ready(false, 2, "", ""));
   CHECK(native_ready(true, 2, "NAME#123", ""));
   for (int mode : {0, 1, 3}) CHECK(native_ready(true, mode, "", ""));
-  CHECK(empty_code(true, 2, ""));
-  CHECK(!empty_code(false, 2, ""));
-  CHECK(!empty_code(true, 2, "NAME#123"));
-  for (int mode : {0, 1, 3, 4, -1}) CHECK(!empty_code(true, mode, ""));
+  CHECK(menu_safe(2, 0)); CHECK(menu_safe(2, 1));
   CHECK(menu_safe(1, 0));
   CHECK(menu_safe(8, 0));
   CHECK(menu_safe(8, 1));
@@ -226,10 +346,9 @@ int main() {
     }
   }
   Events presentation;
-  presentation.code_screen(true);
-  presentation.code_empty(true);
+  presentation.online_menu(true, true);
   CHECK(!presentation.push({{"type", "hide"}}, 1));
-  CHECK(presentation.code_screen()); // embed hide/show never changes Friends state
+  CHECK(presentation.friend_entry()); // embed hide/show never changes Friends state
   presentation.picker_error("Picker cancelled");
   CHECK(presentation.picker_error() == "Picker cancelled");
   presentation.request_host();
@@ -238,16 +357,37 @@ int main() {
   Events host;
   host.request_host();
   CHECK(!host.take_host());
-  host.code_screen(true);
-  host.code_empty(false);
+  host.online_menu(true, false);
   host.request_host();
   CHECK(!host.take_host());
-  host.code_empty(true);
+  host.online_menu(true, true);
   host.request_host();
   CHECK(host.take_host());
   CHECK(!host.take_host());
   host.request_host();
-  host.code_screen(false); // Back/cancel must not host a room later
+  host.online_menu(false); // Back/cancel must not host a room later
   CHECK(!host.take_host());
+
+  // A full room. The invite route's code wins; without one (the app may drop it) only its words decide.
+  const std::string site = "This room is full. Invite again when a seat opens.";
+  CHECK(invite_room_full("room_full", site) == site);
+  CHECK(invite_room_full("refused", site) == site && invite_room_full("", site) == site);
+  CHECK(invite_room_full("room_full", "") == kRoomFull && invite_room_full("room_full", kRequestFailed) == kRoomFull);
+  CHECK(invite_room_full("seat_mismatch", site).empty());   // another code: not a full room
+  CHECK(invite_room_full("room_full", std::string(300, 'x')).size() == 120);
+  CHECK(invite_room_full("refused", "Your friend is offline").empty() && invite_room_full("", "Cancelled").empty());
+  CHECK(room_full_line("Ada") == "Ada's room is full." && room_full_line("") == "This room is full.");
+  try { throw RoomFull(site); } catch (const std::runtime_error& e) { CHECK(e.what() == site); }
+  Events guest;
+  CHECK(guest.inviter("abcdef").empty());
+  CHECK(guest.push({{"type", "notice"}, {"kind", "invite"}, {"from", "Ada"}, {"text", "invited you"}, {"room", "abcdef"}}, 1));
+  guest.current_room("abcdef");   // accepting clears the invite, never who sent it
+  CHECK(guest.inviter("abcdef") == "Ada" && guest.inviter("zzzzzz").empty() && guest.inviter("").empty());
+  guest.room_full(room_full_line(guest.inviter("abcdef")), 1000);
+  CHECK(guest.toast(1000) == "Ada's room is full." && guest.toast(7000).empty());
+  CHECK(!guest.take_full_return(false, 2000));   // waits for the online character select
+  CHECK(guest.take_full_return(true, 3000) && !guest.take_full_return(true, 3001));   // once
+  guest.room_full(kRoomFull, 10000);
+  CHECK(!guest.take_full_return(true, 25000) && !guest.take_full_return(true, 25001));   // expired, never late
   std::puts("YouGame friends passed");
 }

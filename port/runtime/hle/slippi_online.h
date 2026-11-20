@@ -8,6 +8,11 @@
 #include <vector>
 #include <memory>
 #include "native_online_policy.h"
+#if MU_SQUAD
+#include "squad_costume_rule.h"
+#endif
+
+namespace yougame::lobby { enum class Profile; }   // yougame_lobby_wire.h: Friends4, Doubles
 
 namespace slippi { class Matchmaking; }
 
@@ -21,17 +26,22 @@ struct Config {
   int delay = 2;                 // Slippi Online input delay (frames)
   bool auto_delay = false;       // pick the delay from the measured ping each match (delay is the fallback)
   int chat = 0;                  // 0 enabled, 1 direct only, 2 disabled
+  std::string ranked_rules_path; // optional package rules; parsed once after the startup build is set
   // Up to three connect codes never to play in Unranked: a match with one is turned down and the
   // search goes on. Not in Ranked, Direct, Teams or Party.
   std::string blocked_codes[3];
-  std::string ranked_rules_path; // optional package rules; parsed once after the startup build is set
 };
 Config& config();
 
 void init();
 void load_ranked_rules();
+// The app asked for the Online menu first (--resume online after an update). Without it a game the
+// YouGame app started boots on the main menu; standalone keeps Slippi's boot to Online.
+void request_boot_online();
 std::string ranked_rules_digest(int mode); // only a verified YouGame remix Ranked session
 void shutdown();
+// Simulation tick: scene/mode changes and match starts cancel a linking sheet.
+void slippi_link_tick(uint8_t major, uint8_t minor, uint8_t mode);
 // Each engine sets this before its game starts; Static mod discs use OtherMod.
 void set_native_gameplay_profile(NativeGameplayProfile profile);
 
@@ -71,6 +81,26 @@ uint64_t rollback_count();
 constexpr int32_t kRollbackFrameUnknown = INT32_MIN;
 void note_rollback(int32_t to_frame = kRollbackFrameUnknown);
 bool is_online_match();
+#if MU_SQUAD
+// Squad Strike (squad_costume_rule.h). While an online squad match is set up (op 5 handed the game
+// its setup, until the next op 0 or 5 or the connection ends), a costume or Kirby hat path (lower
+// case, leading '/') has its fixed size and the standard copy checked in that match's final view;
+// false otherwise. The lookup opens squad_costume::pick of them. first_fallback is true once per
+// path per match (its log line). refuse cancels the match: a lookup found nothing within its size.
+// The copy finder gives a path's standard copy in the current view; a copy over its size refuses
+// the search (op 4) and the match (op 5).
+struct SquadCostume { squad_costume::Budget budget; squad_costume::Standard standard; };
+// console: a Friends console session runs; then Friends' synced select's copies apply while its
+// squads are in play (MU_SQUAD_OP_CONSOLE, armed by the game) and no online match is set up.
+bool squad_costume_rule(const std::string& path, SquadCostume* out, bool console);
+bool squad_costume_first_fallback(const std::string& path);
+void squad_costume_refuse(const std::string& path, bool mod);
+void set_squad_standard_copy(squad_costume::Standard (*copy)(const std::string& path));
+// Forgets Friends' armed costume rule and its logs: called when a console session begins or ends
+// (EngineHooks::session_edge) and on an in-process host reset. Any thread; the game thread applies
+// it before it next reads or changes the rule.
+void squad_console_reset();
+#endif
 // Gecko codes agreed for the match (gecko_session.h): call every character select frame.
 void gecko_pump();
 // The in-game slot the local player occupies in the running online match (0-3).
@@ -94,6 +124,8 @@ int local_player_index();
 // True while the game is polling the online menus (mode select, the online character select screen,
 // waiting for an opponent) and not running a match.
 bool in_online_menus();
+// Online submenu and CSS, including when the Friends row is hidden.
+bool online_status_visible();
 // Direct only: a connected opponent announced automatic L-cancel in its build message. Slippi
 // Dolphin and builds before 0.9.200 never send it, so it is false against them.
 bool opponent_auto_lcancel();
@@ -131,6 +163,22 @@ WarmupLink warmup_link();  // also while not parked: the connected pair as it st
 // under the opponent's feet in the middle of a session (automatic L-cancel).
 int session_mode_or_parked();
 
+// Play while searching (native_practice.cpp): a search the player chose to keep while they leave its
+// character select. kept_search() reads what it is doing without polling the menus' match state (the
+// select's own poll takes over when the player is back on it). search_away(true): the game sees no
+// session meanwhile (session_mode() -1); every cleanup clears it. Simulation thread.
+struct KeptSearch {
+  bool away = false;
+  int state = 0;             // Matchmaking::ProcessState: 0 idle, 1 initializing, 2 matchmaking, 3 connecting, 4 connected, 5 error
+  int mode = -1;             // Matchmaking::OnlinePlayMode
+  bool squad = false, friend_room = false, lobby = false;
+  bool locked = false;       // this player is locked in (every search from the select is)
+  uint64_t started_ms = 0, now_ms = 0;   // when the search went out, and now, on one clock
+  std::string error;
+};
+KeptSearch kept_search();
+void search_away(bool away);
+
 // Native practice uses the same Slippi matchmaking implementation as the game's online menus.
 // These calls are simulation-thread only. native_poll_match is deliberately side-effecting and
 // must be advanced no more than once per intended 60 Hz tick, just like CMD_GET_MATCH_STATE.
@@ -146,12 +194,26 @@ bool native_start_match(int mode, const std::string& connect_code, uint8_t chara
                         uint8_t color, std::string* error, const std::string& friend_room = {});
 NativeMatchPoll native_poll_match();
 void native_cleanup_match();
-// The character (and costume) the local player has picked on the online character select, false
-// when none is picked yet.
-bool local_css_selection(uint8_t* character, uint8_t* color);
-// The Direct code to keep searching for while practicing: the running Direct search's, else the
-// most recent one used. Empty when there is none.
-std::string direct_code_for_practice();
+// The 4-player Friends lobby (yougame_lobby.h, mode_policy::friends_lobby4): arms the 4-door select's lobby
+// and starts its search. room empty: the Friends row, which holds a new room (this player hosts); else an
+// accepted invite's room (a guest). The select then drives it through MU_LOBBY_COMMAND until B leaves it.
+void arm_friends_lobby(const std::string& room);
+// The same lobby on a profile: Doubles (G2) is the 2-seat home (me and a partner); its Start searches for
+// opponents through Rooms, and the 4-player match runs in its own room while the home stays parked.
+void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile);
+// The Doubles row asked for a new Doubles home (CMD_YOUGAME_FRIENDS_MENU 16): true once per press.
+bool take_doubles_lobby_request();
+bool friends_lobby_armed();
+// Another match takes over (a 1v1 friend invite accepted on the lobby's select): the lobby is let go
+// without its LEAVE, so the select's unload can't close the new connection (view.arm changed).
+void disarm_friends_lobby();
+// The Squad Strike row's "Play a friend" is waiting on the friend picker (it keeps the 1v1 friend room).
+bool squad_friend_intent();
+// Squad Strike in a friend room ("Play a friend" on the Squad Strike row). The room the friend
+// picker returned (picked) carries it; any other room joined clears it (picked = false).
+void squad_friend_room(const std::string& room, bool picked);
+// The friend picker closed without a room (cancelled, failed, refused, or left): Squad Strike off.
+void squad_friend_picker_closed();
 // The --online-test ranked harness: locks in the same character and colour again (a random legal
 // stage) for the set's next game, when a ranked pair is connected and not locked in. True if it did.
 bool native_ranked_next_game(uint8_t character, uint8_t color);
@@ -165,6 +227,14 @@ struct GameFacts {
   int64_t rng = -1;   // the match's rng offset: the same on both players' games
 };
 GameFacts last_game_facts();
+// Ports (bit per 0-based port) the netcode marked disconnected in the current or last match.
+unsigned disconnected_ports();
+// The character (and costume) the local player has picked on the online character select, false
+// when none is picked yet.
+bool local_css_selection(uint8_t* character, uint8_t* color);
+// The Direct code to keep searching for while practicing: the running Direct search's, else the
+// most recent one used. Empty when there is none.
+std::string direct_code_for_practice();
 
 // Arena rooms (slippi_arena.h). The online session as the room sees it: whether a Direct search or
 // connection is up, the connect code it is for (UTF-8), Matchmaking's ProcessState, and whether a

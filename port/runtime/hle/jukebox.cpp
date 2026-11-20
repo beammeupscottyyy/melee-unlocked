@@ -3,10 +3,10 @@
 #include "test_env.h"
 #include "jukebox.h"
 #include "host.h"
-#include "audio_sinc.h"
 #ifdef __APPLE__
 #include "slippi_online.h"
 #endif
+#include "audio_sinc.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>

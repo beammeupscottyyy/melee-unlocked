@@ -12,6 +12,7 @@ constexpr uint32_t kSdlEventMessage = 0x7FFF0001u;
 #endif
 void window_set_message_callback(MessageCallback cb);
 void window_input_capture(bool capture);
+bool window_input_captured(); // shared by Windows, macOS and Linux; local console samples only
 // GameCube buttons held back from the game while the overlay uses them (0: none). The overlay still
 // reads them through window_ui_pads.
 void window_withhold_buttons(uint16_t mask);
@@ -19,12 +20,19 @@ struct PadState;
 bool window_ui_gamecube_pad(PadState& pad);
 // Last routed state for every in-game port, captured before UI input suppression. This lets an
 // overlay follow the controller port selected in Training instead of assuming port 1.
-bool window_ui_pads(PadState pads[4]);
+// Optional ImGui-only snapshot excludes bindings already handled by backend keyboard navigation.
+// Both copies are read atomically and share one agent-script acknowledgement.
+bool window_ui_pads(PadState pads[4], PadState navigation_pads[4] = nullptr);
 using ResizeCallback = std::function<void(int, int)>;
+#ifdef _WIN32
+void* window_create(int w, int h, const wchar_t* title, bool visible = true, bool flip = false);
+#else
 void* window_create(int w, int h, const wchar_t* title, bool visible = true);
+#endif
 // Linux: the next window_create makes a Vulkan window instead of an OpenGL one (SDL allows one
 // kind per window). Windows draws either way into the same window, so it ignores this.
 void window_prefer_vulkan(bool on);
+void window_prefer_background(bool on);   // prewarm: no app activation, before video initialization
 void window_set_resize_callback(ResizeCallback cb);
 // For a window that scales its own contents with the monitor (the standalone settings window).
 // While a callback is set, a move to a monitor with another DPI calls it with the new DPI and then
@@ -98,9 +106,9 @@ bool window_take_fullscreen_toggle();   // true once per Alt+Enter press in the 
 // True once each time the game window comes back to the front: exclusive fullscreen, which Windows
 // leaves on Alt+Tab, is entered again then.
 bool window_take_activation();
-bool window_take_escape();              // true once per Esc press, like the F1 toggle (F1 under YouGame)
-// The key that opens the in-game menu: "Esc", or "F1" in the YouGame app, which keeps Esc for
-// itself (it is how players leave full screen everywhere on YouGame).
+bool window_take_escape();              // true once per game Esc press (also F1 under YouGame; Shift+Esc is app-only)
+// Host-specific menu shortcut hint. Plain Esc also opens/backs the embedded game menu;
+// Shift+Esc belongs to the app.
 const char* window_menu_key();
 bool window_take_settings_toggle();     // true once per F1 press (auto-repeat ignored), however late it is read
 bool window_take_legacy_settings_toggle(); // true once per F11 press (auto-repeat ignored)
@@ -114,11 +122,19 @@ void window_set_title(const wchar_t* title);
 // "Static Recomp"), so the title bar and any screenshot of it say which build is playing. main()
 // sets it once before the window opens; every title the runtime writes begins with it.
 inline std::wstring& window_title_base() { static std::wstring base = L"Melee Unlocked"; return base; }
+// The version and engine ("Melee Unlocked 0.9.120  |  Source Port"): only in the title while the
+// Performance overlay is on, with the display rates after it (threaded_backend.cpp).
+inline std::wstring& window_title_debug() { static std::wstring debug = L"Melee Unlocked"; return debug; }
 // A small progress panel over the game window for startup work that holds the first frame back
 // (compiling the pipeline cache on the first launch of a new version). Call from the thread that
 // owns the game window; nothing is shown for a hidden window.
 void loading_show(const wchar_t* what, size_t done, size_t total);
 void loading_close();
+// Runs the renderer's startup (DLSS, the graphics device, shaders) on a worker while the calling thread,
+// the window's own, keeps answering the window's messages and drawing the panel above; returns when it
+// is done and rethrows what it threw. Only in an app-backed launch (the YouGame app hosts or overlays the
+// game); any other launch, any other thread, or a second call inside one, runs it in place.
+void window_responsive(const std::function<void()>& work);
 bool window_closed();
 void window_client_size(int* w, int* h);
 // Scripted input: text file with lines "FRAME BUTTON+BUTTON [sx=N] [sy=N] [cx=N] [cy=N]"; state holds
@@ -126,3 +142,7 @@ void window_client_size(int* w, int* h);
 bool input_load_script(const char* path);
 void input_mark_match_start();   // online match reached frame 1: `@match` script sections begin now
 }  // namespace host
+
+#ifdef YOUGAME_AGENT_TEST_HOOK
+namespace host { void input_console_script(PadState out[4], int local_port); }
+#endif

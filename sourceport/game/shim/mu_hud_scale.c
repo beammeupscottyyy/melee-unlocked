@@ -138,12 +138,9 @@ void mu_hud_report(void)
             mu_hud_extras_abi(slot, present ? mu_nana_damage(slot) : -1,
                               present && gm_8016B168() ? Player_GetTeam(slot) : -1);
         }
-        /* A pro AI's robot after its name, where the tag left room for it. */
-        {
-            float dx = 0.0f, width = 0.0f;
-            if (!(visible && mu_pro_tag_icon(slot, &dx, &width))) dx = width = 0.0f;
-            mu_hud_pro_tag_abi(slot, dx, width);
-        }
+        /* A pro AI's robot after its name: the game draws it with the tag's letters now
+         * (mu_pro_tag_robot.c), so the host is told there is none to draw over the window. */
+        mu_hud_pro_tag_abi(slot, 0.0f, 0.0f);
     }
 }
 

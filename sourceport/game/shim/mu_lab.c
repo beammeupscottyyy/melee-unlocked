@@ -227,9 +227,12 @@ static void lab_bubbles(void)
  * (the lab's own setting wins in Training while the lab is on). Switching it off puts the model back. */
 void mu_te_frame_begin(void)
 {
+    int mu_console_frame_begin(void);
     static int shown;
-    const int want = mu_te2(MU_TE2_BUBBLES) && !lab_owns_bubbles();
+    int want;
     HSD_GObj* gobj;
+    mu_console_frame_begin();
+    want = mu_te2(MU_TE2_BUBBLES) && !lab_owns_bubbles();
     if (mu_te2(MU_TE2_COLOR_OVERLAYS)) {
         /* 20XX TE "Color overlays": green on every frame a fighter can act, so gaps between
          * actions (frame holes) show. The tint lasts two frames and is renewed while it applies;
@@ -608,7 +611,7 @@ int mu_lab_input(void* fighter, MuLabInput* out)
          * a second in any offline match, so CPU smart DI can be checked without a controller. */
         static int te_fake = -1;
         if (te_fake < 0) {
-            te_fake = getenv("MELEE_TE_FAKE_ATTACK") != NULL;
+            te_fake = mu_test_getenv("MELEE_TE_FAKE_ATTACK") != NULL;
         }
         if (te_fake && fp->player_idx == 0 && !fp->is_sub_fighter && !mu_online_active()) {
             HSD_GObj* d = Player_GetEntity(1);

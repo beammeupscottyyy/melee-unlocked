@@ -26,7 +26,9 @@ struct FakeRoom {
   FakeRoom(int local = 0) { set.configure(local, {"participant-a", "participant-b"}); }
   std::vector<json> tick() {
     auto out = set.due(now, host, 7);
-    for (const auto& message : out) sent.push_back(json::parse(message.dump()));
+    for (const auto& message : out) { sent.push_back(json::parse(message.dump())); set.sent(message); }
+    // Unit helpers model a successful pump turn for a queued first-frame start.
+    if (!out.empty() && out[0]["t"] == "game-start") return tick();
     return out;
   }
   void start() {
@@ -35,10 +37,12 @@ struct FakeRoom {
     if (host) CHECK(out.size() == 1 && out[0] == json({{"t", "begin"}, {"revision", 7}}));
     else CHECK(out.empty());   // only the room's host asks for the match
     set.receive({{"t", "start"}, {"matchId", "set-1"}});
+    tick();
   }
   Game game(int winner, bool forfeit = false) {
     Game game;
     set.start_game();   // a no-op while start() already began game 1 and nothing reported it
+    tick(); // send the first-frame start before the game ends
     game.index = set.games_started(); game.winner = winner; game.forfeit = forfeit;
     const int chars[2] = {2, 20};
     game.detail = game_detail(forfeit ? 7 : 2, forfeit ? 1 - winner : -1, 31, chars, 1800);
@@ -130,7 +134,7 @@ void first_to_two() {
       CHECK(out[0]["winner"] == (winners[i] == 0 ? "participant-a" : "participant-b"));
       CHECK(room.set.awaiting_receipt() && !room.set.decided());
       room.now += 2000;
-      CHECK(room.tick() == out);   // an unchanged retry
+      CHECK(room.tick().empty());   // subgames are sent once, never replayed
       room.receipt(out[0]["id"], winners[i]);
       room.receipt(out[0]["id"], winners[i]);   // the room re-broadcasts a receipt: it counts once
       CHECK(!room.set.awaiting_receipt());
@@ -216,24 +220,45 @@ void forfeits_and_leaving() {
   CHECK(quitter.set.leaves_at_once());
   const auto last = quitter.set.flush();
   CHECK(last.size() == 1 && last[0] == json({{"t", "finish"}, {"matchId", "set-1"}, {"winner", "participant-a"}}));
-  // The other player's connection broke instead: it claims the set (never concedes it).
+  // The connection broke instead: both games see the same break, so neither claims (or concedes)
+  // the set. It stays for the room, whose leave rule forfeits the game that left the room.
   FakeRoom stayer(0); stayer.start();
   stayer.game(1); stayer.tick(); stayer.receipt("g1-t0", 1);
   stayer.set.lost();
-  CHECK(stayer.tick()[0]["winner"] == "participant-a" && !stayer.set.leaves_at_once());
-  // Lost with its own game report still waiting: the claim waits for the receipt, which may decide.
+  CHECK(stayer.tick().empty() && !stayer.set.decided() && !stayer.set.leaves_at_once());
+  CHECK(stayer.set.needs_drain());
+  stayer.now += yougame::ranked::kLostCallOffMs - 1;
+  CHECK(stayer.tick().empty() && !stayer.set.decided());
+  CHECK(stayer.set.receive({{"t", "result"}, {"matchId", "set-1"}}));   // the room's forfeit
+  CHECK(stayer.tick().empty() && !stayer.set.needs_drain());
+  // Still in the room with no result when the call-off comes: neither game left, the set is void.
+  FakeRoom both(1); both.host = false; both.start();
+  both.game(1); both.tick(); both.receipt("g1-t0", 1);
+  both.set.lost();
+  both.tick();
+  both.now += yougame::ranked::kLostCallOffMs;
+  CHECK(both.tick()[0] == json({{"t", "finish"}, {"matchId", "set-1"}, {"void", true}}));
+  static_assert(yougame::ranked::kLostCallOffMs < 30000, "the call-off is sent inside the 30 s drain");
+  // close_room stamps the break: the call-off counts from it even if the pump skipped due() while
+  // the room socket reconnected (review, 43b).
+  FakeRoom stamped(0); stamped.start();
+  stamped.game(1); stamped.tick(); stamped.receipt("g1-t0", 1);
+  stamped.set.lost(stamped.now);
+  stamped.now += yougame::ranked::kLostCallOffMs;
+  CHECK(stamped.tick()[0] == json({{"t", "finish"}, {"matchId", "set-1"}, {"void", true}}));
+  // Lost with its own game report still waiting: the receipt may still decide the set.
   FakeRoom race(1); race.host = false; race.start();
   race.game(0); race.tick(); race.receipt("g1-t0", 0);
   race.game(0); race.tick();
   race.set.lost();
   CHECK(!race.set.decided());
   race.receipt("g2-t0", 0);
-  CHECK(race.tick()[0]["winner"] == "participant-a");   // first-to-2, not the claim for B
+  CHECK(race.tick()[0]["winner"] == "participant-a");   // first-to-2 still finishes the set
   // Status 40 before any game: nothing to concede. No match started: nothing to drain.
   FakeRoom unplayed; unplayed.set.quit(); CHECK(unplayed.tick().empty() && !unplayed.set.needs_drain());
   FakeRoom nomatch; nomatch.host = false; nomatch.set.start_game(); nomatch.set.quit();
   CHECK(!nomatch.set.needs_drain() && nomatch.set.flush().empty());
-  std::puts("yougame_ranked: No Contest forfeits, quit concedes at once, lost claims after its receipts ok");
+  std::puts("yougame_ranked: No Contest forfeits, quit concedes at once, lost waits for the room ok");
 }
 
 void quit_after_config_and_receipts() {
@@ -266,32 +291,33 @@ void quit_after_config_and_receipts() {
 
   FakeRoom refused; refused.start(); refused.game(0); refused.tick();
   refused.set.refused({{"action", "game-report"}, {"id", "g1-t0"}, {"error", "Invalid result detail"}});
-  CHECK(!refused.set.awaiting_receipt() && refused.set.games_received() == 0);
+  CHECK(refused.set.awaiting_receipt() && refused.set.games_received() == 0);
+  refused.now += kGameGraceMs; refused.tick();
+  CHECK(refused.set.awaiting_receipt() && refused.set.games_received() == 0);
+  refused.now += kRecoveryWaitMs; refused.tick();
+  CHECK(refused.set.release_pair() && !refused.set.settled());
   std::puts("yougame_ranked: quit-after parsing, own unique receipts, voids, refusals and one-shot cleanup ok");
 }
 
 void c2_and_game_setup() {
-  // C2 before any decision (a future flow) decides from the settled games once they are in.
-  FakeRoom early; early.start();
-  early.game(0); early.tick();
-  early.set.complete(0);
-  CHECK(!early.set.decided());
-  early.receipt("g1-t0", 0);
+  // An early normal C2 cannot rate a 1-0 set.
+  FakeRoom early; early.start(); early.game(0); early.tick(); early.set.complete(0);
+  early.receipt("g1-t0", 0); CHECK(!early.set.decided() && early.tick().empty());
+  early.game(0); early.tick(); early.receipt("g2-t0", 0);
   CHECK(early.tick()[0]["winner"] == "participant-a");
-  // A GameSetup port: first-to-2 is off, C2 alone decides (here a best of 5 at 3-1).
+  // C0 cannot switch off the room-settled first-to-two finish.
   FakeRoom setup; setup.start(); setup.set.game_setup();
-  int i = 0;
-  for (int w : {0, 0, 1, 0}) { setup.game(w); setup.tick(); setup.receipt("g" + std::to_string(++i) + "-t0", w); }
+  setup.game(0); setup.tick(); setup.receipt("g1-t0", 0);
   CHECK(!setup.set.decided());
-  setup.set.complete(0);
-  CHECK(setup.tick()[0]["winner"] == "participant-a");
-  setup.set.complete(0);
-  CHECK(setup.tick().empty());
+  setup.game(0); setup.tick(); setup.receipt("g2-t0", 0);
+  CHECK(setup.set.decided());
+  setup.set.complete(0); CHECK(setup.tick()[0]["winner"] == "participant-a");
+  setup.set.complete(0); CHECK(setup.tick().empty());
   // An abnormal C2 names nobody: void.
   FakeRoom abnormal; abnormal.start(); abnormal.set.game_setup(); abnormal.game(0); abnormal.tick();
   abnormal.receipt("g1-t0", 0); abnormal.set.complete(1);
   CHECK(abnormal.tick()[0]["void"] == true);
-  std::puts("yougame_ranked: C2 after first-to-2 adds no final; a GameSetup port's C2 decides ok");
+  std::puts("yougame_ranked: C2 and GameSetup preserve first-to-two authority");
 }
 
 void refusals() {
@@ -300,31 +326,35 @@ void refusals() {
   room.game(0);
   const auto report = room.tick();
   room.set.refused({{"t", "command-error"}, {"action", "game-report"}, {"id", report[0]["id"]}, {"error", "Invalid result detail"}});
-  CHECK(!room.set.awaiting_receipt());
+  CHECK(room.set.awaiting_receipt());
   room.now += 10000;
   CHECK(room.tick().empty() && !room.set.decided());
-  // A final refused while a game is pending is retried; refused for good, it stops.
+  room.now += kRecoveryWaitMs; room.tick();
+  CHECK(room.set.release_pair() && room.set.awaiting_receipt());
+  // Finish refusals are final, even when older rooms provide only text.
   FakeRoom fin; fin.start(); fin.game(0); fin.tick(); fin.receipt("g1-t0", 0); fin.game(0); fin.tick(); fin.receipt("g2-t0", 0);
   CHECK(fin.tick()[0]["t"] == "finish");
   fin.set.refused({{"t", "command-error"}, {"action", "finish"}, {"error", "Wait for individual game reports before completing the match"}});
   fin.now += 2000;
-  CHECK(fin.tick().size() == 1);
+  CHECK(fin.tick().empty());
   fin.set.refused({{"t", "command-error"}, {"action", "finish"}, {"error", "A submitted result cannot be changed"}});
   fin.now += 2000;
   CHECK(fin.tick().empty() && fin.set.needs_drain());   // still waits for the room's result
   // Both reports in, the site still recording the game: the result is on its way, the fence holds
   // (review: releasing it here let a 2-0 winner who left concede before its deciding result).
-  FakeRoom slow; slow.start(); slow.game(0);
+  FakeRoom slow; slow.start(); slow.game(0); slow.tick(); slow.receipt("g1-t0", 0); slow.game(0);
   slow.tick();
-  slow.set.refused({{"t", "command-error"}, {"action", "game-report"}, {"id", "g1-t0"}, {"error", "That game result is already being recorded"}});
-  CHECK(slow.set.awaiting_receipt());
+  slow.set.refused({{"t", "command-error"}, {"action", "game-report"}, {"id", "g2-t0"}, {"error", "That game result is already being recorded"}});
+  CHECK(slow.set.awaiting_receipt() && slow.set.games_received() == 1);
   slow.set.quit();
   CHECK(!slow.set.decided() && !slow.set.leaves_at_once());
+  slow.receipt("g2-t0", 0);
+  CHECK(slow.tick()[0]["winner"] == "participant-a" && !slow.set.leaves_at_once());
   // The room recording the result: nothing more is sent, the drain waits for the result.
   FakeRoom closing; closing.start(); closing.game(0);
   closing.set.refused({{"t", "command-error"}, {"action", "game-report"}, {"id", "g1-t0"}, {"error", "The match result is being recorded"}});
   CHECK(closing.tick().empty() && closing.set.needs_drain());
-  // Begin: a roster still settling is retried, at most kBeginTries times; a refusal for good stops it.
+  // Begin: every refusal retries within the same cap, regardless of text or code.
   FakeRoom begin; begin.set.start_game();
   int begins = 0;
   for (int t = 0; t < 100; ++t, begin.now += 2000) {
@@ -334,7 +364,7 @@ void refusals() {
   CHECK(begins == kBeginTries && !begin.set.needs_drain());
   FakeRoom host; host.set.start_game(); CHECK(host.tick().size() == 1);
   host.set.refused({{"t", "command-error"}, {"action", "begin"}, {"error", "Only the host game can start a match"}});
-  host.now += 2000; CHECK(host.tick().empty());
+  host.now += 2000; CHECK(host.tick().size() == 1);
   // A room that never starts the match (on either side): the pair breaks up, nothing to drain.
   CHECK(!host.set.over());
   host.now += kStartWaitMs; host.tick();
@@ -348,7 +378,85 @@ void refusals() {
   room.set.receive({{"t", 5}, {"matchId", nullptr}});
   room.set.receive({{"t", "game-result"}, {"matchId", "set-1"}, {"id", 3}, {"ranking", "x"}});
   room.set.refused({{"t", "command-error"}, {"action", 1}, {"id", false}});
-  std::puts("yougame_ranked: refused reports dropped, finish retried only while games settle, begin capped ok");
+  std::puts("yougame_ranked: final refusals retain receipt fences, finish stops, begin retries capped ok");
+}
+
+void refusal_codes_and_fences() {
+  // The only retryable code: exactly one retry, spaced from the refusal, including rejoin.
+  for (bool accept : {false, true}) {
+    FakeRoom r; r.start(); r.game(0); const auto report = r.tick();
+    r.set.refused({{"action", "game-report"}, {"id", "g1-t0"}, {"code", "not_started"}}, 100);
+    r.set.rejoined(); r.now = 2099; CHECK(r.tick().empty());
+    r.now = 2100; CHECK(r.tick() == report);
+    r.now += 5000; CHECK(r.tick().empty());
+    if (accept) r.receipt("g1-t0", 0);
+    else {
+      r.set.refused({{"action", "game-report"}, {"id", "g1-t0"}, {"code", "not_started"}}, r.now);
+      r.set.rejoined(); r.now += kRetryMs; CHECK(r.tick().empty());
+      CHECK(r.set.awaiting_receipt());
+      r.receipt("g1-t0", -1);
+    }
+    CHECK(!r.set.awaiting_receipt());
+    CHECK(count_type(r.sent, "game-report") == 2);
+  }
+  // All other codes (and missing/unknown codes) are final, without interpreting wording.
+  for (const char* code : {"set_over", "not_in_match", "set_decided", "game_active", "id_used",
+                           "game_limit", "result_changed", "bad_id", "recording", "report_limit", "future", ""}) {
+    for (bool receipt : {false, true}) {
+      FakeRoom r; r.start(); r.game(0); r.tick();
+      json error = {{"action", "game-report"}, {"id", "g1-t0"}, {"error", "please retry not_started already recorded"}};
+      if (*code) error["code"] = code;
+      r.set.refused(error, 100);
+      r.set.start_game(); r.set.rejoined();
+      r.now = 100 + kGameGraceMs - 1;
+      CHECK(r.tick().empty() && r.set.awaiting_receipt());
+      if (receipt) r.receipt("g1-t0", -1);
+      else ++r.now;
+      const auto next = r.tick();
+      CHECK(next.empty());
+      CHECK(count_type(r.sent, "game-start") == (receipt ? 2 : 1) && count_type(r.sent, "game-report") == 1);
+      CHECK(r.set.awaiting_receipt() == !receipt && r.set.games_received() == 0);
+      if (!receipt) {
+        r.now = 100 + kRecoveryWaitMs;
+        const auto final = r.tick();
+        CHECK(final.size() == 1 && final[0]["t"] == "finish" && final[0]["void"] == true);
+        CHECK(r.set.release_pair() && !r.set.settled());
+        CHECK(count_type(r.sent, "game-start") == 1); // never guess room advancement
+      }
+    }
+  }
+  // already_recorded cannot substitute for the missing room outcome.
+  for (const char* action : {"game-start", "game-report"}) {
+    FakeRoom r; r.start(); r.game(0); r.tick();
+    r.set.refused({{"action", action}, {"id", "g1-t0"}, {"code", "already_recorded"}});
+    r.set.refused({{"action", action}, {"id", "g1-t0"}, {"code", "already_recorded"}});
+    CHECK(r.set.awaiting_receipt() && r.set.games_received() == 0);
+    r.set.rejoined(); r.now += 10000; CHECK(r.tick().empty());
+    r.receipt("g1-t0", 0);
+    CHECK(!r.set.awaiting_receipt() && r.set.score_text() == "Game 2 - 1:0");
+  }
+}
+
+void repeated_game_keys() {
+  Set a, b;
+  for (Set* s : {&a, &b}) { s->configure(0, {"a", "b"}); s->receive({{"t", "start"}, {"matchId", "set"}}); }
+  const std::string key = game_key(42, 31);
+  std::set<std::string> ids;
+  for (int n = 1; n <= kMaxGames; ++n) {
+    std::string id;
+    for (Set* s : {&a, &b}) {
+      s->start_game(key); s->start_game(key); s->start_game(key);
+      CHECK(s->games_started() == n);
+      const auto start = s->due(n, true, 7); CHECK(start.size() == 1);
+      const auto wire_id = str(start[0], "id");
+      CHECK(std::regex_match(wire_id, std::regex("^[A-Za-z0-9_-]{1,64}$")));
+      if (id.empty()) id = wire_id; else CHECK(id == wire_id);
+      s->sent(start[0]); Game g; s->report_game(g);
+      const auto report = s->due(n, true, 7); CHECK(str(report[0], "id") == id); s->sent(report[0]);
+      s->receive({{"t", "game-result"}, {"matchId", "set"}, {"id", id}, {"void", true}});
+    }
+    CHECK(ids.insert(id).second);
+  }
 }
 
 void ranks() {
@@ -358,8 +466,8 @@ void ranks() {
   RankCache cache;
   CHECK(cache.header() == "Ranked Mode" && cache.visibility() == 0 && cache.response().size() == 16);
   // A ranked ticket for a player with no result yet (rankFor(1000, 0)): still plain.
-  CHECK(!cache.standing({{"tier", "unranked"}, {"division", nullptr}, {"label", "Placements 0/5"}, {"placed", false}, {"matches", 0}, {"rating", 1000}}, 1000));
-  CHECK(cache.header() == "Ranked Mode");
+  CHECK(cache.standing({{"tier", "unranked"}, {"division", nullptr}, {"label", "Placements 0/5"}, {"placed", false}, {"matches", 0}, {"rating", 1000}}, 1000));
+  CHECK(cache.header() == "Ranked - Placements 0/5");
   CHECK(cache.standing({{"tier", "unranked"}, {"division", nullptr}, {"label", "Placements 2/5"}, {"placed", false}, {"matches", 2}, {"rating", 1016}}, 1016));
   CHECK(cache.header() == "Ranked - Placements 2/5" && cache.rank() == 0);
   json rank = {{"placed", true}, {"tier", "gold"}, {"division", 2}, {"label", "Gold II"}, {"matches", 5}, {"rating", 1240}};
@@ -370,7 +478,7 @@ void ranks() {
   CHECK(!cache.result(event, "connection-a")); // participant, not connection id
   CHECK(cache.result(event, "participant-a"));
   CHECK(cache.header() == "Ranked - Gold II - 1240");
-  CHECK(cache.response() == (std::vector<uint8_t>{1, 1, 8, 0x44, 0x9b, 0, 0, 0, 0, 0, 5, 0x41, 0xa0, 0, 0, 0}));
+  CHECK(cache.response() == (std::vector<uint8_t>{1, 1, 8, 0x44, 0x9b, 0, 0, 0, 0, 0, 5, 0x41, 0xa0, 0, 0, 8}));
   auto game = event; game["t"] = "game-result"; game["ratings"]["participant-a"]["after"] = 1500;
   CHECK(!cache.result(game, "participant-a") && cache.rank() == 8);
   auto invalid = event; invalid["ratings"]["participant-a"]["after"] = "bad";
@@ -398,7 +506,7 @@ void ranks() {
   // mpRank: applied only when nothing newer arrived since it was asked; "Unknown request" stops it.
   RankCache fresh;
   const uint64_t asked = fresh.version();
-  json answer = {{"mode", "singles"}, {"rating", 1140}, {"matches", 5}, {"place", nullptr},
+  json answer = {{"queue", "ranked"}, {"player", "a"}, {"mode", "singles"}, {"rating", 1140}, {"matches", 5}, {"place", nullptr},
                  {"rank", {{"tier", "gold"}, {"division", 4}, {"label", "Gold IV"}, {"order", 9}, {"rating", 1140}, {"matches", 5}, {"placed", true}}}};
   CHECK(apply_rank_answer(fresh, answer, asked) && fresh.header() == "Ranked - Gold IV - 1140");
   const uint64_t stale = fresh.version();
@@ -430,6 +538,7 @@ struct Rooms {
   std::map<std::string, uint64_t> left;
   bool match = false, closing = false, disputed = false, closed = false;
   const std::string match_id = "set-1";
+  std::map<std::string, std::set<std::string>> starts;
   std::map<std::string, Group> groups;
   std::map<std::string, Outcome> completed;
   std::map<std::string, json> receipts;
@@ -532,6 +641,13 @@ struct Rooms {
       broadcast({{"t", "start"}, {"matchId", match_id}});
       return "";
     }
+    if (t == "game-start") {
+      if (!match || str(msg, "matchId") != match_id) return "No active match";
+      starts[str(msg, "id")].insert(from);
+      return "";
+    }
+    if (t == "game-report" && starts[str(msg, "id")].size() != 2)
+      return "Report only the current game started by both players";
     if (t != "game-report" && t != "finish") return "Unsupported game lobby command";
     const bool final = t == "finish";
     const std::string id = final ? "$final" : str(msg, "id"), key = final ? "$final" : "game:" + id;
@@ -631,6 +747,7 @@ struct Sim {
     return copy.dump();
   }
   void send(Client& c, const json& m) {
+    c.set.sent(m);
     note(c.name + " -> " + brief(m));
     const std::string error = rooms.command(c.conn, m);
     if (!error.empty()) c.inbox.push_back({now + c.delay, {{"t", "command-error"}, {"action", m["t"]}, {"id", m.count("id") ? m["id"] : json()}, {"error", error}}});
@@ -682,8 +799,8 @@ struct Sim {
     }
   }
   void play(int winner, bool forfeit = false) {
-    for (Client* c : {&a, &b}) c->set.start_game();
-    run(200);
+    for (Client* c : {&a, &b}) c->set.start_game(game_key(0x101 + c->set.games_started(), 31));
+    run(std::max<uint64_t>(200, std::max(a.delay,b.delay)+200));
     for (Client* c : {&a, &b}) {
       Game g;
       g.index = c->set.games_started(); g.winner = winner; g.forfeit = forfeit;
@@ -771,16 +888,17 @@ void sim_leaving() {
     CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "completed");
   }
   // Addendum A/B: B quits between games (concedes, closes at once); A's game sees the pair break
-  // and claims. Both finals agree: completed for A at once, not void.
+  // and waits (a lost link claims nothing). B's concession and the leave rule give A the set once
+  // B's grace runs out, inside A's drain; never void.
   {
     Sim sim;
     sim.play(1);
     sim.close(sim.b, 0);
     sim.run(500);
     sim.close(sim.a, 1);
-    sim.run(3000);
-    CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "completed");
-    CHECK(sim.now < 20000);
+    sim.run(kGameGraceMs + 3000);
+    CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["void"] == false);
+    CHECK(sim.a.set.settled() && sim.now < 25000);
   }
   // B quits but A's game says nothing (it froze): the leave rule gives A the set after 15 s.
   {
@@ -790,7 +908,7 @@ void sim_leaving() {
     sim.run(20000);
     CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "forfeit");
   }
-  // B's game vanishes between games (no message at all); A claims: the leave rule gives A the set.
+  // B's game vanishes between games (no message at all); A waits: the leave rule gives A the set.
   {
     Sim sim;
     sim.play(1);
@@ -809,13 +927,28 @@ void sim_leaving() {
     sim.run(20000);
     CHECK(sim.rooms.result["void"] == true);
   }
-  // The link between the games breaks while both stay in the room: both claim, the set is void.
+  // The link between the games breaks while both stay in the room: neither claims, nobody left,
+  // so both call it off at kLostCallOffMs and the set is void (run 2 voided at once: both claimed).
   {
     Sim sim;
     sim.play(0);
     sim.close(sim.a, 1); sim.close(sim.b, 1);
-    sim.run(20000);
+    sim.run(kLostCallOffMs - 1000);
+    CHECK(!sim.rooms.result.is_object());
+    sim.run(3000);
     CHECK(sim.rooms.result["void"] == true);
+  }
+  // Run 2 on build 42b: B's app stops after game 1. Both games see the link break first; B's game
+  // exits 5 s later (its socket closes), A's stays. Neither claims; the leave rule gives A the set.
+  for (int leaver_won_game1 : {0, 1}) {
+    Sim sim;
+    sim.play(leaver_won_game1 ? 1 : 0);
+    sim.close(sim.a, 1); sim.close(sim.b, 1);
+    sim.run(5000);
+    sim.leave(sim.b);
+    sim.run(kGameGraceMs + 2000);
+    CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "forfeit");
+    CHECK(sim.a.set.settled() && !sim.a.open);
   }
   // The link dies mid-game 2 with both still in the room: each game ends it as a No Contest naming
   // its opponent (mu_online.c end_game), so each claims the game and the set: void, never inverted.
@@ -850,12 +983,15 @@ void sim_leaving() {
   // drop before its own receipt arrives. B's claim waits for the receipt, which decides: A's set.
   {
     Sim sim;
+    sim.tracing = true;
     sim.b.delay = 400;
     sim.play(0);
     for (Client* c : {&sim.a, &sim.b}) c->set.start_game();
     sim.run(200);
     for (Client* c : {&sim.a, &sim.b}) { Game g; g.index = 2; g.winner = 0; c->set.report_game(g); }
-    while (!sim.a.set.decided()) sim.step();
+    for (int n = 0; !sim.a.set.decided() && n < 1000; ++n) sim.step();
+    if (!sim.a.set.decided()) for (const auto& line : sim.trace) std::fprintf(stderr,"%s\n",line.c_str());
+    CHECK(sim.a.set.decided());
     sim.close(sim.a, 2);
     CHECK(!sim.b.set.decided());
     sim.close(sim.b, 1);
@@ -883,11 +1019,11 @@ void sim_leaving() {
   // the next game still matches. The lone game voids; game 2 settles for A.
   {
     Sim sim;
-    for (Client* c : {&sim.a, &sim.b}) c->set.start_game();
+    for (Client* c : {&sim.a, &sim.b}) c->set.start_game(game_key(0x401, 31));
     sim.run(200);
     { Game g; g.index = 1; g.key = game_key(0x401, 31); g.winner = 0; sim.a.set.report_game(g); }
     sim.run(16000);
-    for (Client* c : {&sim.a, &sim.b}) c->set.start_game();   // B's set still thinks game 1 runs
+    for (Client* c : {&sim.a, &sim.b}) c->set.start_game(game_key(0x402, 2));   // B missed the old end
     sim.run(200);
     for (Client* c : {&sim.a, &sim.b}) { Game g; g.index = (uint32_t)c->set.games_started(); g.key = game_key(0x402, 2); g.winner = 0; c->set.report_game(g); }
     sim.run(1000);
@@ -932,6 +1068,8 @@ int main() {
   sim_quit_after();
   c2_and_game_setup();
   refusals();
+  refusal_codes_and_fences();
+  repeated_game_keys();
   ranks();
   sim_series({0, 0}, false);
   sim_series({0, 1, 0}, true);

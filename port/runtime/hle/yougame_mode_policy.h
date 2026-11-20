@@ -6,6 +6,72 @@
 
 namespace yougame::mode_policy {
 
+// Direct, Teams and Party in the Slippi submenu never use YouGame's queues. An explicit
+// friend room is the separate Friends flow, which retains its existing routing.
+enum class MatchmakingRoute { YouGame, Slippi, Blend, Locked };
+constexpr bool slippi_menu_mode(int mode, bool friend_room) {
+  return mode >= 2 && mode <= 4 && !friend_room;
+}
+
+// Slippi mode ids: 0 Ranked, 1 Unranked, 2 Direct, 3 Teams, 4 Party.
+// Plain Unranked keeps its mixed search on the base listing. Direct, Teams and Party
+// require the app's granted Slippi account, independent of connect-code syntax.
+constexpr MatchmakingRoute matchmaking_route(int mode, bool yougame_mode, bool slippi_login,
+                                             bool agent_script, bool friend_room, bool vanilla) {
+  if (yougame_mode && slippi_menu_mode(mode, friend_room))
+    return slippi_login && !agent_script ? MatchmakingRoute::Slippi : MatchmakingRoute::Locked;
+  if (agent_script) return MatchmakingRoute::YouGame;
+  if (!yougame_mode) return MatchmakingRoute::Slippi;
+  return mode == 1 && slippi_login && !friend_room && vanilla ? MatchmakingRoute::Blend : MatchmakingRoute::YouGame;
+}
+
+// Melee Unlocked's launcher (no YouGame app): a search the online menu sent to YouGame. `service` is
+// the menu's pick (CMD_YOUGAME_MENU): 1 a YouGame row, 2 Both Unranked (the Unranked slider: YouGame's
+// pool and Slippi's Unranked at once, the first opponent wins). A Slippi row (0) never comes here:
+// the launcher's Slippi rows run Slippi's own search. Both blends only plain Unranked, with the
+// game's own Slippi login and gameplay Slippi's Unranked plays (vanilla); else YouGame alone, and
+// `why` says so for the log. Agent copies never reach Slippi.
+enum class LauncherRoute { YouGame, BothYouGameOnly, Blend };
+struct LauncherDecision {
+  LauncherRoute route;
+  const char* why;
+};
+constexpr LauncherDecision launcher_route(int service, int mode, bool friend_room, bool slippi_login,
+                                          bool slippi_gameplay, bool agent) {
+  if (service != 2 || mode != 1 || friend_room) return {LauncherRoute::YouGame, "a YouGame row"};
+  if (agent) return {LauncherRoute::BothYouGameOnly, "agent copy, never Slippi"};
+  if (!slippi_login) return {LauncherRoute::BothYouGameOnly, "no Slippi login"};
+  if (!slippi_gameplay) return {LauncherRoute::BothYouGameOnly, "Slippi Unranked plays vanilla Melee only"};
+  return {LauncherRoute::Blend, "Slippi login present"};
+}
+
+// Whether the Online menu offers Ranked in YouGame mode. Off until Ranked plays like Slippi's
+// (rank shown, best of 3, stage striking, rating change): 2026-10-29. The site's ladder
+// switch is off for these listings too, and the page turns a ranked request into a casual one.
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+constexpr bool yougame_ranked_offered = true;
+#else
+constexpr bool yougame_ranked_offered = false;
+#endif
+// The Online menu offers Friends by default in YouGame launches.
+#ifndef YOUGAME_FRIENDS_ROW
+#define YOUGAME_FRIENDS_ROW 1
+#endif
+constexpr bool friends_offered(bool yougame_mode) { return YOUGAME_FRIENDS_ROW != 0 && yougame_mode; }
+// Friends keeps its menus local and sends picks as messages: each player stays on their own CSS
+// and stage select, and the pair meets as known peers in the friend room (native_start_match with
+// the room, the same rollback a Direct match uses), with rollback only inside the match. The
+// shared-menu console session (console::friends_entry/start_session, synced CSS pads, mid-CSS join)
+// stays compiled for agent and app-requested console launches but is not reachable from Friends.
+constexpr bool friends_shared_menus = false;
+// The Friends row opens the 4-player Friends lobby (yougame_lobby.h) on Melee's 4-door VS select, and an
+// accepted lobby invite joins it there. 0 keeps the 1v1 friend room (the picker, then the 1-door select).
+// The Squad Strike row's "Play a friend" keeps the 1v1 friend room either way.
+#ifndef YOUGAME_FRIENDS_LOBBY4
+#define YOUGAME_FRIENDS_LOBBY4 1
+#endif
+constexpr bool friends_lobby4 = YOUGAME_FRIENDS_LOBBY4 != 0;
+
 constexpr bool spectator_allowed(bool yougame_mode, bool setting_on) {
   return !yougame_mode && setting_on;
 }

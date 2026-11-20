@@ -1,4 +1,5 @@
-// YouGame in the launcher: the player's YouGame account, and the loopback bridge the game's YouGame
+// YouGame in the launcher: the player's YouGame account (signed in on YouGame's own page in a browser view
+// the launcher owns, launcher_yougame_web.h; the only sign-in there is), and the loopback bridge the game's YouGame
 // rows use (YOUGAME_BRIDGE + YOUGAME_TOKEN + MELEE_YOUGAME_LAUNCHER=1). The YouGame app is never
 // started: the launcher answers the game's few requests itself and passes tickets from YouGame's
 // site through unchanged. Requests: hello, mpCode, mpTicket, mpRank; mpFriend is answered here.
@@ -16,36 +17,80 @@ namespace launcher::yougame {
 struct Env {
   std::string id;        // "production" or "staging"
   std::string site;      // https://yougame.co
-  std::string auth;      // YouGame's sign-in service
-  std::string anon_key;  // the sign-in service's public key, as the site's own page uses it
-  std::string cookie;    // the site's session cookie name
 };
 const Env& env();
 void set_env(const std::string& id);   // switching signs out
 
-// launcher.ini: the environment and the saved session (protected for this Windows user).
+// launcher.ini: the environment and who is signed in (the account's id, name and connect code, protected for
+// this Windows user). No password, token or cookie is ever kept: the session itself lives in the browser view.
 bool load_line(const std::string& line);   // true when the line was this module's
 std::string ini_lines();
+// "YouGame extension": the game uses the YouGame app's channel instead of connecting itself. Off by default.
+bool extension();
+void set_extension(bool on);
 
 struct Account {
   bool signed_in = false;
-  std::string name, code, email;
+  bool app = false;   // signed in through the YouGame app (sign_in_app): the game plays YouGame through the app
+  std::string name, code;
 };
 Account account();
-// Blocking (call off the window thread): YouGame's own email sign-in, then the connect code.
-bool sign_in(const std::string& email, const std::string& password, std::string* error);
 void sign_out();
+// The player is already signed in to the YouGame app for this environment (YouGame Staging on staging):
+// the launcher asks the app over its own local channel (launcher_yougame_app.h) and takes that account,
+// with no second sign-in. may_start: start the installed app quietly (its tray link, no window) when it is not
+// running; else only a running app is asked. `version`: this build, named in the hello as the game does.
+// Blocking (seconds; up to ~30 s when it starts the app): never on the window thread.
+// kSignedIn: account() is the app's player (app = true). Otherwise nothing changed. *detail: every step taken.
+enum class AppSignIn { kSignedIn, kSignedOut, kNoApp, kNoAnswer };
+AppSignIn sign_in_app(bool may_start, const std::string& version, std::string* detail);
+// Disconnect chose not to use the app's account: the launcher no longer takes it by itself when it starts
+// (Connect takes it again). Saved in launcher.ini (yougame_app=0).
+bool app_declined();
+// This launcher connected through the YouGame app before (launcher.ini yougame_app=1): when it starts, it may
+// start the installed app quietly (tray only) to take that account again.
+bool app_used_before();
+// "Launch with YouGame extension": the installed YouGame app (YouGame Staging on staging) is started quietly (its
+// tray link, no window) when it is not running, so the game can reach its channel for the extension's features.
+// Blocking up to ~25 s: never on the window thread. True when its channel is there; *detail says what happened.
+bool start_app_quietly(std::string* detail);
+// The launcher starting: its browser view's folder holds a session (a sign-in made before) that launcher.ini
+// does not name. Asks the site through the hidden view, as warm() does (never a window); true when it answered
+// signed in (account() is that account then). Blocking: never on the window thread.
+bool resume_web();
+// YouGame's own sign-in page in a browser view this launcher owns (launcher_yougame_web.h). The player
+// signs in there once; the view keeps the session in its folder, and every YouGame request goes
+// through a page of the site in that view. Windows; elsewhere web_sign_in_available() is false.
+void set_web_folder(const std::wstring& base);   // before anything else; each YouGame site gets a folder under it
+bool web_sign_in_available();
+// Blocking (call off the window thread): shows the page, returns once the site reports the player
+// signed in (true) or the window was closed (false, *error empty). test_script: hidden test runs only.
+// again: the window's title says the earlier sign-in ended. title: the window's title instead (why it opens).
+bool sign_in_web(void* owner_window, std::string* error, const std::string& test_script = {}, bool again = false,
+                 const std::wstring& title = {});
+// True once after YouGame said the saved sign-in ended (signed out on the site, or the session ran out): the
+// launcher then shows the sign-in page again. The session-change callback fires when this becomes true.
+bool take_expired();
+// A game is about to start: opens the browser view and checks its session with YouGame (off this thread),
+// so the game's first search does not wait for the view. Nothing without a web sign-in.
+void warm();
 // Called (from any thread) when the saved session changed: signed in or out, a refreshed token,
 // a connect code. The launcher saves launcher.ini then.
 void set_on_session_change(std::function<void()> callback);
 
 // The Melee Unlocked page on the YouGame site (Open YouGame).
 std::string game_page();
-// YouGame accounts live on yougame.co (staging takes them from there): its sign-up and password reset
-// pages, opened in the browser from the Connect box.
-std::string signup_page();
-std::string reset_page();
-
+// The rooms this build searches on YouGame: the base version of the build YouGame lists while it is older
+// than 0.9.990, "" for the shared key. Cached, refreshed in the background.
+std::string pool_now();
+// YouGame lists this build or a newer one (its game page was read and pool_now() is the shared key). Only then
+// does a game started app-backed (the YouGame app's account) get its searches through: the app's tickets for a
+// build YouGame does not list come back update_required. False before the page was read.
+bool listed_current();
+bool listing_known();   // YouGame's game page was read at least once (listed_current() means something)
+// What Open YouGame opens: the installed YouGame app's link (yougame-staging:// on staging), else the
+// site's download page (<site>/desktop).
+std::string open_target();
 // The bridge: started once, it answers until the launcher exits. A new launch token per game start;
 // a token stays valid while that game may still be running.
 bool start_bridge(std::string* error);
@@ -58,9 +103,17 @@ void set_build(const std::string& version, const std::wstring& exe, const std::w
 // older release than this one. The launcher reads the builds YouGame allows (blocking; call off the
 // window thread) and compares them with this installation's files. When this build is not allowed,
 // behind() names the newest allowed GitHub release; the game then offers to restart in it.
-struct Allowed { std::string version, exe_sha256, game_sha256; };
+// restart: this launcher can fetch that release and restart in it (it has YouGame, and is older than this one).
+struct Allowed { std::string version, exe_sha256, game_sha256; bool restart = true; };
 std::vector<Allowed> allowed_builds();   // empty: YouGame did not say (then nothing is offered)
 void refresh_allowed(const std::string& current_version, const std::wstring& exe, const std::wstring& game_library);
+// The version whose rooms the game searches, from YouGame's game page (its build records): the newest
+// Windows build's version while that is older than 0.9.990, else "" (every release's shared key).
+std::string pool_from_listing(const std::string& page);
+// YouGame's build records on the game page, and the native_build a ticket names (launcher_yougame.cpp).
+struct ListedBuild { std::string id, version, platform; };
+std::vector<ListedBuild> listed_builds(const std::string& page);
+std::string native_build_from_listing(const std::string& page, const std::string& version, const char* platform);
 Allowed behind();                         // version empty: this build is allowed, or nothing is known
 // The game asked to restart in the older release for a YouGame mode ("ranked" or "direct"). The
 // launcher answers "" when it will start that release once the game has closed, else why not yet.
@@ -85,10 +138,12 @@ struct Backend {
   std::function<std::string(const std::string& mode)> rank;
   std::function<std::string(const std::string& body_json)> ticket;
   std::function<Allowed()> behind;   // may be empty
+  std::function<std::string()> room_code;   // tests: the code of a held room; empty = a random one
   std::function<std::string(const std::string& mode)> restart_older;   // "" accepted, else why not
 };
 struct BridgeReply { int status = 200; std::string body; };
 // One request to the bridge: token check, then hello / mpCode / mpTicket / mpRank / mpFriend.
+std::string new_room_code();   // 12 characters, as YouGame's app names a held room
 BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& tokens, uint16_t port,
                    const Backend& backend, const std::string& build_json);
 

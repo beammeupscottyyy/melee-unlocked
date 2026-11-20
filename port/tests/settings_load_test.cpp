@@ -222,6 +222,15 @@ int main() {
   CHECK(!reloaded.vsync);
   CHECK(reloaded.mod_choices == options.mod_choices);
   CHECK(reloaded.mod_choices.at("abcdef0123456789") == 0);
+  // The automatic VSync default must not erase a player's saved choice in either direction.
+  for (bool enabled : {true, false}) {
+    options.vsync = enabled;
+    CHECK(gx::save_pc_settings(options, volume));
+    reloaded = gx::RenderOptions{};
+    reloaded.settings_path = path.string();
+    gx::load_pc_settings(reloaded, volume);
+    CHECK(reloaded.vsync == enabled);
+  }
   // The volume a player set survives a save and a restart. It came back at full volume before.
   CHECK(gx::save_pc_settings(options, 35));
   int restarted = 70;

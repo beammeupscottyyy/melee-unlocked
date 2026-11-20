@@ -249,6 +249,19 @@ bool audio_open(int volume_percent, const char* wav_dump_path, bool open) {
   return true;
 }
 
+void audio_reset_stream() {
+  const bool had_device = g_device != 0;
+  const int volume = audio_volume();
+  auto* wav = g_wav; g_wav = nullptr; // a data sink continues across a device reset
+  audio_close();
+  g_ring_write.store(0); g_ring_read.store(0); g_phase = 0;
+  g_rate = 1; g_fill_average = 0; g_skew = 0;
+  std::memset(g_ring, 0, sizeof g_ring); g_last_output[0] = g_last_output[1] = 0;
+  g_ui_sound_request.store(0);
+  if (had_device) audio_open(volume, nullptr, true);
+  g_wav = wav;
+  if (wav) g_open = true;
+}
 void audio_close() {
   if (g_device) { SDL_CloseAudioDevice(g_device); g_device = 0; }
   if (g_wav) {

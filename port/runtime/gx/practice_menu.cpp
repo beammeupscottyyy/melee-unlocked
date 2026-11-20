@@ -1,3 +1,4 @@
+#include "test_env.h"
 // The Practice menu in Training: one menu model, controller navigation, and four looks.
 //   Main Menu bars: the game's own Main Menu bars (gold rims, the yellow lit bar and its cursor
 //                   ring, grey title, description box) in the lower right of the picture.
@@ -10,7 +11,6 @@
 // glyph codes at 0x8040C680). Nothing of the game is stored here.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "user_texture.h"
-#include "test_env.h"
 #include "practice_menu.h"
 
 #include "host.h"
@@ -1558,18 +1558,19 @@ void draw_bars(ImDrawList* dl, const Frame& f, std::vector<Row>& rows, float a) 
   (void)dx; (void)dy;
 }
 
-// After an online session, back in Training: the question, centred near the top, in every look.
+// After an online session, back in Training: the question, centred near the top, in every look, in the
+// searching banner's plate (draw_notice), between the Training logo and its damage display.
 void draw_offer(ImDrawList* dl, const Frame& f) {
-  if (f.search.offer.empty()) return;
-  // Sized like the closed search bar, centred between the Training logo and its damage display.
-  const float u = (f.game_y1 - f.game_y0) / 720.0f * 0.82f;
-  const float pulse = 0.8f + 0.2f * std::sin((float)f.time * 3.0f);
-  const float w = text_width(25 * u, f.search.offer.c_str()) + 110 * u;
-  const float left = (f.game_x0 + f.game_x1 - w) * 0.5f, top = f.game_y0 + 170 * u, h = 50 * u;
-  draw_bar(dl, left, top, left + w, h, u, true, f.search.offer.c_str(), "", true, pulse, false);
-  const char* spec = "U:Search|V:Keep training";
-  const float hw = hints(dl, 0, 0, u, spec, 1.0f, false);
-  hints(dl, (f.game_x0 + f.game_x1 - hw) * 0.5f, top + h + 8 * u, u, spec, 1.0f);
+  (void)dl;
+  static double since = -1.0;
+  if (f.search.offer.empty()) { since = -1.0; return; }
+  if (since < 0.0) since = f.time;
+  Notice n;
+  n.title = f.search.offer;
+  for (char& c : n.title) c = (char)std::toupper((unsigned char)c);
+  n.keys = "U:Search|V:Keep training";
+  n.shown_ms = (uint32_t)std::max(0.0, (f.time - since) * 1000.0);
+  draw_notice(n, f.display_w, f.display_h, f.game_x0, f.game_y0, f.game_x1, f.game_y1, 0.236f);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1921,8 +1922,10 @@ void draw_warmup(ImDrawList* dl, const Frame& f) {
 // Until the menu has been opened three times (Frame::hint) it introduces itself in every look: a banner
 // near the top for the first seconds of Training, then the buttons drawn small at the top right.
 double g_hint_since = -1.0;
+double g_banner_drawn = -100.0;   // ImGui time the searching banner was last drawn (draw_search_banner)
 void draw_intro(ImDrawList* dl, const Frame& f) {
   if (!f.hint) { g_hint_since = -1.0; return; }
+  if (f.time - g_banner_drawn < 0.5) return;   // the searching banner holds the top of the screen
   if (f.warmup.active && f.warmup.in_small_window) return;   // Training as the room's small window
   // The search-again question comes first; the introduction starts once it is answered.
   if (g_hint_since < 0.0 || !f.search.offer.empty()) g_hint_since = f.time;
@@ -2613,6 +2616,365 @@ Result frame(int style, const Frame& f) {
     default: draw_bars(dl, f, rows, a); break;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Play while searching (practice_menu.h SearchBanner, KeepAsk): the banner in its two looks and the
+// question on the select, in the game's font.
+namespace {
+
+float clamp01(float t) { return std::clamp(t, 0.0f, 1.0f); }
+float smooth01(float t) { t = clamp01(t); return t * t * (3.0f - 2.0f * t); }
+float ease_in3(float t) { t = clamp01(t); return t * t * t; }
+std::string clock_text(uint32_t ms) {
+  const uint32_t s = ms / 1000;
+  char out[24];
+  std::snprintf(out, sizeof out, "%u:%02u", s / 60, s % 60);
+  return out;
+}
+
+constexpr ImU32 kWhite = IM_COL32(255, 255, 255, 255);
+
+ImU32 mix(ImU32 a, ImU32 b, float t) {
+  t = clamp01(t);
+  const auto ch = [&](int s) { return (int)(((a >> s) & 0xFF) * (1 - t) + ((b >> s) & 0xFF) * t); };
+  return IM_COL32(ch(IM_COL32_R_SHIFT), ch(IM_COL32_G_SHIFT), ch(IM_COL32_B_SHIFT), ch(IM_COL32_A_SHIFT));
+}
+// Text whose capitals are centred on cy.
+void text_mid(ImDrawList* dl, float x, float cy, float px, ImU32 col, const std::string& s, float skew = 0.0f, bool shadow = true) {
+  text(dl, x, text_y_centered(cy, px), px, col, s.c_str(), skew, shadow);
+}
+// The L+R hold's thin bar along an edge.
+void hold_bar(ImDrawList* dl, float x0, float x1, float y, float u, float hold, float a) {
+  if (hold <= 0.0f) return;
+  dl->AddRectFilled(ImVec2(x0, y), ImVec2(x1, y + 3 * u), with_alpha(IM_COL32(255, 255, 255, 50), a), 1.5f * u);
+  dl->AddRectFilled(ImVec2(x0, y), ImVec2(x0 + (x1 - x0) * clamp01(hold), y + 3 * u), with_alpha(kYellowBottom, a), 1.5f * u);
+}
+
+struct Geo {
+  float dw, dh, x0, y0, x1, y1, w, h, u;
+  float bar;           // the black bar left of the picture (0 none)
+  bool bars;           // wide enough to hold a card
+};
+Geo geo_of(float dw, float dh, float x0, float y0, float x1, float y1) {
+  Geo g{dw, dh, x0, y0, x1, y1, x1 - x0, y1 - y0, (y1 - y0) / 720.0f, x0, false};
+  g.bars = g.bar >= 120.0f * g.u * 0.66f && g.bar >= 90.0f;
+  return g;
+}
+
+// Where the side cards go: in the black bar left of the picture, else over the picture's left edge.
+struct Side { float x0, x1, k; bool in_bar; };
+Side side_of(const Geo& g, float want) {
+  Side s;
+  s.in_bar = g.bars;
+  if (s.in_bar) { s.x0 = 16.0f; s.x1 = std::min(g.bar - 16.0f, 16.0f + want * g.u); }
+  else { s.x0 = g.x0 + 10 * g.u; s.x1 = s.x0 + want * g.u * 0.8f; }
+  s.k = (s.x1 - s.x0) / (want * g.u) * g.u;
+  return s;
+}
+
+// The banner's words: SEARCHING YOUGAME SQUAD STRIKE 0:42, or OPPONENT FOUND.
+std::string banner_mode(const SearchBanner& b) {
+  std::string s = b.service.empty() ? std::string() : b.service + " ";
+  return caps(s + (b.mode.empty() ? std::string("Unranked") : b.mode));
+}
+
+// The top of the banner as a fraction of the picture's height, by screen: up at the top edge, clear of
+// what each screen draws there (the match timer, Training's logo, the menus' titles).
+float banner_top(const SearchBanner& b) {
+  (void)b;
+  return 0.014f;
+}
+
+// Where a banner `h` tall rests: in the black bar above the picture when the window has one tall enough
+// (a narrow window), so it covers nothing of the game; else at the top of the picture (banner_top).
+float rest_top(const Geo& g, const SearchBanner& b, float h) {
+  if (g.y0 >= h + 8.0f * g.u) return std::floor((g.y0 - h) * 0.5f);
+  return std::floor(g.y0 + g.h * banner_top(b));
+}
+
+// How far in it is: slides down from above, slides back up when it goes.
+float banner_in(const SearchBanner& b) { return ease((float)b.shown_ms / 380.0f) * (1.0f - ease_in3(b.leave)); }
+
+float run_with_timer(ImDrawList* dl, float cx, float cy, float px, ImU32 col, const std::string& before, const std::string& timer,
+                     const std::string& after, bool draw, bool shadow);
+
+// 1: orange letters with a dark brown edge, as the TRAINING MODE logo is lettered, centred at the top of
+// the picture, the timer in its fixed slot. Green OPPONENT FOUND when an opponent is found.
+void look_letters(ImDrawList* dl, const Geo& g, const SearchBanner& b) {
+  const bool found = b.stage == 2;
+  const std::string before = found ? std::string("OPPONENT FOUND") : "SEARCHING " + banner_mode(b) + "  ";
+  const std::string timer = found ? std::string() : clock_text(b.elapsed_ms);
+  const float room = std::min(g.w, g.dw) - 24.0f * g.u;
+  float px = g.h * 0.033f;
+  const float w0 = run_with_timer(dl, 0, 0, px, 0, before, timer, "", false, false);
+  if (w0 > room) px *= room / w0;
+  const float rest = rest_top(g, b, px);
+  const float in = banner_in(b);
+  const float top = rest - (rest + px * 1.3f) * (1.0f - in);   // from above the window's edge
+  const float cy = top + px * 0.5f, cx = (g.x0 + g.x1) * 0.5f;
+  const float a = clamp01(in * 1.4f);
+  // The edge: the letters drawn round them in dark brown, then a hard drop under them.
+  const ImU32 edge = with_alpha(IM_COL32(70, 20, 0, 255), a);
+  const float o = std::max(1.5f, px * 0.075f);
+  for (int i = 0; i < 12; ++i) {
+    const float t = (float)i * IM_PI / 6.0f;
+    run_with_timer(dl, cx + o * std::cos(t), cy + o * std::sin(t), px, edge, before, timer, "", true, false);
+  }
+  run_with_timer(dl, cx + o * 0.4f, cy + o * 1.6f, px, edge, before, timer, "", true, false);
+  // The face, light at the top and deeper at the foot, as the logo's.
+  const int v0 = dl->VtxBuffer.Size;
+  run_with_timer(dl, cx, cy, px, with_alpha(IM_COL32(255, 255, 255, 255), a), before, timer, "", true, false);
+  const ImU32 hi = found ? IM_COL32(150, 255, 170, 255) : IM_COL32(255, 206, 80, 255);
+  const ImU32 lo = found ? IM_COL32(50, 200, 100, 255) : IM_COL32(245, 140, 20, 255);
+  ImGui::ShadeVertsLinearColorGradientKeepAlpha(dl, v0, dl->VtxBuffer.Size, ImVec2(0, cy - px * 0.35f), ImVec2(0, cy + px * 0.35f),
+                                                with_alpha(hi, a), with_alpha(lo, a));
+  if (b.hold > 0.0f) hold_bar(dl, cx - w0 * 0.3f, cx + w0 * 0.3f, cy + px * 0.6f, g.u, b.hold, a);
+}
+
+// The timer in fixed cells (every digit as wide as the widest, the colon its own), so the words beside
+// it never move as the seconds tick, and a slot as wide as 00:00 so the pill keeps its width past
+// ten minutes. Drawn right-aligned against `right`; returns the slot's width.
+float tabular_cell(float px) {
+  float cell = 0.0f;
+  for (char c = '0'; c <= '9'; ++c) { const char d[2] = {c, 0}; cell = std::max(cell, text_width(px, d)); }
+  return cell;
+}
+float tabular_slot(float px) { return 4.0f * tabular_cell(px) + text_width(px, ":"); }
+void tabular_text(ImDrawList* dl, float right, float cy, float px, ImU32 col, const std::string& s) {
+  const float cell = tabular_cell(px), colon = text_width(px, ":");
+  float w = 0.0f;
+  for (char c : s) w += c == ':' ? colon : cell;
+  float x = right - w;
+  for (char c : s) {
+    const char one[2] = {c, 0};
+    const float cw = c == ':' ? colon : cell;
+    text(dl, x + (cw - text_width(px, one)) * 0.5f, text_y_centered(cy, px), px, col, one, 0.0f, true);
+    x += cw;
+  }
+}
+
+// 0 (the default): a slim dark pill centred at the top of the picture: a gold dot that breathes on its
+// fixed centre, the words, and the timer in a fixed slot. One centre line for all three (the capitals'
+// own ink, text_y_centered); the edge to the dot equals the timer to the edge, and the dot to the words
+// equals the words to the slot. Found: the rim and dot turn green, OPPONENT FOUND, the countdown in the
+// slot.
+void look_pill(ImDrawList* dl, const Geo& g, const SearchBanner& b) {
+  const bool found = b.stage == 2;
+  const std::string words = found ? std::string("OPPONENT FOUND") : banner_mode(b) + "  SEARCHING";
+  const std::string search_words = banner_mode(b) + "  SEARCHING";
+  const std::string slot_text = found ? (b.countdown_ms > 0 ? std::to_string((b.countdown_ms + 999) / 1000) : std::string())
+                                      : clock_text(b.elapsed_ms);
+  float h = g.h * 0.042f, px = h * 0.55f;
+  // Laid out in units of h: pad | dot | gap | words | gap | slot | pad.
+  const auto layout_w = [&](float hh, float pp) {
+    const float pad = hh * 0.42f, dot = hh * 0.36f, gap = hh * 0.40f;
+    // The pill is as wide as the search's own words need, found or not, so it never jumps.
+    const float ww = std::max(text_width(pp, search_words.c_str()), text_width(pp, "OPPONENT FOUND"));
+    return pad + dot + gap + ww + gap + tabular_slot(pp) + pad;
+  };
+  const float room = std::min(g.w, g.dw) - 16.0f * g.u;
+  if (layout_w(h, px) > room) { const float k = room / layout_w(h, px); h *= k; px *= k; }   // smaller, never cut
+  const float pad = h * 0.42f, dot = h * 0.36f, gap = h * 0.40f, w = layout_w(h, px);
+  const float rest = rest_top(g, b, h);
+  const float in = banner_in(b);
+  const float y0 = std::floor(rest - (rest + h + 4.0f) * (1.0f - in));
+  const float cx = (g.x0 + g.x1) * 0.5f;
+  const float x0 = std::floor(std::clamp(cx - w * 0.5f, 2.0f, std::max(2.0f, g.dw - w - 2.0f))), x1 = x0 + w;
+  const float cy = y0 + h * 0.5f, a = clamp01(in * 1.4f);
+  dl->AddRectFilled(ImVec2(x0 + 1.5f * g.u, y0 + 2.0f * g.u), ImVec2(x1 + 1.5f * g.u, y0 + h + 2.0f * g.u), with_alpha(IM_COL32(0, 0, 0, 90), a), h * 0.5f);
+  dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y0 + h), with_alpha(IM_COL32(16, 18, 34, 215), a), h * 0.5f);
+  const float f = found ? smooth01((float)b.found_ms / 250.0f) : 0.0f;
+  dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y0 + h), with_alpha(mix(IM_COL32(90, 100, 150, 255), IM_COL32(70, 220, 120, 255), f), a), h * 0.5f, 0,
+              std::max(1.0f, 1.4f * g.u));
+  // The dot: its centre never moves; only its glow breathes.
+  const float pulse = 0.5f + 0.5f * std::sin((float)b.clock_ms * 0.0063f);
+  const ImU32 dot_col = mix(IM_COL32(255, 206, 30, 255), IM_COL32(70, 220, 120, 255), f);
+  const ImVec2 dc(x0 + pad + dot * 0.5f, cy);
+  dl->AddCircleFilled(dc, dot * (0.62f + 0.18f * (found ? 1.0f : pulse)), with_alpha((dot_col & ~IM_COL32_A_MASK) | IM_COL32(0, 0, 0, 70), a), 20);
+  dl->AddCircleFilled(dc, dot * 0.42f, with_alpha(dot_col, a), 18);
+  text(dl, x0 + pad + dot + gap, text_y_centered(cy, px), px, with_alpha(kWhite, a), words.c_str(), 0.0f, true);
+  if (!slot_text.empty()) tabular_text(dl, x1 - pad, cy, px, with_alpha(kWhite, a), slot_text);
+  if (b.hold > 0.0f) hold_bar(dl, x0 + h * 0.5f, x1 - h * 0.5f, y0 + h + 2.0f * g.u, g.u, b.hold, a);
+}
+
+// Words, then the timer in its fixed slot, then more words, as one centred run on `cy`: returns the
+// run's width (draw false only measures). The slot's empty cells sit before the digits, inside it.
+float run_with_timer(ImDrawList* dl, float cx, float cy, float px, ImU32 col, const std::string& before, const std::string& timer,
+                     const std::string& after, bool draw, bool shadow) {
+  const float slot = timer.empty() ? 0.0f : tabular_slot(px);
+  const float wb = text_width(px, before.c_str()), wa = text_width(px, after.c_str());
+  const float w = wb + slot + wa;
+  if (!draw) return w;
+  float x = cx - w * 0.5f;
+  text(dl, x, text_y_centered(cy, px), px, col, before.c_str(), 0.0f, shadow);
+  x += wb;
+  if (!timer.empty()) { tabular_text(dl, x + slot, cy, px, col, timer); x += slot; }
+  text(dl, x, text_y_centered(cy, px), px, col, after.c_str(), 0.0f, shadow);
+  return w;
+}
+
+// 2: a thin dark strip the whole width of the picture at its very top, a gold line under it (green when
+// found), the words centred. While away there is no button that stops the search outright (L and R held
+// go back to it), so no cancel button is named.
+void look_ticker(ImDrawList* dl, const Geo& g, const SearchBanner& b) {
+  const bool found = b.stage == 2;
+  float h = std::floor(g.h * 0.034f), px = h * 0.62f;
+  const std::string before = found ? std::string("OPPONENT FOUND") : banner_mode(b) + "  |  SEARCHING  ";
+  const std::string timer = found ? std::string() : clock_text(b.elapsed_ms);
+  const std::string after = found ? (b.countdown_ms > 0 ? "  |  MATCH IN " + std::to_string((b.countdown_ms + 999) / 1000) : std::string()) : std::string();
+  const float room = std::min(g.w, g.dw) - 20.0f * g.u;
+  const float w = run_with_timer(dl, 0, 0, px, 0, before, timer, after, false, false);
+  if (w > room) px *= room / w;
+  const float in = banner_in(b);
+  const float rest = g.y0 >= h + 8.0f * g.u ? std::floor(g.y0 - h - 4.0f * g.u) : g.y0;
+  const float y0 = std::floor(rest - (rest + h + 3.0f) * (1.0f - in)), a = clamp01(in * 1.4f);
+  const float x0 = std::max(0.0f, g.x0), x1 = std::min(g.dw, g.x1);
+  dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y0 + h), with_alpha(IM_COL32(10, 10, 22, 200), a));
+  const float f = found ? smooth01((float)b.found_ms / 250.0f) : 0.0f;
+  dl->AddRectFilled(ImVec2(x0, y0 + h), ImVec2(x1, y0 + h + std::max(1.0f, 1.4f * g.u)),
+                    with_alpha(mix(IM_COL32(255, 206, 30, 255), IM_COL32(70, 220, 120, 255), f), a));
+  run_with_timer(dl, (g.x0 + g.x1) * 0.5f, y0 + h * 0.5f, px, with_alpha(kWhite, a), before, timer, after, true, true);
+  if (b.hold > 0.0f) hold_bar(dl, x0 + g.w * 0.3f, x1 - g.w * 0.3f, y0 + h + 3.0f * g.u, g.u, b.hold, a);
+}
+
+// 3: a slanted red ribbon at the top centre, as the game's own "Ready to fight" lettering sits on one:
+// a dark red edge, a light line along its top, white words with a dark red edge. Found: a gold ribbon,
+// OPPONENT FOUND!. Comes in from the left.
+void look_ribbon(ImDrawList* dl, const Geo& g, const SearchBanner& b) {
+  const bool found = b.stage == 2;
+  float h = std::floor(g.h * 0.042f), px = h * 0.6f;   // as low as the pill: clear of the select's header and the match timer
+  const std::string before = found ? std::string("OPPONENT FOUND!") : "SEARCHING " + banner_mode(b) + "  ";
+  const std::string timer = found ? std::string() : clock_text(b.elapsed_ms);
+  const float room = std::min(g.w, g.dw) - 16.0f * g.u;
+  float tw = run_with_timer(dl, 0, 0, px, 0, before, timer, "", false, false);
+  float w = tw + h * 2.2f;
+  if (w > room) { const float k = room / w; h *= k; px *= k; tw *= k; w = room; }
+  const float slant = h * 0.5f, in = banner_in(b), a = clamp01(in * 1.6f);
+  const float cx = (g.x0 + g.x1) * 0.5f - (1.0f - in) * ((g.x0 + g.x1) * 0.5f + w * 0.5f);
+  const float x0 = cx - w * 0.5f, x1 = x0 + w, y0 = rest_top(g, b, h), y1 = y0 + h;
+  const ImVec2 q[4] = {ImVec2(x0 + slant, y0), ImVec2(x1, y0), ImVec2(x1 - slant, y1), ImVec2(x0, y1)};
+  const float f = found ? smooth01((float)b.found_ms / 250.0f) : 0.0f;
+  dl->AddQuadFilled(ImVec2(q[0].x + 2 * g.u, q[0].y + 3 * g.u), ImVec2(q[1].x + 2 * g.u, q[1].y + 3 * g.u), ImVec2(q[2].x + 2 * g.u, q[2].y + 3 * g.u),
+                    ImVec2(q[3].x + 2 * g.u, q[3].y + 3 * g.u), with_alpha(IM_COL32(0, 0, 0, 110), a));
+  dl->AddQuadFilled(q[0], q[1], q[2], q[3], with_alpha(mix(IM_COL32(214, 36, 52, 255), IM_COL32(240, 200, 40, 255), f), a));
+  dl->AddLine(ImVec2(x0 + slant + h * 0.12f, y0 + h * 0.2f), ImVec2(x1 - h * 0.2f, y0 + h * 0.2f), with_alpha(IM_COL32(255, 255, 255, 90), a), std::max(1.0f, 1.4f * g.u));
+  dl->AddQuad(q[0], q[1], q[2], q[3], with_alpha(IM_COL32(80, 0, 0, 255), a), std::max(1.0f, 1.6f * g.u));
+  // The words with a dark red edge (drawn round them), then white.
+  const float cy = (y0 + y1) * 0.5f, o = std::max(1.0f, px * 0.06f);
+  const ImU32 edge = with_alpha(found ? IM_COL32(110, 60, 0, 255) : IM_COL32(60, 0, 0, 255), a);
+  for (int i = 0; i < 8; ++i) {
+    const float t = (float)i * IM_PI / 4.0f;
+    run_with_timer(dl, cx + o * std::cos(t), cy + o * std::sin(t), px, edge, before, timer, "", true, false);
+  }
+  run_with_timer(dl, cx, cy, px, with_alpha(kWhite, a), before, timer, "", true, false);
+  if (b.hold > 0.0f) hold_bar(dl, x0 + slant, x1 - slant, y1 + 3.0f * g.u, g.u, b.hold, a);
+}
+
+// A notice in the banner's look: a dark rounded plate with a thin rim, its title and an optional line
+// under it centred, then the buttons (hints) centred, even padding all round. Drops in from above.
+void notice_plate(ImDrawList* dl, const Geo& g, const Notice& n, float top_frac) {
+  const float in = ease((float)n.shown_ms / 300.0f), a = clamp01(in * 1.4f);
+  const float lh = g.h * 0.042f;                 // the banner's height: one line of the plate
+  float tpx = lh * 0.55f, dpx = lh * 0.46f, hu = lh * 0.027f;
+  const float pad = lh * 0.42f;
+  float tw = text_width(tpx, n.title.c_str()), dw = n.detail.empty() ? 0.0f : text_width(dpx, n.detail.c_str());
+  float kw = n.keys.empty() ? 0.0f : hints(dl, 0, 0, hu, n.keys.c_str(), 1.0f, false);
+  const float room = std::min(g.w, g.dw) - 24.0f * g.u - 2 * pad;
+  const float widest = std::max({tw, dw, kw});
+  if (widest > room) { const float k = room / widest; tpx *= k; dpx *= k; hu *= k; tw *= k; dw *= k; kw *= k; }
+  const float rows = 1.0f + (n.detail.empty() ? 0.0f : 0.85f) + (n.keys.empty() ? 0.0f : 1.0f);
+  const float w = std::max({tw, dw, kw}) + 2 * pad + lh * 0.6f, h = rows * lh + pad;
+  const float cx = (g.x0 + g.x1) * 0.5f, rest = g.y0 + g.h * top_frac;
+  const float y0 = std::floor(rest - (1.0f - in) * lh * 1.2f), x0 = std::floor(cx - w * 0.5f), x1 = x0 + w;
+  const float r = lh * 0.5f;
+  dl->AddRectFilled(ImVec2(x0 + 1.5f * g.u, y0 + 2.0f * g.u), ImVec2(x1 + 1.5f * g.u, y0 + h + 2.0f * g.u), with_alpha(IM_COL32(0, 0, 0, 90), a), r);
+  dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y0 + h), with_alpha(IM_COL32(16, 18, 34, 225), a), r);
+  dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y0 + h), with_alpha(n.alert ? IM_COL32(214, 70, 80, 255) : IM_COL32(90, 100, 150, 255), a), r, 0,
+              std::max(1.0f, 1.4f * g.u));
+  float cy = y0 + pad * 0.5f + lh * 0.5f;
+  text(dl, cx - tw * 0.5f, text_y_centered(cy, tpx), tpx, with_alpha(kWhite, a), n.title.c_str(), 0.0f, true);
+  if (!n.detail.empty()) {
+    cy += lh * 0.85f;
+    text(dl, cx - dw * 0.5f, text_y_centered(cy, dpx), dpx, with_alpha(IM_COL32(190, 196, 214, 255), a), n.detail.c_str(), 0.0f, true);
+  }
+  if (!n.keys.empty()) {
+    cy += lh * (n.detail.empty() ? 1.0f : 0.95f);
+    hints(dl, cx - kw * 0.5f, cy, hu, n.keys.c_str(), a);
+  }
+}
+
+}  // namespace
+
+const char* search_banner_name(int look) {
+  switch (look) { case 1: return "Orange letters"; case 2: return "Ticker strip"; case 3: return "Red ribbon"; default: return "Slim pill"; }
+}
+
+void draw_search_banner(const SearchBanner& b, float dw, float dh, float x0, float y0, float x1, float y1) {
+  if (b.stage == 0 || x1 <= x0 || y1 <= y0) return;
+  if (!font_ready()) return;
+  ImDrawList* dl = ImGui::GetBackgroundDrawList();
+  const Geo g = geo_of(dw, dh, x0, y0, x1, y1);
+  if (banner_in(b) <= 0.001f) return;
+  g_banner_drawn = ImGui::GetTime();
+  switch (b.look) {
+    case 1: look_letters(dl, g, b); break;
+    case 2: look_ticker(dl, g, b); break;
+    case 3: look_ribbon(dl, g, b); break;
+    default: look_pill(dl, g, b); break;
+  }
+}
+
+void draw_notice(const Notice& n, float dw, float dh, float x0, float y0, float x1, float y1, float top_frac) {
+  if (x1 <= x0 || y1 <= y0 || !font_ready()) return;
+  notice_plate(ImGui::GetBackgroundDrawList(), geo_of(dw, dh, x0, y0, x1, y1), n, top_frac);
+}
+
+void draw_keep_ask(const KeepAsk& k, float dw, float dh, float x0, float y0, float x1, float y1) {
+  (void)dh;
+  if (x1 <= x0 || y1 <= y0 || !font_ready()) return;
+  ImDrawList* dl = ImGui::GetBackgroundDrawList();
+  const Geo g = geo_of(dw, dh, x0, y0, x1, y1);
+  const float u = g.u;
+  const float in = ease((float)k.shown_ms / 260.0f);
+  if (k.look == 1) {
+    // Asked as the player starts to leave while searching: the banner's plate over the select.
+    if (!k.asking) return;
+    Notice n;
+    n.title = "KEEP SEARCHING WHILE YOU PLAY?";
+    n.detail = "HOLD L AND R ANYWHERE TO GO BACK TO IT";
+    n.keys = "A:Yes, keep my place|B:No, stop searching";
+    n.shown_ms = k.shown_ms;
+    notice_plate(dl, g, n, 0.40f);
+    return;
+  }
+  if (k.look == 2) {
+    // A card in the left bar where WARM UP stands between games: the two ways to play while the search
+    // goes on.
+    const Side s = side_of(g, 150);
+    const float kk = s.k, x0c = s.x0 - (1.0f - in) * (s.x1 + 20 * kk), x1c = s.x1 - (1.0f - in) * (s.x1 + 20 * kk);
+    const float top = g.y0 + g.h * 0.42f, h = 88 * kk;
+    warm_box(dl, x0c, top, x1c, top + h, kk, 1.0f);
+    const float cx = (x0c + x1c) * 0.5f;
+    const char* title = "PLAY WHILE SEARCHING";
+    text_mid(dl, cx - text_width(11 * kk, title) * 0.5f, top + 16 * kk, 11 * kk, kGoldText, title);
+    dl->AddLine(ImVec2(x0c + 12 * kk, top + 28 * kk), ImVec2(x1c - 12 * kk, top + 28 * kk), with_alpha(kGold, 0.35f), std::max(1.0f, kk));
+    const float r1 = top + 44 * kk, r2 = top + 68 * kk, gu = 0.62f * kk;
+    lr_hold(dl, cx, r1, gu, "WARM UP", 10.5f * kk, kWhite, 1.0f);
+    const char* spec = "X:Leave, keep my place";
+    const float hw = hints(dl, 0, 0, 0.62f * kk, spec, 1, false);
+    hints(dl, cx - hw * 0.5f, r2, 0.62f * kk, spec, 1.0f);
+    if (k.hold > 0) hold_bar(dl, x0c + 10 * kk, x1c - 10 * kk, top + h - 6 * kk, kk, k.hold, 1.0f);
+    return;
+  }
+  // 3: one line in the select's own words under its search text, at the top left of the picture.
+  const float px = 13 * u;
+  const char* spec = "L:+|R:Warm up|B:Leave, keep my place";
+  const float hw = hints(dl, 0, 0, 0.7f * u, spec, 1, false);
+  const float x = g.x0 + 30 * u, cy = g.y0 + g.h * 0.205f;
+  dl->AddRectFilled(ImVec2(x - 8 * u, cy - 12 * u), ImVec2(x + hw + 8 * u, cy + 12 * u), with_alpha(IM_COL32(0, 0, 0, 150), in), 12 * u);
+  hints(dl, x, cy, 0.7f * u, spec, in);
+  (void)px;
 }
 
 }  // namespace practice_menu

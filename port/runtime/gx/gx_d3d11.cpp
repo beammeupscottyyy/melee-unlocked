@@ -16,6 +16,8 @@
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_paths.h"
 #endif
+#include "yougame_box_present.h"
+#include "yougame_link.h"
 #include <windows.h>
 #include "gx_cache_prune.h"
 #include <d3d11_1.h>
@@ -23,6 +25,7 @@
 #include "dxgi_paced_mode.h"
 #include "fullscreen_state.h"
 #include "vrr_detect.h"
+#include "pacing_diagnostics_win.h"
 #include "vblank_clock.h"
 #include "gx_adapter.h"
 #include <d3dcompiler.h>
@@ -295,6 +298,20 @@ class D3D11Backend : public Backend {
     if (context_) context_->ClearState();
     if (present_timer_) CloseHandle(present_timer_);
   }
+  bool supports_game_reset() const override { return true; }
+  void reset_game_state() override {
+    context_->ClearState();
+    D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT, 0};
+    ComPtr<ID3D11Query> idle;
+    if (FAILED(device_->CreateQuery(&desc, &idle))) host::die("d3d11: reset fence failed");
+    context_->End(idle.Get()); context_->Flush();
+    while (context_->GetData(idle.Get(), nullptr, 0, 0) == S_FALSE) Sleep(0);
+    textures_.clear(); efb_copies_.clear();
+    for (auto& t : video_textures_) t = {};
+    std::fill(std::begin(video_serial_), std::end(video_serial_), 0);
+    create_efb();
+    plan_cache_valid_ = false; plans_.clear(); ps_cache_.clear(); reset_bound();
+  }
   const RenderOptions& options() const { return opts_; }
   const RenderOptions* presentation_options() const override { return &opts_; }
   void presentation_stats(uint32_t* frames, uint32_t* pipelines, uint32_t* textures) const override {
@@ -565,9 +582,11 @@ class D3D11Backend : public Backend {
   void reset_bound() { bound_ = Bound{}; }
 
   HANDLE present_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* high resolution */, TIMER_ALL_ACCESS);
+  bool flip_model_ = false;
   double present_deadline_ = 0, present_wait_ = 0;
   bool have_frame_stats_ = false;
   DXGI_FRAME_STATISTICS last_frame_stats_{};
+  pacing_diag::WindowsRecorder pacing_diagnostics_;
   void update_variable_refresh();
   vrr::Detector vrr_;
   bool tear_free_ = false, vrr_readable_ = false, vblank_tracked_ = false;
@@ -675,11 +694,14 @@ void D3D11Backend::init() {
   // to match the window, so the desktop resolution became whatever "Window size" was set to.
   // Without it exclusive fullscreen keeps the desktop's own mode and refresh rate.
   sd.Flags = allow_tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-  if (FAILED(factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &sd, nullptr, nullptr, &swapchain_))) {
+  const HRESULT swapchain_hr = factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &sd, nullptr, nullptr, &swapchain_);
+  if (FAILED(swapchain_hr)) {
+    if (yougame::embed_toplevel()) require(swapchain_hr, "toplevel flip swapchain");
     // Pre-Windows-10 runtimes have no flip-discard: fall back to the blit model.
     sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; sd.BufferCount = 1; sd.Flags = 0; allow_tearing_ = false;
     require(factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &sd, nullptr, nullptr, &swapchain_), "swapchain");
   }
+  flip_model_ = sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
   factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
   // With V-Sync on, the default lets three finished frames wait in line for the display. After a
   // stall the game runs slightly fast to catch up and that line filled, and it stayed filled:
@@ -698,7 +720,8 @@ void D3D11Backend::init() {
   shader_cache_root_ = opts_.shader_cache;
   opts_.shader_cache += "/" GX_SHADER_CACHE_VERSION;
   CreateDirectoryA(opts_.shader_cache.c_str(), nullptr);
-  if (const unsigned long long freed = gx::prune_old_shader_caches(shader_cache_root_, GX_SHADER_CACHE_VERSION))
+  if (const unsigned long long freed =
+          opts_.shader_cache_shared ? 0 : gx::prune_old_shader_caches(shader_cache_root_, GX_SHADER_CACHE_VERSION))
     host::log("shaders: removed the shader caches of earlier builds (%.0f MB)", freed / 1048576.0);
 
   if (!vertex_buffer_.init(device_.Get(), context_.Get(), 8 << 20, D3D11_BIND_VERTEX_BUFFER)) host::die("D3D11: vertex buffer");
@@ -871,6 +894,9 @@ void D3D11Backend::create_swapchain_targets(bool resize) {
 }
 
 void D3D11Backend::apply_fullscreen_mode() {
+  // Every embedded window, child or toplevel: a settings change (Internal resolution) used to reach
+  // ResizeTarget/SetFullscreenState here in child embeds and leave the picture monitor-sized and cropped.
+  if (yougame::embedded()) opts_.exclusive_fullscreen = false;
   if (!swapchain_) return;
   BOOL was_exclusive = FALSE;
   swapchain_->GetFullscreenState(&was_exclusive, nullptr);
@@ -2121,17 +2147,20 @@ void D3D11Backend::gpu_frame_end() {
 // See Backend::variable_refresh and vrr_detect.h. Called every 32 presents; a window is a second.
 void D3D11Backend::update_variable_refresh() {
   DXGI_FRAME_STATISTICS st{};
-  vrr_readable_ = swapchain_ && SUCCEEDED(swapchain_->GetFrameStatistics(&st));
+  HRESULT diagnostic_statistics_result = E_FAIL;
+  vrr_readable_ = swapchain_ && SUCCEEDED(diagnostic_statistics_result = swapchain_->GetFrameStatistics(&st));
+  pacing_diagnostics_.statistics(diagnostic_statistics_result, st);
   if (!vrr_readable_) { vrr_.restart(); return; }
   static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
   if (!vrr_.add({st.PresentCount, st.SyncRefreshCount, (double)st.SyncQPCTime.QuadPart / qpc_hz}, vrr_nominal_hz_)) return;
   if (vrr_.state() == 1)
     host::log("display: variable refresh (G-Sync or FreeSync) is on: %.0f refreshes a second for %.0f frames on a %.0f Hz "
-              "display; frames are presented synced under %.0f a second", vrr_.refreshes(), vrr_.shown(),
+              "display; frame cap below %.0f fps, V-Sync follows the player's setting", vrr_.refreshes(), vrr_.shown(),
               vrr_nominal_hz_, vrr::under_refresh(vrr_nominal_hz_));
   else
     host::log("display: fixed refresh: %.0f refreshes a second for %.0f frames on a %.0f Hz display", vrr_.refreshes(),
               vrr_.shown(), vrr_nominal_hz_);
+  RenderOptions::live_variable_refresh().store(vrr_.state(), std::memory_order_relaxed);   // the automatic V-Sync reads it
 }
 
 // Submitted frames the GPU has not finished: the end-of-frame events still outstanding. D3D11 has
@@ -2519,31 +2548,43 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
     }
     }
     present_wait_ = Stopwatch::now() - wait_start;
-    // Synced with V-Sync on, and on a display that follows the frames (tear_free_, from the
-    // presentation loop), where a frame starts its own refresh and syncing costs nothing.
+    // Sync by the player's choice or the explicit scanline-sync diagnostic. VRR detection
+    // controls the cap; it must leave the interval-0/ALLOW_TEARING path available with V-Sync off.
     const bool synced = opts_.vsync || tear_free_;
+    // Keep the existing deadline timer, simulation-locked path and DXGI queue limit.
+    // A subframe without a timer deadline may rely on Reflex/vblank pacing: keep interval 1.
+    const bool paced = (present_deadline_ > 0 || opts_.subframe == SubFrameMode::Off ||
+                        !subframe_useful(opts_.fps_cap));
+    const auto present = yougame::box_present::choose(yougame::embedded(), opts_.vsync,
+        host::window_is_fullscreen() || fullscreen_state_.exclusive_active,
+        yougame::box_present::agent_override(), flip_model_, paced, allow_tearing_ && !fullscreen_state_.exclusive_active, synced, yougame::embed_toplevel());
+    if (const auto line = yougame::box_present::announcement(present)) host::log("%s", line);
     const double present_call = Stopwatch::now();
-    // While hidden, only test whether the window can be seen again (see gx_d3d12.cpp).
+    // Hidden standalone windows use DXGI's occlusion probe; the embed must keep drawing
+    // because its loading cover is released only after the first real frame.
+    const bool test_only = occluded_ && !yougame::embedded();
     const HRESULT present_result = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait);
-        return occluded_ ? swapchain_->Present(0, DXGI_PRESENT_TEST)
-            : swapchain_->Present(synced ? 1 : 0, (!synced && allow_tearing_ && !fullscreen_state_.exclusive_active) ? DXGI_PRESENT_ALLOW_TEARING : 0); }();
+        if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);
+        return swapchain_->Present(present.interval, present.flags); }();
     if ((present_result == DXGI_STATUS_OCCLUDED) != occluded_) {
       occluded_ = present_result == DXGI_STATUS_OCCLUDED;
       host::log(occluded_ ? "d3d11: window hidden, presents paused" : "d3d11: window visible, presents resumed");
     }
-    // Ready = the game drew its first real frame, visible or not: the YouGame page hides the window
-    // under its loading cover until ready, and a hidden window's Present returns DXGI_STATUS_OCCLUDED
-    // (a success code). Only read in a YouGame app session.
-    yougame::parity::signals.presented(SUCCEEDED(present_result) && frame.test_fill < 0);
+    // Ready includes a real hidden Present (DXGI_STATUS_OCCLUDED), but never a probe.
+    yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);
+    if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();
     // A synced Present blocks until the display takes the previous frame: waiting, not drawing.
     // Counted as drawing it inflated the render-time estimate to a whole refresh under synced
     // pacing, and the presentation loop then aimed every frame one refresh too late.
     present_wait_ += Stopwatch::now() - present_call;
+    if (!test_only) pacing_diagnostics_.present(present_call, opts_.vsync,
+        present.interval, present.flags, opts_.fps_cap, fullscreen_state_.exclusive_active);
     ++frames_presented_;
     if ((frames_presented_ & 31) == 0) update_variable_refresh();
     if (capture) { capture_sequence_ = frame.sequence; write_capture(path, frame.sequence); }
   }
   gpu_frame_end();
+  pacing_diagnostics_.poll(swapchain_.Get(), hwnd_);
 }
 
 // ---------------------------------------------------------------- pipeline prewarm

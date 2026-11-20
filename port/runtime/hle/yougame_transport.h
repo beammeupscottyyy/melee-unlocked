@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "yougame_ranked.h"
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <condition_variable>
@@ -47,6 +48,19 @@ inline DatagramRoute posix_datagram_route(const json& hello) {
   return integer_is(*n, "version", 1) && direct != n->end() && direct->is_object() &&
          integer_is(*direct, "version", 1) && integer_is(*direct, "maxDatagram", 1200)
       ? DatagramRoute::Ring : DatagramRoute::Refuse;
+}
+// A seat whose game has no YouGame direct links (a standalone copy the player started itself): Rooms marks
+// it links:false in participants (YouGame claude/relay-flag-7a31, the pool merge of 11-17). A seat without
+// the key, or with anything but false, has links. One such seat puts the whole match on own UDP + STUN.
+inline bool seat_without_links(const json& seat) {
+  if (!seat.is_object()) return false;
+  const auto l = seat.find("links");
+  return l != seat.end() && l->is_boolean() && !l->get<bool>();
+}
+inline bool any_seat_without_links(const json& participants) {
+  if (!participants.is_array()) return false;
+  for (const auto& p : participants) if (seat_without_links(p)) return true;
+  return false;
 }
 struct PosixAttachment { int section = -1, wake = -1, wait = -1; size_t size = 0; };
 inline bool posix_attachment(const json& answer, PosixAttachment& out) {
@@ -107,33 +121,116 @@ class Events {
   std::set<int> retired_;
 };
 using Request = std::function<json(const json&, int)>; // returns bridge.result, throws on refusal
+// Structured broker codes take precedence; older app bridges forward only human text.
+// Rooms' native admission answers 503 "Please try again shortly." while its build list is cold. The app
+// forwards only the status and the error words (desktop ws-client), so match exactly that refusal.
+inline bool rooms_busy(const json& p) {
+  return str(p,"reason").find("answered 503: Please try again shortly.") != std::string::npos;
+}
+// The app's refusal of a room upgrade: "the rooms server answered 409: Room is full", in an error event's
+// message and again in the close reason (sliced to 120 characters). Two seats racing past the upgrade:
+// Rooms drops the loser with 1008 "room full"; a recovery client gets 4004 "rejoin-refused:room-full".
+inline bool rooms_full(const json& p) {
+  for (const auto* field : {"message", "reason"}) {
+    std::string text = str(p, field);
+    for (auto& ch : text) if (ch >= 'A' && ch <= 'Z') ch = char(ch + ('a'-'A'));
+    if (text.find("room is full") != std::string::npos) return true;
+  }
+  return false;
+}
+inline bool lobby_protocol_mismatch(const json& p) {
+  for (const auto* field : {"errorCode", "refused"})
+    if (str(p,field) == "console_mixed_builds" || str(p,field) == "lobby_mismatch") return true;
+  std::string reason = str(p,"reason");
+  for (auto& ch : reason) if (ch >= 'A' && ch <= 'Z') ch = char(ch + ('a'-'A'));
+  for (const auto* phrase : {"different lobby protocol", "incompatible lobby protocol", "lobby protocol mismatch",
+                             "different lobby configuration", "console_mixed_builds"})
+    if (reason.find(phrase) != std::string::npos) return true;
+  return false;
+}
+
+// Rooms' refusal of a ticket whose Teams mark differs from the room's (rooms/src/index.ts, before lobbyDiffers):
+// 403 "This room uses another Teams protocol" (a 1v1 or Friends lobby ticket at a Teams home, or the reverse) and
+// 403 "This room uses another Doubles profile" (the MU Doubles mark differs). The app forwards them as
+// "the rooms server answered 403: <error>". A room of another kind, never a gone one (host_gone is 410).
+// The app may also name rooms' refusal code in the words: "the rooms server answered <status> [<slug>]: <error>",
+// slug [a-z_]{1,32} (rooms_refusal_slug, anchored at the start: the error words can hold brackets too). A slug
+// decides: teams_protocol / doubles_profile is a room of another kind, any other slug is not. Without a slug
+// (an older app or rooms) the words decide, as before.
+inline std::string rooms_refusal_slug(const std::string& text) {
+  static const std::string lead = "the rooms server answered ";
+  if (text.compare(0, lead.size(), lead) != 0) return {};
+  size_t at = lead.size();
+  for (int i = 0; i < 3; ++i, ++at)
+    if (at >= text.size() || text[at] < '0' || text[at] > '9') return {};
+  if (text.compare(at, 2, " [") != 0) return {};
+  const size_t start = at += 2;
+  while (at < text.size() && at - start <= 32 && ((text[at] >= 'a' && text[at] <= 'z') || text[at] == '_')) ++at;
+  const size_t length = at - start;
+  if (length < 1 || length > 32 || at >= text.size() || text[at] != ']') return {};
+  return text.substr(start, length);
+}
+// -1 no slug in the close reason or the error event's message, else whether it names a room of another kind.
+inline int room_kind_slug(const json& p) {
+  for (const auto* field : {"reason", "message"}) {
+    const auto slug = rooms_refusal_slug(str(p, field));
+    if (!slug.empty()) return slug == "teams_protocol" || slug == "doubles_profile";
+  }
+  return -1;
+}
+inline bool room_kind_refusal(const json& p) {
+  if (const int slug = room_kind_slug(p); slug >= 0) return slug == 1;
+  std::string reason = str(p,"reason");
+  for (auto& ch : reason) if (ch >= 'A' && ch <= 'Z') ch = char(ch + ('a'-'A'));
+  return reason.find("answered 403") != std::string::npos &&
+         (reason.find("another teams protocol") != std::string::npos ||
+          reason.find("another doubles profile") != std::string::npos);
+}
+
 class Stream {
  public:
   Stream(Events& events, Request request, std::function<uint64_t()> clock = now_ms)
       : events_(events), request_(std::move(request)), clock_(std::move(clock)) {}
   ~Stream() { close(1000, 4000); }
-  bool open(const std::string& ticket, const std::string& room, int ms) {
+  bool open(const std::string& ticket, const std::string& room, int ms, const std::string& session = {}, const std::function<bool()>& cancelled = {}) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled && cancelled()) return false;
     const uint64_t until = clock_() + ms;
     // An open timeout is not a close. Keep waiting for this connection's app event;
     // replacing it could deliberately evict a seat which connected after the timeout.
-    if (conn_ && !closed_) return ready_ || wait_open(until);
+    if (conn_ && !closed_) return ready_ || wait_open(until, cancelled);
     if (conn_) events_.retire(conn_);
-    conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006;
+    conn_ = 0; live_conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006; lobby_mismatch_ = false; kind_refused_ = false; busy_ = false; full_ = false;
     json q = {{"type", "netOpen"}, {"ticket", ticket}};
     if (!room.empty()) q["room"] = room;
+    if (!session.empty()) q["session"] = session;
 #ifdef YOUGAME_AGENT_TEST_HOOK
     if (!first_open_recorded_) { first_open_recorded_ = true; first_open_at_ = clock_(); }
 #endif
     conn_ = request_(q, std::max(1, ms)).value("conn", 0);
     closed_ = conn_ <= 0;
-    return !closed_ && wait_open(until);
+    return !closed_ && !(cancelled && cancelled()) && wait_open(until, cancelled);
+  }
+  // Keep cancellation-only callers and console session callers source-compatible.
+  bool open(const std::string& ticket, const std::string& room, int ms,
+            const std::function<bool()>& cancelled) {
+    return open(ticket, room, ms, {}, cancelled);
   }
   bool send(const json& m) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_ || !ready_ || conn_ <= 0) return false;
     try { request_({{"type", "netSend"}, {"conn", conn_}, {"data", m.dump()}}, 1000); return true; }
     catch (...) { return false; } // timeout/backpressure/rate limiting loses a message, not the stream
+  }
+  // send() without mutex_: the room relay's sender never waits behind next()'s blocking event read.
+  // Uses the connection that last opened; a message raced by a close is lost, like any relayed datagram.
+  // `via` carries the request: the owner's request_ may read state its pump thread reassigns (an open's
+  // cancel), so the relay passes one of its own that reads nothing shared.
+  bool send_now(const json& m, const Request& via) {
+    const int id = live_conn_.load();
+    if (id <= 0 || closed_ || !via) return false;
+    try { via({{"type", "netSend"}, {"conn", id}, {"data", m.dump()}}, 1000); return true; }
+    catch (...) { return false; }
   }
   bool next(json& m, int ms) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -143,8 +240,9 @@ class Stream {
       if (!pending_.empty() && ready_) { p = std::move(pending_.front()); pending_.pop_front(); }
       else if (!conn_ || closed_ || !events_.next(conn_, p, (int)std::max<int64_t>(0, (int64_t)until - clock_()))) return false;
       const auto event = str(p, "event");
-      if (event == "open") ready_ = true;
-      if (event == "close") { closed_ = true; ready_ = false; code_ = p.value("code", 1006); return false; }
+      if (event == "open") { ready_ = true; live_conn_ = conn_; }
+      if (event == "error") record_error(p);
+      if (event == "close") { closed_ = true; ready_ = false; live_conn_ = 0; record_close(p); return false; }
       if (event == "message" && !ready_) { pending_.push_back(std::move(p)); continue; }
       if (event == "message" && p.count("data") && p["data"].is_string()) {
         m = json::parse(p["data"].get<std::string>(), nullptr, false);
@@ -155,7 +253,7 @@ class Stream {
   }
   void close(int timeout = 1000, int code = 1000) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const int id = conn_; conn_ = 0; ready_ = false; pending_.clear();
+    const int id = conn_; conn_ = 0; live_conn_ = 0; ready_ = false; pending_.clear();
     const bool reported_closed = closed_; closed_ = true;
     if (!id) return;
     events_.retire(id);
@@ -167,6 +265,11 @@ class Stream {
   bool closed() const { return closed_.load(); }
   bool ready() const { std::lock_guard<std::mutex> lock(mutex_); return ready_; }
   int close_code() const { std::lock_guard<std::mutex> lock(mutex_); return code_; }
+  bool lobby_mismatch() const { std::lock_guard<std::mutex> lock(mutex_); return lobby_mismatch_; }
+  bool kind_refused() const { std::lock_guard<std::mutex> lock(mutex_); return kind_refused_; }
+  bool busy() const { std::lock_guard<std::mutex> lock(mutex_); return busy_; }
+  // Rooms refused this open because every seat is taken: final, never worth another try.
+  bool full() const { std::lock_guard<std::mutex> lock(mutex_); return full_; }
   int conn() const { std::lock_guard<std::mutex> lock(mutex_); return conn_; }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   uint64_t agent_test_first_open_at() const {
@@ -175,7 +278,7 @@ class Stream {
   void agent_test_drop_room() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_ || !conn_) return;
-    const int id = conn_; conn_ = 0; ready_ = false; pending_.clear();
+    const int id = conn_; conn_ = 0; live_conn_ = 0; ready_ = false; pending_.clear();
     code_ = 1006; closed_ = true;
     events_.retire(id);
     // 1006 is local-only (reserved on the wire). Use the app's existing teardown request.
@@ -183,24 +286,45 @@ class Stream {
   }
 #endif
  private:
-  bool wait_open(uint64_t until) {
-    while (clock_() < until) {
+  void record_close(const json& p) {
+    code_ = p.value("code", 1006);
+    // Embedded ws-client forwards the HTTP refusal as a fixed close reason (not the JSON code).
+    lobby_mismatch_ = code_ == 1006 && lobby_protocol_mismatch(p);
+    kind_refused_ = code_ == 1006 && (kind_refused_ || room_kind_refusal(p));   // the error event may have named it
+    busy_ = code_ == 1006 && rooms_busy(p);
+    const auto reason = str(p, "reason");
+    full_ = full_ || (code_ == 1006 && rooms_full(p)) || (code_ == 1008 && reason == "room full") ||
+            (code_ == 4004 && reason == "rejoin-refused:room-full");
+  }
+  void record_error(const json& p) {
+    if (str(p, "code") == "refused" && rooms_full(p)) full_ = true;
+    if (room_kind_slug(p) == 1) kind_refused_ = true;   // a refused upgrade's error event comes before its close
+  }
+  bool wait_open(uint64_t until, const std::function<bool()>& cancelled) {
+    // Events already queued are read even once the time is up: the netOpen request itself can use the
+    // whole timeout (a slow app reply, a starved thread), and its open or refusal is then already here.
+    for (;;) {
+      if (cancelled && cancelled()) return false;
       json p;
-      if (!events_.next(conn_, p, (int)std::max<int64_t>(0, (int64_t)until - clock_()))) break;
+      const uint64_t now = clock_();
+      const int slice = now < until ? (int)std::min<uint64_t>(50, until - now) : 0;
+      if (!events_.next(conn_, p, slice)) { if (slice == 0) return false; continue; }
+      if (cancelled && cancelled()) return false;
       const auto event = str(p, "event");
-      if (event == "open") { ready_ = true; return true; }
+      if (event == "open") { ready_ = true; live_conn_ = conn_; return true; }
       if (event == "message") pending_.push_back(std::move(p));
-      if (event == "close") { code_ = p.value("code", 1006); closed_ = true; return false; }
+      if (event == "error") record_error(p);
+      if (event == "close") { record_close(p); closed_ = true; live_conn_ = 0; return false; }
     }
-    return false;
   }
   Events& events_;
   Request request_;
   std::function<uint64_t()> clock_;
   mutable std::mutex mutex_;
   int conn_ = 0, code_ = 1006;
+  std::atomic<int> live_conn_{0};   // conn_ once open, for send_now
   std::atomic<bool> closed_{true};
-  bool ready_ = false;
+  bool ready_ = false, lobby_mismatch_ = false, kind_refused_ = false, busy_ = false, full_ = false;
   std::deque<json> pending_;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   bool first_open_recorded_ = false;
@@ -326,6 +450,38 @@ inline json team_outcome(int winner, const std::vector<std::string>& ids, const 
   return {{"ranking", ranking}, {"detail", {{"tw", winner}}}};
 }
 
+inline bool no_team_map(const int* room_teams) {
+  for (int port = 0; port < 4; ++port) if (room_teams[port] != -1) return false;
+  return true;
+}
+// The game's teams for a result. Without a room team map (a private room, not ranked) players
+// may pick any two CSS colours (red 0, blue 1, green 2): two colours with two players each become
+// teams 0 and 1, the lower colour first. A room's team map, or any other split, is left as is.
+inline void outcome_teams(const int* game, const int* room_teams, bool ranked, int out[4]) {
+  for (int port = 0; port < 4; ++port) out[port] = game[port];
+  if (ranked || !no_team_map(room_teams)) return;
+  int low = 3, high = -1;
+  for (int port = 0; port < 4; ++port) {
+    if (game[port] < 0 || game[port] > 2) return;
+    low = std::min(low, game[port]); high = std::max(high, game[port]);
+  }
+  int count = 0;
+  for (int port = 0; port < 4; ++port) count += game[port] == low;
+  for (int port = 0; port < 4; ++port) if (game[port] != low && game[port] != high) return;
+  if (low == high || count != 2) return;
+  for (int port = 0; port < 4; ++port) out[port] = game[port] == low ? 0 : 1;
+}
+
+// Private rooms have no team map: their non-ranked results use the game's CSS teams.
+inline json room_team_outcome(int winner, const std::vector<std::string>& ids,
+                              const int* teams, const int* room_teams, bool ranked) {
+  if (!teams || !room_teams) return {{"void", true}};
+  if (no_team_map(room_teams)) return ranked ? json{{"void", true}} : team_outcome(winner, ids, teams);
+  for (int port = 0; port < 4; ++port)
+    if (teams[port] != room_teams[port]) return {{"void", true}};
+  return team_outcome(winner, ids, room_teams);
+}
+
 // Unranked may finish a fight and start another while signaling recovers. Keep each begin/finish
 // together, retain its winner through retries, and retire it only on its own room receipt.
 class Games {
@@ -339,8 +495,11 @@ class Games {
   }
   void report(int winner) { in_game_ = false; if (!games_.empty()) games_.back().winner = winner; }
   void report_team(int winner, const std::vector<std::string>& ids, const int* teams) {
+    report_team_result(team_outcome(winner, ids, teams));
+  }
+  void report_team_result(json result) {
     in_game_ = false;
-    if (!games_.empty()) games_.back().team_result = team_outcome(winner, ids, teams);
+    if (!games_.empty()) games_.back().team_result = std::move(result);
   }
   void started(const std::string& match) {
     if (!games_.empty() && games_.front().match.empty()) { games_.front().match = match; games_.front().next = 0; }
@@ -400,6 +559,26 @@ inline void close_links(Links& links, Request request) {
   for (unsigned id : ids) { try { request({{"type", "directClose"}, {"link", id}}, 1000); } catch (...) {} }
 }
 inline bool retry_link_failure(int mode) { return mode != 0 && mode != 2; }
+// One message per connect attempt, for rooms to log (rooms adds the game, the mode and whether the seats
+// share a public IP itself): connected or not, how ("lan"/"ext"/"other" for own UDP, "links", "none"), how
+// long it took. Never an address. Rooms ignores a message type it doesn't know.
+inline json link_report(bool ok, const std::string& via, uint64_t ms, bool own, const std::string& path = {}) {
+  json out = {{"t", "linkReport"}, {"ok", ok}, {"via", via}, {"ms", ms}, {"transport", own ? "own" : "links"}};
+  if (!own && !path.empty()) out["path"] = path;
+  return out;
+}
+// A links match's path for linkReport: the slowest of its links' routes as the app reports them ("lan",
+// "direct", "relay"; relay reported as "turn"), "unknown" when none is known yet.
+template<class Route> std::string links_path(const std::vector<unsigned>& ids, Route route) {
+  int worst = -1;
+  static const char* names[] = {"lan", "direct", "turn"};
+  for (unsigned id : ids) {
+    const std::string r = route(id);
+    const int rank = r == "lan" ? 0 : r == "direct" ? 1 : r == "relay" ? 2 : -1;
+    worst = std::max(worst, rank);
+  }
+  return worst < 0 ? std::string("unknown") : std::string(names[worst]);
+}
 template<class State, class Clock, class Pause, class Cancel>
 bool open_links(Links& links, int conn, const std::vector<std::string>& peers, Request request,
                 State state, Clock clock, Pause pause, Cancel cancelled) {

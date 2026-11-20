@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "yougame_transport.h"
+#include "yougame_doubles_teams.h"
+#include "yougame_lobby_setup.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_input.h"
 #include <cstdlib>
@@ -46,15 +48,28 @@ template<class Socket> struct RoomState {
   // Four-seat Teams only. Singles rosters also carry team numbers; they do not enable Teams.
   // Room slot n is Slippi player_idx n / controller port n+1, independent of roster order.
   std::array<int, 4> port_teams = {{-1, -1, -1, -1}};
+  // A Doubles match room's lobby (nativeTeams, muDoubles) names every seat's team; it outranks rosters.
+  doubles_teams::Seats doubles;
+  // The match the host's console begin froze (the start frame), which outranks the lobby; settled once
+  // its result came or Rooms reset the room after it: the room plays one match, then closes (4004).
+  doubles_teams::Setup setup;
+  bool settled = false;
   int seat_team(int player_idx) const {
-    return size == 4 && player_idx >= 0 && player_idx < 4 ? port_teams[player_idx] : -1;
+    if (size != 4 || player_idx < 0 || player_idx >= 4) return -1;
+    if (setup.known) return setup.team[player_idx];
+    return doubles.known ? doubles.team[player_idx] : port_teams[player_idx];
   }
+  // The room teams a result is checked against: the start's when known, else the roster's.
+  const int* result_teams() const { return setup.known ? setup.team.data() : port_teams.data(); }
   json pending_team_result;             // legacy socket's complete Teams finish outcome
   bool pending_begin = false;
   uint64_t begin_at = 0;               // when a refused begin may be tried again
   bool in_game = false;                // between game_started and its one game_ended
   Games games;
   int pending_winner = -2;             // -2 none, -1 no single winner, else 0-based port
+  // A Friends lobby match (yougame_lobby_setup.h): the plan from the room's frozen setup. Its result is
+  // the full ranking by setup id with the setup echoed (lobby::finish_report), as pending_team_result.
+  std::shared_ptr<const lobby::Plan> lobby;
 };
 
 struct RoomIO {
@@ -63,9 +78,36 @@ struct RoomIO {
   std::function<void(int)> pause = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
   std::function<int(unsigned)> link_state;
   std::function<void()> disable_links = [] {};
+  // The room relay (yougame_room_relay.h) carries this room's match instead of links: it ends wherever
+  // the links would, including when the room has no link ids at all.
+  std::function<void()> end_relay = [] {};
   std::function<void(const char*)> log = [](const char*) {};
   std::function<void(const json&)> result = [](const json&) {};
+  std::function<void(const std::string&)> started = [](const std::string&) {};
+  std::function<void()> settled = [] {};  // a Doubles match room's one match is over (called once, unlocked)
+  // Every room message, under the room mutex: a Friends lobby room keeps its lobby current through the
+  // match and between matches (yougame_lobby.h Session::receive), so the next select starts from it.
+  std::function<void(const json&)> message = [](const json&) {};
+  // Each turn, under the room mutex: frames the room's own lobby session owes (appended to the turn's sends).
+  std::function<void(std::vector<json>&)> tick = [](std::vector<json>&) {};
+  // When the pump stops: true hands the links on (the Friends lobby's next search adopts the room) instead
+  // of closing them.
+  std::function<bool()> keep_links = [] { return false; };
+  // Our own room socket (no app broker) dropped with neither the room nor us closing it: the pump
+  // rejoins on a fresh ticket instead of ending the room. A relay match has about 7 s before Slippi
+  // gives up on the peer, and Rooms hands a signed-in seat to its new socket at once.
+  std::function<bool()> own_drop = [] { return false; };
+  // Own socket mid-match: when it last heard anything / a relay frame (0 = never), and closing it as a drop.
+  std::function<uint64_t()> own_heard = [] { return uint64_t{0}; };
+  std::function<uint64_t()> own_relay_heard = [] { return uint64_t{0}; };
+  std::function<void()> own_abandon = [] {};
 };
+// A Doubles match room's one match is over: its result, or Rooms ending the room after the start.
+template<class Room> bool settles(const Room& r, const json& m) {
+  if (!r.setup.known || r.settled) return false;
+  const auto t = str(m, "t");
+  return (t == "result" && str(m, "matchId") == r.setup.match) || (t == "teams-dissolved" && str(m, "reason") == "reset");
+}
 // What the room is waiting for: a begin (the host, once a game starts) and the finish. Decided
 // under the room mutex, sent after it is released (a stalled socket must not hold up the game thread).
 template<class Room> std::vector<json> due_messages(Room& r, uint64_t now) {
@@ -120,6 +162,7 @@ template<class Room> void read_participants(Room& r, const json& m) {
 template<class Room> void read_roster(Room& r, const json& m) {
   read_participants(r, m);
   read_seat_teams(r, m);
+  if (r.size == 4) doubles_teams::read(m, r.doubles);
   if (m.count("host") && m["host"].is_string()) r.host_connection = m["host"].get<std::string>();
   if (m.count("revision") && m["revision"].is_number_integer()) r.revision = m["revision"].get<int>();
 }
@@ -128,6 +171,7 @@ inline std::string leave_id(const json& m, bool brokered) {
   return brokered && m.count("player") ? str(m["player"], "id") : str(m, "id");
 }
 template<class Room> void end_links(Room& r, const RoomIO& io) {
+  io.end_relay();
   if (r.links.ids.empty()) return;
   io.disable_links();
   close_links(r.links, io.request);
@@ -175,12 +219,59 @@ template<class Room> bool agent_drop_room_due(Room& r, const RoomIO& io, int sec
   io.log(("agent-test: dropped the room socket (dropRoomAfter " + std::to_string(seconds) + " s)").c_str());
   return true;
 }
+// dropRoomOnce (Friends console rooms): once per process, after 300 simulation frames on VS character
+// select, only when every seat in the server's roster is an agent. Claims the attempt, refusals included.
+inline std::atomic<bool> agent_drop_room_once_attempted{false};
+inline bool agent_drop_room_once_enabled(const char* value) { return value && value[0] == '1' && !value[1]; }
+template<class Json, class Log>
+bool agent_drop_room_once_due(bool enabled, uint32_t css_frames, const Json& roster, Log log) {
+  if (!enabled || css_frames < 300 || agent_drop_room_once_attempted) return false;
+  if (agent_drop_room_once_attempted.exchange(true)) return false;
+  const auto me = roster.is_object() && roster.count("me") && roster["me"].is_string() ?
+      roster["me"].template get<std::string>() : std::string();
+  const auto state = agent_test::room_input_state(0, 1, false,
+      roster.is_object() && roster.count("participants") ? roster["participants"] : Json(), me);
+  if (state.players < 2 || !state.all_agents) {
+    log("agent-test: dropRoomOnce refused: not an agent-only room");
+    return false;
+  }
+  log("agent-test: dropped the room socket (dropRoomOnce at character select)");
+  return true;
+}
 #endif
+
+// Our own socket's way back into the room after a drop: the match's ticket is usually past its five
+// minutes by then, so a fresh one first, then the same socket reopened, all within 6 s.
+template<class Room> bool rejoin_own(Room& r, const RoomIO& io) {
+  const uint64_t start = io.clock(), until = start + 6000;
+  io.log("yougame: room socket dropped; rejoining the room");
+  bool renewed = false;
+  while (!r.stop && io.clock() < until) {
+    if (!renewed && !r.ticket_request.is_null()) {
+      const auto left = until - io.clock();
+      try {
+        renewed = renew_room_ticket(r.ticket, r.code, [&] {
+          return io.request(r.ticket_request, (int)std::min<uint64_t>(3000, left));
+        }, io.log);
+      } catch (...) {}
+    }
+    if (r.stop || io.clock() >= until) break;
+    std::string error;
+    if (r.socket->open_session(r.url, r.ticket, r.code, &error, (int)std::min<uint64_t>(2000, until - io.clock()))) {
+      io.log(("yougame: back in the room after " + std::to_string(io.clock() - start) + " ms").c_str());
+      return true;
+    }
+    if (io.clock() < until) io.pause((int)std::min<uint64_t>(250, until - io.clock()));
+  }
+  io.log("yougame: could not rejoin the room");
+  return false;
+}
 
 // A link ending does not end the room: ranked still owes reports and must hear its result.
 template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io) {
-  uint64_t last_ping = 0, reopen_at = 0;
-  bool awaiting_welcome = false, links_ended = false, restored = false, room_closed = false, recovered_match_known = false;
+  uint64_t last_ping = 0, reopen_at = 0, probe_at = 0;
+  int own_rejoins = 0;
+  bool rejoin_pending = false, awaiting_welcome = false, links_ended = false, room_closed = false, recovered_match_known = false;
   std::string recovered_match;
   const bool broker = r->socket->brokered();
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -192,12 +283,33 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
     { std::lock_guard<std::mutex> lock(mutex); drop_room = agent_drop_room_due(*r, io, drop_room_seconds); }
     if (drop_room) r->socket->agent_test_drop_room();
 #endif
+    // Own socket, a match passing relay frames through it: 1 s of silence sends a ping; no answer in
+    // another 1 s means our connection died (TCP takes seconds to say so, and the other seat gives up
+    // after a 7 s stall). A pong means the socket is fine and the silence is the other seat's.
+    if (!broker && !r->socket->closed()) {
+      const uint64_t now = io.clock(), heard = io.own_heard(), relay = io.own_relay_heard();
+      const auto since = [now](uint64_t t) { return t >= now ? uint64_t{0} : now - t; };   // stamps from the reader thread
+      if (!relay || since(relay) >= 10000) probe_at = 0;
+      else if (probe_at && heard >= probe_at) probe_at = 0;
+      else if (!probe_at && since(heard) >= 1000) { r->socket->send({{"t", "ping"}}); probe_at = now; }
+      else if (probe_at && now - probe_at >= 1000) {
+        io.log("yougame: the room stopped answering mid-match; reopening the socket");
+        io.own_abandon(); probe_at = 0;
+      }
+    }
     json m;
     const bool got = r->socket->next(m, broker ? 100 : 250);
     if (!got && r->socket->closed()) {
       { std::lock_guard<std::mutex> lock(mutex); r->participants = json::array(); }
-      if (!broker || !r->recovery.dropped(io.clock(), r->socket->recoverable())) { room_closed = true; break; }
-      awaiting_welcome = true;
+      if (!broker) {
+        // Three rejoins per room at most: a room that keeps dropping us ends as before.
+        if (r->stop || own_rejoins >= 3 || !io.own_drop()) { room_closed = true; break; }
+        ++own_rejoins;
+        if (!rejoin_own(*r, io)) { room_closed = true; break; }
+        continue;
+      }
+      if (!r->recovery.dropped(io.clock(), r->socket->recoverable())) { room_closed = true; break; }
+      awaiting_welcome = rejoin_pending = true;
       if (io.clock() >= reopen_at) {
         reopen_room(*r, io);
         reopen_at = io.clock() + 1000;
@@ -206,9 +318,11 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
       if (r->socket->closed() && left && !r->stop) io.pause((int)std::min<uint64_t>(100, left));
     }
     std::vector<json> out;
-    bool stop_links = false;
+    bool stop_links = false, settled_now = false;
     {
       std::lock_guard<std::mutex> lock(mutex);
+      if (got && settles(*r, m)) { r->settled = settled_now = true; }
+      if (got) io.message(m);
       if (got) {
         const auto t = str(m, "t");
         if (broker && (t == "ended" || t == "end" || t == "kick" || t == "kicked" || t == "error" || m.count("setOver"))) stop_links = true;
@@ -218,10 +332,14 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
             const bool recovered = r->recovery.restore(m, io.clock(), !links_ended, r->ranked);
             if (r->recovery.expired(io.clock())) room_closed = true;
             if (t == "welcome" && !r->recovery.expired(io.clock())) {
-              awaiting_welcome = false; restored = true;
+              awaiting_welcome = false;
               recovered_match = str(m, "matchId"); recovered_match_known = true;
             }
-            if (recovered) { awaiting_welcome = false; restored = true; r->ticket_retry = {}; reopen_at = 0; }
+            if (recovered) {
+              awaiting_welcome = false;
+              if (rejoin_pending && r->ranked) r->set.rejoined();
+              rejoin_pending = false; r->ticket_retry = {}; reopen_at = 0;
+            }
           }
         }
         if (broker && t == "welcome" && !r->ranked) r->games.receive(m);
@@ -229,12 +347,16 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
           r->match_id = std::move(recovered_match); recovered_match_known = false;
           if (r->match_id.empty()) r->recovery.result(); else r->recovery.start(r->match_id);
           r->pending_begin = false;
-          if (r->ranked) r->set.receive({{"t", "start"}, {"matchId", r->match_id}});
+          if (r->ranked) {
+            r->set.receive({{"t", "start"}, {"matchId", r->match_id}});
+            if (!r->match_id.empty()) io.started(r->match_id);
+          }
           else r->games.started(r->match_id);
         }
         if (r->ranked && r->set.receive(m)) io.result(m);
         if (t == "start") {
           io.log("yougame: room started a match");
+          if (r->ranked) io.started(str(m, "matchId"));
           r->match_id = str(m, "matchId");
           if (broker) {
             r->recovery.start(r->match_id);
@@ -247,11 +369,14 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
             if (!r->ranked) r->games.receive(m);
             if (str(m, "matchId") == r->match_id) { r->match_id.clear(); r->recovery.result(); }
           }
+        } else if (t == "command-error" && r->setup.known && str(m, "action") == "begin") {
+          // A Doubles begin sent just before the start ("A match is already active or complete"): the match
+          // the start froze is the one being played, so the refusal is expected and nothing is retried.
         } else if (t == "command-error") {
           const auto action = str(m, "action");
-          // Which command and the room's reason: the set's own handling depends on the text (10-25 1-1 set).
-          io.log(("yougame: room refused a command: " + action.substr(0, 32) + ": " + str(m, "error").substr(0, 160)).c_str());
-          if (r->ranked) r->set.refused(m, broker && restored);
+          // Human text is bounded plain ASCII for logs only; never a protocol decision.
+          io.log(("yougame: room refused a command: " + ranked::log_text(action, 32) + ": " + ranked::log_text(str(m, "error"), 160)).c_str());
+          if (r->ranked) r->set.refused(m, io.clock());
           else if (broker && r->games.refused(m)) { r->match_id.clear(); r->recovery.result(); }
           if (!r->ranked && action == "begin" && (r->in_game || (broker && r->pending_winner != -2))) {
             r->pending_begin = true; r->begin_at = io.clock() + 2000;
@@ -270,16 +395,35 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
         if (!awaiting_welcome) { r->recovery.cancel_wait(); r->ticket_retry = {}; reopen_at = 0; }
       }
       if (broker && r->recovery.expired(io.clock())) room_closed = true;
-      if (!room_closed && !r->recovery.pending() && !awaiting_welcome && !r->socket->closed()) out = due_messages(*r, io.clock());
+      if (!room_closed && !r->recovery.pending() && !awaiting_welcome && !r->socket->closed()) {
+        out = due_messages(*r, io.clock());
+        io.tick(out);
+      }
     }
+    if (settled_now) { io.log("yougame: the Doubles match is over; the room closes behind it"); io.settled(); }
     if (stop_links) end_links(*r, io);
     if (room_closed) break;
     if (!r->socket->closed() && io.clock() - last_ping > 5000) {
       out.push_back({{"t", "ping"}, {"at", io.clock()}}); last_ping = io.clock();
     }
-    for (auto& j : out) r->socket->send(j);
+    for (auto& j : out) {
+      const bool sent = r->socket->send(j);
+      if (r->ranked && sent) {
+        std::lock_guard<std::mutex> lock(mutex);
+        r->set.sent(j);
+      }
+      if (r->ranked && !sent) {
+        io.log("yougame: ranked command delivery failed; retrying after backoff");
+        break; // in particular, do not report a subgame whose game-start could not be sent
+      }
+    }
   }
-  end_links(*r, io);
+  bool settled;
+  { std::lock_guard<std::mutex> lock(mutex); settled = r->settled; }
+  // After a Doubles match's result Rooms closes the room (4004): a normal end. The links stay up for the
+  // game's own exit from its results, so no seat sees its partners drop first.
+  if (room_closed && settled) io.log("yougame: the Doubles room closed after its match (a normal end)");
+  else if (room_closed || !io.keep_links()) end_links(*r, io);
   if (room_closed) {
     std::lock_guard<std::mutex> lock(mutex);
     r->participants = json::array();
@@ -291,8 +435,33 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
 template<class Room> void stop_and_flush(Room& r, std::mutex& mutex) {
   r.stop = true;
   if (r.pump.joinable()) r.pump.join();
-  std::vector<json> last;
-  { std::lock_guard<std::mutex> lock(mutex); last = r.set.flush(); }
-  for (const auto& j : last) r.socket->send(j);
+  for (;;) {
+    std::vector<json> last;
+    { std::lock_guard<std::mutex> lock(mutex); last = r.set.flush(); }
+    if (last.empty()) break;
+    for (const auto& j : last) {
+      if (!r.socket->send(j)) return;
+      std::lock_guard<std::mutex> lock(mutex);
+      r.set.sent(j);
+    }
+  }
+}
+
+// A quit can become a concession only after the pump receives its last game receipt.
+// Transfer socket ownership to the flush at that point, just as for an immediate quit.
+template<class Room> bool drain_ranked_room(Room& r, std::mutex& mutex, const RoomIO& io, uint64_t timeout) {
+  const uint64_t until = io.clock() + timeout;
+  for (;;) {
+    bool pending, concede;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      pending = r.set.needs_drain();
+      concede = r.set.leaves_at_once();
+    }
+    if (!pending) return true;
+    if (concede) { stop_and_flush(r, mutex); return true; }
+    if (io.clock() >= until) return false;
+    io.pause(50);
+  }
 }
 } // namespace yougame::transport

@@ -1,5 +1,6 @@
 // Window-free parsing and routing/precedence checks for app-launched input scripts.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "yougame_agent_script.h"
 #include "yougame_agent_fight.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -50,6 +51,36 @@ static void ranked_input_policy() {
       const bool expected = script ? mode != 0 && active && !local : local || server;
       CHECK(matchmaking_allowed(local, server, script, active, mode) == expected);
     }
+  }
+  for (int mode : {-2, -1, 0, 1, 2, 3, 4, 5}) {
+    for (bool ranked : {false, true}) {
+      const bool expected = !ranked && (mode == -1 || (mode >= 1 && mode <= 4));
+      CHECK(gameplay_input_allowed(pre_room_input_state(10, mode, ranked)) == expected);
+      const json self = json::array({{{"connectionId", "self"}, {"hn", false}}});
+      CHECK(gameplay_input_allowed(room_input_state(10, mode, ranked, self, "self", true)) == expected);
+    }
+  }
+  for (auto key : keys) {
+    InputPolicy policy;
+    std::vector<std::string> lines;
+    auto record = [&](const char* line) { lines.emplace_back(line); };
+    const auto before = pre_room_input_state(11, 2);
+    CHECK(policy.allowed(before, key, record));
+    CHECK(policy.allowed(before, key, record));
+    CHECK(!policy.allowed(room_input_state(11, 2, false, rosters[2], "self", true), key, record));
+    CHECK(policy.allowed(room_input_state(11, 2, false, agents, "self", true), key, record));
+    CHECK(policy.allowed(room_input_state(11, 2, false, agents, "self"), key, record));
+    CHECK(lines == (std::vector<std::string>{
+        std::string("agent-test: ") + input_key_name(key) + " allowed: no other player in the room yet",
+        std::string("agent-test: ") + input_key_name(key) + " refused: not an agent-only room",
+        std::string("agent-test: ") + input_key_name(key) + " allowed: agent-only room (2 agent players)"}));
+    CHECK(policy.allowed(pre_room_input_state(12, 2), key, record));
+    CHECK(policy.allowed(pre_room_input_state(12, 2), key, record));
+    CHECK(policy.allowed(pre_room_input_state(12, -1), key, record));
+    CHECK(policy.allowed(pre_room_input_state(12, 2), key, record));
+    CHECK(lines.size() == 4 && lines.back() == lines.front());
+    CHECK(!gameplay_input_allowed(room_input_state(11, 2, false, json::array(), "self", true)));
+    CHECK(!gameplay_input_allowed(room_input_state(11, 2, false, agents, "absent", true)));
   }
   InputPolicy live;
   std::vector<std::string> reported;
@@ -240,6 +271,7 @@ static void source_match_key(const std::filesystem::path& dir) {
 }
 
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   const auto directory = std::filesystem::u8path(argv[1]);
   std::filesystem::create_directories(directory);
@@ -247,6 +279,29 @@ int main(int argc, char** argv) {
     { std::ofstream file(directory / "agent-test.json"); file << object.dump(); CHECK(file.good()); }
     return load(true, directory.u8string().c_str(), engine);
   };
+  for (const auto engine : {Engine::Source, Engine::Static}) {
+    const auto video = parse({{"openSettings", "video"}}, engine);
+    CHECK(video.open_settings_video);
+    CHECK(video.arguments.empty() && video.environment.empty());
+    CHECK(video.log == "agent-test.json applied default keys: openSettings");
+    CHECK(!yougame::agent_paths::session.path.empty());
+    CHECK(open_settings_video.exchange(false));
+    CHECK(!open_settings_video.exchange(false));
+    for (const auto& invalid : {nlohmann::json("Video"), nlohmann::json("audio"), nlohmann::json(""),
+         nlohmann::json(0), nlohmann::json(true), nlohmann::json(nullptr), nlohmann::json::array(), nlohmann::json::object()}) {
+      const auto bad = parse({{"openSettings", invalid}}, engine);
+      CHECK(!bad.open_settings_video && !open_settings_video.load());
+      CHECK(bad.log == "agent-test: openSettings invalid value; ignored");
+    }
+    parse({{"openSettings", "video"}}, engine);
+    CHECK(!load(false, directory.u8string().c_str(), engine).open_settings_video);
+    CHECK(!open_settings_video.load());
+    parse({{"openSettings", "video"}}, engine);
+    CHECK(!parse(nlohmann::json::object(), engine).open_settings_video);
+    CHECK(!open_settings_video.load());
+    CHECK(parse({{"mute", true}, {"openSettings", "video"}}, engine).log ==
+          "agent-test.json applied default keys: mute, openSettings");
+  }
   for (const std::string name : {std::string("ace-0.9_Online.txt"), std::string("a"), std::string(64, 'a'), std::string(".menu")}) {
     { std::ofstream file(directory / name); file << "0 0 0\n"; }
     const auto s = parse({{"script", name}});
@@ -300,9 +355,16 @@ int main(int argc, char** argv) {
     }
   }
   const auto source = parse({{"script", "a"}, {"captureEvery", 30}, {"frames", 600}}, Engine::Source);
+#ifdef __APPLE__
+  // The Mac Source Port captures through its GL renderer.
+  CHECK(source.arguments == (std::vector<std::string>{"--capture", (directory / "agent-captures" / "cap.ppm").u8string(),
+                                                       "--capture-every", "30", "--frames", "600", "--script", (directory / "a").u8string()}));
+  CHECK(source.log.find("not supported") == std::string::npos);
+#else
   CHECK(source.arguments == (std::vector<std::string>{"--frames", "600", "--script", (directory / "a").u8string()}));
-  CHECK(source.agent_script);
   CHECK(source.log.find("agent test: captureEvery not supported on the Source Port; ignored") != std::string::npos);
+#endif
+  CHECK(source.agent_script);
   std::filesystem::create_directories(directory / "fixtures");
   { std::ofstream file(directory / "fixtures" / "ab_vs_source.txt"); file << "0 START\n"; }
   for (const char* name : {"a", "fixtures/ab_vs_source.txt", "fixtures\\ab_vs_source.txt"}) {

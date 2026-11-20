@@ -11,6 +11,79 @@
 
 int main() {
   using namespace yougame::mode_policy;
+  int route_cases = 0;
+  for (int mode : {0, 1, 2, 3, 4}) {
+    for (bool active : {false, true}) {
+      for (bool login : {false, true}) {
+        for (bool agent : {false, true}) {
+          for (bool friend_room : {false, true}) {
+            for (bool vanilla : {false, true}) {
+              const auto expected = active && slippi_menu_mode(mode, friend_room)
+                  ? (login && !agent ? MatchmakingRoute::Slippi : MatchmakingRoute::Locked)
+                  : agent ? MatchmakingRoute::YouGame
+                  : !active ? MatchmakingRoute::Slippi
+                  : mode == 1 && login && !friend_room && vanilla ? MatchmakingRoute::Blend : MatchmakingRoute::YouGame;
+              CHECK(matchmaking_route(mode, active, login, agent, friend_room, vanilla) == expected);
+              ++route_cases;
+            }
+          }
+        }
+      }
+    }
+  }
+  CHECK(route_cases == 160);
+  // The three Slippi submenu modes ignore listing type; a missing grant or script locks
+  // instead of entering any YouGame search. Explicit Friends rooms keep their route.
+  for (int mode : {2, 3, 4}) for (bool vanilla : {false, true}) {
+    CHECK(matchmaking_route(mode, true, true, false, false, vanilla) == MatchmakingRoute::Slippi);
+    CHECK(matchmaking_route(mode, true, false, false, false, vanilla) == MatchmakingRoute::Locked);
+    CHECK(matchmaking_route(mode, true, true, true, false, vanilla) == MatchmakingRoute::Locked);
+    CHECK(matchmaking_route(mode, true, true, false, true, vanilla) == MatchmakingRoute::YouGame);
+  }
+  // A remix (not vanilla-only) never reaches Slippi, even signed in to Slippi on plain Unranked.
+  CHECK(matchmaking_route(1, true, true, false, false, false) == MatchmakingRoute::YouGame);
+  // The base listing signed in to Slippi searches both pools; standalone stays on Slippi.
+  CHECK(matchmaking_route(1, true, true, false, false, true) == MatchmakingRoute::Blend);
+  CHECK(matchmaking_route(1, false, true, false, false, true) == MatchmakingRoute::Slippi);
+  // Only that one case blends: Ranked, Direct, Teams, Party, a friend room or an agent never do.
+  CHECK(matchmaking_route(0, true, true, false, false, true) == MatchmakingRoute::YouGame);
+  CHECK(matchmaking_route(1, true, true, false, true, true) == MatchmakingRoute::YouGame);
+  CHECK(matchmaking_route(1, true, true, true, false, true) == MatchmakingRoute::YouGame);
+  CHECK(matchmaking_route(1, false, true, true, false, true) == MatchmakingRoute::YouGame);
+  // Melee Unlocked's launcher (no app): the online menu's pick. Only Both (2) on plain Unranked with
+  // the game's own Slippi login and Slippi's gameplay blends; every other Both searches YouGame alone
+  // and says why; a YouGame row (1) and anything not Both keep YouGame's own search.
+  int launcher_cases = 0;
+  for (int service : {-1, 0, 1, 2, 3}) for (int mode : {0, 1, 2, 3, 4}) for (bool friend_room : {false, true})
+    for (bool login : {false, true}) for (bool gameplay : {false, true}) for (bool agent : {false, true}) {
+      const LauncherDecision d = launcher_route(service, mode, friend_room, login, gameplay, agent);
+      const bool both = service == 2 && mode == 1 && !friend_room;
+      const LauncherRoute expected = !both ? LauncherRoute::YouGame
+          : login && gameplay && !agent ? LauncherRoute::Blend : LauncherRoute::BothYouGameOnly;
+      CHECK(d.route == expected);
+      CHECK(d.why != nullptr && d.why[0] != 0);
+      ++launcher_cases;
+    }
+  CHECK(launcher_cases == 400);
+  {
+    const LauncherDecision blend = launcher_route(2, 1, false, true, true, false);
+    CHECK(blend.route == LauncherRoute::Blend && std::string(blend.why) == "Slippi login present");
+    const LauncherDecision no_login = launcher_route(2, 1, false, false, true, false);
+    CHECK(no_login.route == LauncherRoute::BothYouGameOnly && std::string(no_login.why) == "no Slippi login");
+    const LauncherDecision mods = launcher_route(2, 1, false, true, false, false);
+    CHECK(mods.route == LauncherRoute::BothYouGameOnly && std::string(mods.why) == "Slippi Unranked plays vanilla Melee only");
+    const LauncherDecision agent = launcher_route(2, 1, false, true, true, true);
+    CHECK(agent.route == LauncherRoute::BothYouGameOnly && std::string(agent.why) == "agent copy, never Slippi");
+    // YouGame Unranked (1) and Ranked stay YouGame's own search, signed in to Slippi or not.
+    CHECK(launcher_route(1, 1, false, true, true, false).route == LauncherRoute::YouGame);
+    CHECK(launcher_route(2, 0, false, true, true, false).route == LauncherRoute::YouGame);
+    CHECK(launcher_route(2, 1, true, true, true, false).route == LauncherRoute::YouGame);
+    static_assert(launcher_route(2, 1, false, true, true, false).route == LauncherRoute::Blend, "constexpr");
+  }
+  std::printf("yougame_mode_policy: %d launcher route cases passed\n", launcher_cases);
+  // Ranked stays off the YouGame Online menu until it plays like Slippi's (2026-10-29).
+  CHECK(!yougame_ranked_offered);
+  std::printf("yougame_mode_policy: %d matchmaking route cases passed\n", route_cases);
   CHECK(hle::card::file_filter == nullptr);  // Standalone card tests and mounts need no app filter.
   CHECK(spectator_allowed(false, true));
   CHECK(!spectator_allowed(false, false));

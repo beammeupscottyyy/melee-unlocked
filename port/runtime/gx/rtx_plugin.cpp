@@ -24,7 +24,8 @@ bool rtx_pack_current(const std::wstring& game_dir) {
   };
   const std::filesystem::path dir(game_dir);
   const std::string offered = first_word(dir / L"rtxpack.sha256");
-  if (offered.empty()) return true;
+  // No record of an offered pack: nothing from RTX\ or Remix\ loads (a DLL planted beside the game included).
+  if (offered.empty()) return false;
   return first_word(dir / L"rtxpack.installed") == offered;
 }
 

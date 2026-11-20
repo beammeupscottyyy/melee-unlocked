@@ -27,20 +27,27 @@ std::mutex g_mutex;
 MuPcConfig g_config = [] {
   MuPcConfig c;
   mu_pc_defaults(&c);
+  return c;
+}();
+// YouGame: the test overrides below wait for the first use, after test_env has latched the session policy
+// (global initialization runs before it, so a YouGame session could otherwise keep them). A saved setting wins.
+bool g_test_env_done = false;
+void apply_test_env_locked() {
+  if (g_test_env_done) return;
+  g_test_env_done = true;
   // MELEE_TEST_PRACTICE_CPU=<preset> (tests only): on, with that preset, without a settings file.
   if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_CPU")) {
-    mu_pc_preset(std::atoi(v), &c);
-    c.enabled = 1;
+    mu_pc_preset(std::atoi(v), &g_config);
+    g_config.enabled = 1;
   }
   // MELEE_TEST_PRACTICE_GHOST=<index> (tests only): on, playing that habit ghost.
   if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_GHOST")) {
-    if (practice_cpu::ghost(std::atoi(v), c)) c.enabled = 1;
+    if (practice_cpu::ghost(std::atoi(v), g_config)) g_config.enabled = 1;
   }
   // MELEE_TEST_PRACTICE_TOOLS=<MU_PC_TOOL_* bits, hex> (tests only): the Training tools, as the
   // Practice page's Tools rows set them.
-  if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_TOOLS")) c.tools = (uint8_t)std::strtoul(v, nullptr, 16);
-  return c;
-}();
+  if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_TOOLS")) g_config.tools = (uint8_t)std::strtoul(v, nullptr, 16);
+}
 std::atomic<uint32_t> g_generation{1};
 std::atomic<bool> g_driving{false};
 std::atomic<int> g_plan{0};
@@ -79,7 +86,7 @@ bool ghost(int index, MuPcConfig& c) {
   return true;
 }
 
-MuPcConfig config() { std::lock_guard<std::mutex> lk(g_mutex); return g_config; }
+MuPcConfig config() { std::lock_guard<std::mutex> lk(g_mutex); apply_test_env_locked(); return g_config; }
 void initialize_source_test_ghost() {
   if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_GHOST")) {
     MuPcConfig c = config();
@@ -92,6 +99,7 @@ void initialize_source_test_ghost() {
 }
 void set_config(const MuPcConfig& c) {
   std::lock_guard<std::mutex> lk(g_mutex);
+  g_test_env_done = true;
   if (std::memcmp(&g_config, &c, sizeof c) == 0) return;
   g_config = c;
   g_config.version = (uint8_t)MU_PC_CONFIG_VERSION;
@@ -273,7 +281,7 @@ void on_proc_input(ppc::Context& c) {
   if (host::game_image) return;   // the Source Port runs the model in its game code
   const uint8_t major = host::rd8(kSceneState);
   if (major != g_last_major) { g_last_major = major; ++g_session; }
-  static const bool any_mode = std::getenv("MELEE_PC_ANY_MODE") != nullptr;   // tests only: any offline match
+  static const bool any_mode = host::test_env::getenv("MELEE_PC_ANY_MODE") != nullptr;   // tests only: any offline match
   if (major != kTrainingMajor && !any_mode) return;
   if (slippi::online::is_online_match() || slippi::playback::enabled()) return;
   const MuPcConfig cfg = config();
@@ -286,7 +294,7 @@ void on_proc_input(ppc::Context& c) {
   const uint32_t slot = kPlayerSlots + idx * kPlayerStride;
   // MELEE_PC_TEST_P2_CPU (tests only, with MELEE_PC_ANY_MODE): player 2 of a scripted two-human VS
   // match becomes a CPU, so the practice CPU can be checked without scripting the CPU badge.
-  static const bool p2_cpu = any_mode && std::getenv("MELEE_PC_TEST_P2_CPU") != nullptr;
+  static const bool p2_cpu = any_mode && host::test_env::getenv("MELEE_PC_TEST_P2_CPU") != nullptr;
   if (p2_cpu && idx == 1 && host::rd32(slot + 0x8) == 0) host::wr32(slot + 0x8, 1);
   if (host::rd32(slot + 0x8) != 1) return;   // pkind: CPU only
   // The opponent: the first human player in the match.
@@ -325,7 +333,7 @@ void on_proc_input(ppc::Context& c) {
   host::wr8(cpu + 0x7, (uint8_t)stick8(in.cy));
   host::wr8(cpu + 0x8, (uint8_t)std::lround(std::fmin(1.0f, std::fmax(0.0f, in.l)) * 255.0f));
   host::wr8(cpu + 0x9, (uint8_t)std::lround(std::fmin(1.0f, std::fmax(0.0f, in.r)) * 255.0f));
-  if (std::getenv("MELEE_PC_LOG") && g_logs < 400 && g_state[idx].plan != g_state[idx].last_logged) {
+  if (host::test_env::getenv("MELEE_PC_LOG") && g_logs < 400 && g_state[idx].plan != g_state[idx].last_logged) {
     ++g_logs;
     g_state[idx].last_logged = g_state[idx].plan;
     host::log("practice cpu: frame %u plan %s, motion %d, x %.1f", v.frame, mu_pc_plan_name(g_state[idx].plan),

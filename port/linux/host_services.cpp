@@ -4,6 +4,8 @@
 #define _GNU_SOURCE
 #endif
 #include "host_services.h"
+#include "mu_host_aram.h"
+#include "../runtime/host/session_logs.h"
 #include "input_script.h"
 #include "ax_ucode.h"
 #include "disc_archive.h"
@@ -54,7 +56,7 @@ namespace {
 constexpr uintptr_t locked_cache_base = 0xE0000000u;
 constexpr uint32_t locked_cache_bytes = 16u << 10;
 constexpr uint64_t ticks_per_frame = MU_TB_HZ / 60;
-constexpr uint32_t aram_bytes = 32u << 20;
+constexpr uint32_t aram_bytes = MU_HOST_ARAM_BYTES;
 using Clock = std::chrono::steady_clock;
 Config cfg;
 Counters count;
@@ -997,7 +999,8 @@ bool initialize(const Config& config, std::string* error) {
   cfg=config; count={}; game={}; audio={}; stop_requested=false; stop_code=0; resimulating=false;
   next_retrace=ticks_per_frame; sound=1; progressive=0;
   if (!cfg.log_path.empty()) {
-    log_file=std::fopen(cfg.log_path.c_str(), "w");
+    const bool rotated = host::rotate_session_logs(cfg.log_path);
+    log_file=std::fopen(cfg.log_path.c_str(), rotated ? "w" : "a");
     if (!log_file) return fail(error, "cannot open log file: " + std::string(std::strerror(errno)));
   }
   auto startup_failed = [&] { shutdown(); return false; };

@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 #include "test_env.h"
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "replay_scan.h"
 
 #include "slippilib/SlippiGame.h"

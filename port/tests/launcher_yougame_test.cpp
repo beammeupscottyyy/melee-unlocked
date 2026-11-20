@@ -2,6 +2,7 @@
 // and each request type answered as the game's loopback client expects ({ok, result} or {ok:false}).
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "launcher_yougame.h"
+#include "launcher_yougame_app.h"
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -51,27 +52,44 @@ json call(Fake& f, const HttpRequest& r, int* status = nullptr) {
 }
 }  // namespace
 
-// --serve SITE EMAIL PASSWORD VERSION EXE DLL: the real bridge for the end-to-end run
-// (tools/yougame_fake/e2e.py). Signs in to the stand-in site, prints "BRIDGE <url> <token>", then
-// answers until stdin closes.
-int serve(int argc, char** argv) {
-  if (argc < 8) return 2;
-  _putenv_s("MELEE_LAUNCHER_TEST", "1");
-  _putenv_s("MELEE_YOUGAME_SITE", argv[2]);
-  _putenv_s("MELEE_YOUGAME_AUTH", argv[2]);
-  std::string why;
-  if (!sign_in(argv[3], argv[4], &why)) { std::printf("SIGNIN FAILED %s\n", why.c_str()); return 3; }
-  if (!start_bridge(&why)) { std::printf("BRIDGE FAILED %s\n", why.c_str()); return 4; }
-  // The launcher's restart, recorded instead of done: a line the end-to-end run reads.
-  set_restart_older([](const Allowed& older, const std::string& mode) {
-    std::printf("RESTART %s %s\n", older.version.c_str(), mode.c_str());
-    std::fflush(stdout);
-    return std::string();
-  });
-  const std::string token = new_launch_token();
+// --serve-web FOLDER VERSION EXE DLL [SCRIPT]: the real bridge over the launcher's browser view, on
+// YouGame staging. FOLDER holds the view's session and session.ini (what the launcher keeps in
+// launcher.ini): a session saved there is used as it is, as a launcher started again does; otherwise
+// YouGame's sign-in page opens (run it on a desktop nobody sees) and SCRIPT, a file, types a test
+// account into it. Prints "BRIDGE <url> <token> <name> <code>", then answers until stdin closes.
+int serve_web(int argc, char** argv) {
+  if (argc < 6) return 2;
   auto wide = [](const char* s) { std::wstring w; for (; *s; ++s) w += (wchar_t)(unsigned char)*s; return w; };
-  set_build(argv[5], wide(argv[6]), wide(argv[7]));
-  refresh_allowed(argv[5], wide(argv[6]), wide(argv[7]));
+  const std::string folder = argv[2], ini = folder + "/session.ini";
+  set_web_folder(wide(argv[2]));
+  set_on_session_change([ini] {
+    if (FILE* f = std::fopen(ini.c_str(), "wb")) { const std::string lines = ini_lines(); std::fwrite(lines.data(), 1, lines.size(), f); std::fclose(f); }
+  });
+  if (FILE* f = std::fopen(ini.c_str(), "rb")) {
+    char line[8192];
+    while (std::fgets(line, sizeof line, f)) {
+      std::string l = line;
+      while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+      load_line(l);
+    }
+    std::fclose(f);
+  }
+  std::string why;
+  if (account().signed_in) {
+    std::printf("REMEMBERED %s\n", account().code.c_str());
+  } else {
+    std::string script;
+    if (argc > 6)
+      if (FILE* f = std::fopen(argv[6], "rb")) { char buf[4096]; size_t n; while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) script.append(buf, n); std::fclose(f); }
+    if (!web_sign_in_available()) { std::printf("SIGNIN FAILED no browser view on this computer\n"); return 3; }
+    if (!sign_in_web(nullptr, &why, script)) { std::printf("SIGNIN FAILED %s\n", why.c_str()); return 3; }
+    std::printf("SIGNED IN %s\n", account().code.c_str());
+  }
+  std::fflush(stdout);
+  if (!start_bridge(&why)) { std::printf("BRIDGE FAILED %s\n", why.c_str()); return 4; }
+  const std::string token = new_launch_token();
+  set_build(argv[3], wide(argv[4]), wide(argv[5]));
+  refresh_allowed(argv[3], wide(argv[4]), wide(argv[5]));
   const Account a = account();
   std::printf("BRIDGE %s %s %s %s\n", bridge_url().c_str(), token.c_str(), a.name.c_str(), a.code.c_str());
   std::fflush(stdout);
@@ -80,7 +98,91 @@ int serve(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-  if (argc > 1 && std::string(argv[1]) == "--serve") return serve(argc, argv);
+  if (argc > 1 && std::string(argv[1]) == "--serve-web") return serve_web(argc, argv);
+  // --ask-app staging|production VERSION: asks the running YouGame app over its channel, as Connect does
+  // (never opens it). Prints the state and which parts of the account came back, not the account itself.
+  if (argc > 3 && std::string(argv[1]) == "--ask-app") {
+    namespace app = launcher::yougame::app;
+    const bool staging = std::string(argv[2]) == "staging";
+    std::printf("installed %d running %d\n", app::installed(staging) ? 1 : 0, app::running(staging) ? 1 : 0);
+    const app::Answer a = app::ask(staging, argv[3]);
+    static const char* names[] = {"signed in", "signed out", "not running", "refused", "no answer"};
+    std::printf("APP %s id %s name %s code %s why '%s'\n", names[a.state], a.player_id.empty() ? "no" : "yes",
+                a.name.empty() ? "no" : "yes", a.code.empty() ? "no" : "yes", a.why.c_str());
+    return a.state == app::Answer::kSignedIn ? 0 : 5;
+  }
+  if (argc > 2 && std::string(argv[1]) == "--sign-out-web") {   // the launcher's Disconnect: the folder goes
+    auto wide = [](const char* s) { std::wstring w; for (; *s; ++s) w += (wchar_t)(unsigned char)*s; return w; };
+    set_web_folder(wide(argv[2]));
+    sign_out();
+    return 0;
+  }
+  // The listing reads (native_build, pool) never reach a real site from these tests: nothing answers here.
+#ifdef _WIN32
+  _putenv_s("MELEE_LAUNCHER_TEST", "1");
+  _putenv_s("MELEE_YOUGAME_SITE", "http://127.0.0.1:9");
+#else
+  setenv("MELEE_LAUNCHER_TEST", "1", 1);
+  setenv("MELEE_YOUGAME_SITE", "http://127.0.0.1:9", 1);
+#endif
+  // Which rooms a release searches, from YouGame's game page: its newest Windows build's version while that
+  // is one of YouGame's own builds from before 0.9.990, the shared key ("") from 0.9.990 on or when unknown.
+  {
+    auto rec = [](const char* id, const char* version, const char* platform) {
+      return std::string("{\\\"buildId\\\":\\\"") + id + "\\\",\\\"version\\\":\\\"" + version + "\\\",\\\"platform\\\":\\\"" + platform + "\\\"}";
+    };
+    const char* a = "880b2eeb-0d00-4a00-8000-0000000e0131";
+    const char* b = "ef5cf674-1b68-447f-9144-794abfd4eb1e";
+    CHECK(pool_from_listing("") == "");
+    CHECK(pool_from_listing("no builds here") == "");
+    CHECK(pool_from_listing(rec(b, "0.9.218-online-test.122.30", "windows") + rec(a, "0.9.218-online-test.122.31", "windows") +
+                            rec(a, "0.9.218-online-test.122.32", "linux")) == "0.9.218");   // Windows names the pool
+    CHECK(pool_from_listing(rec(a, "0.9.218-online-test.122.31", "windows") + rec(b, "0.9.218-online-test.122.9", "windows")) ==
+          "0.9.218");                                                                     // 31 is newer than 9
+    CHECK(pool_from_listing(rec(a, "0.9.218-online-test.122.31", "windows") + rec(b, "0.9.990", "windows")) == "");          // our release listed
+    CHECK(pool_from_listing(rec(a, "0.9.990-online-test.123.1", "windows")) == "");                                         // a build of 0.9.990
+    CHECK(pool_from_listing(rec(a, "0.9.1001", "windows")) == "");
+    CHECK(pool_from_listing(rec(a, "0.9.218 bad\"version", "windows")) == "");
+    CHECK(pool_from_listing(rec(a, "0.9.218-online-test.122.31", "linux")) == "");
+    // native_build: YouGame's record of this release for this platform, and never another build's.
+    const char* app_w = "880b2eeb-0d00-4a00-8000-0000000e0135";
+    const char* app_l = "880b2eeb-0d00-4a00-8000-0000000c0189";
+    const std::string page = rec(a, "0.9.218-online-test.122.31", "windows") + rec(app_w, "0.9.220-online-test.122.39", "windows") +
+                             rec(app_l, "0.9.220-online-test.122.39", "linux");
+    CHECK(listed_builds(page).size() == 3 && listed_builds(page)[1].id == app_w && listed_builds(page)[2].platform == "linux");
+    CHECK(native_build_from_listing(page, "0.9.990", "windows") == "");                 // not listed: no other build's record
+    CHECK(native_build_from_listing(page, "0.9.220", "windows") == app_w);               // a build of this release
+    CHECK(native_build_from_listing(page, "0.9.220", "linux") == app_l);
+    CHECK(native_build_from_listing(page + rec(b, "0.9.990", "windows"), "0.9.990", "windows") == b);
+    CHECK(native_build_from_listing(page + rec(b, "0.9.990-online-test.123.1", "windows"), "0.9.990", "windows") == b);
+    CHECK(native_build_from_listing("", "0.9.990", "windows") == "");
+  }
+  // The YouGame app's hello answer, read as the game reads it (launcher_yougame_app.h): signed in with a
+  // player id, pending while the app loads its player, signed out otherwise, refused when not ok.
+  {
+    namespace app = launcher::yougame::app;
+    bool pending = true;
+    app::Answer a = app::read_hello(json::parse(R"({"re":1,"ok":true,"result":{"player":{"id":"u-9","name":"Ann"},"nameShared":true}})"), &pending);
+    CHECK(a.state == app::Answer::kSignedIn && a.player_id == "u-9" && a.name == "Ann" && !pending);
+    a = app::read_hello(json::parse(R"({"re":1,"ok":true,"result":{"player":{"id":"u-9","name":"Player"}}})"), &pending);
+    CHECK(a.state == app::Answer::kSignedIn && a.name.empty());   // name not shared: the code's tag is used
+    a = app::read_hello(json::parse(R"({"re":1,"ok":true,"result":{"playerPending":true,"signedIn":true}})"), &pending);
+    CHECK(a.state == app::Answer::kSignedOut && pending);
+    a = app::read_hello(json::parse(R"({"re":1,"ok":true,"result":{"signedIn":false}})"), &pending);
+    CHECK(a.state == app::Answer::kSignedOut && !pending);
+    a = app::read_hello(json::parse(R"({"re":1,"ok":false,"code":"accountChanged"})"), &pending);
+    CHECK(a.state == app::Answer::kRefused && a.why == "hello refused accountChanged");
+    CHECK(app::read_hello(json(), &pending).state == app::Answer::kNoAnswer);
+    // launcher.ini remembers whether this launcher connected through the app (1) or Disconnect declined it (0);
+    // nothing of the app's account is kept.
+    CHECK(load_line("yougame_app=0") && app_declined() && !app_used_before());
+    CHECK(ini_lines().find("yougame_app=0") != std::string::npos);
+    CHECK(load_line("yougame_app=1") && !app_declined() && app_used_before());
+    CHECK(ini_lines().find("yougame_app=1") != std::string::npos);
+    CHECK(load_line("yougame_app=x") && !app_declined() && !app_used_before());
+    CHECK(ini_lines().find("yougame_app") == std::string::npos);
+    CHECK(!account().signed_in && ini_lines().find("yougame_session") == std::string::npos);
+  }
   // Parsing: incomplete, complete, oversize, chunked refused.
   {
     HttpRequest r;
@@ -92,6 +194,12 @@ int main(int argc, char** argv) {
     CHECK(parse_request("garbage\r\n\r\n", r) == -1);
   }
   Fake f;
+  // An older launcher may refuse best-effort match hints. Neither edge consumes a ticket.
+  for (bool open : {true, false, true, false}) {
+    const json hint = call(f, post(json{{"type", "matchState"}, {"open", open}}.dump()));
+    CHECK(hint["ok"] == false && hint["code"] == "unsupported");
+    CHECK(f.last_ticket.empty());
+  }
   // Refusals: wrong token, browser origin, another host name, wrong path.
   {
     int status = 0;
@@ -141,6 +249,31 @@ int main(int argc, char** argv) {
     CHECK(sent2["queue"] == "casual" && sent2["direct"] == "FRND#7" && sent2["after_match"] == "stay");
     const json bad = call(f, post(R"({"type":"mpTicket","players":2,"mode":"singles","direct":"BAD#1"})"));
     CHECK(bad["ok"] == false && bad["code"] == "not_found" && bad["error"] == "No player has that code");
+  }
+  // A held room (the Doubles home, the Friends lobby): the launcher picks the 12-character code and asks
+  // for the room's private ticket, as the YouGame app does. Room reports are accepted and go nowhere.
+  {
+    CHECK(new_room_code().size() == 12 && new_room_code() != new_room_code());
+    for (char c : new_room_code()) CHECK((c >= 'a' && c <= 'z') || (c >= '2' && c <= '9'));
+    // The Doubles home needs YouGame's own record of this release (its listing's buildId, native_build). The
+    // test site lists nothing: the launcher says so and sends no ticket.
+    const std::string before = f.last_ticket;
+    const json home = call(f, post(R"({"type":"mpFriend","hold":true,"players":2,"compatibility":"doubles-lobby-1:mu"})"));
+    CHECK(home["ok"] == false && home["error"].get<std::string>().find("opens once YouGame lists") != std::string::npos);
+    CHECK(f.last_ticket == before);
+    json sent;
+    const json lobby = call(f, post(R"({"type":"mpFriend","hold":true,"players":4,"compatibility":"friends-lobby-1:mu"})"));
+    CHECK(lobby["ok"] == true);
+    sent = json::parse(f.last_ticket);
+    CHECK(sent["mode"] == "singles" && !sent.count("teams_lobby") && sent["players"] == 4 && sent["queue"] == "private" &&
+          sent["lobby"]["minPlayers"] == 1);
+    CHECK(call(f, post(R"({"type":"mpFriend","hold":true,"players":3,"compatibility":"x"})"))["ok"] == false);
+    CHECK(call(f, post(R"({"type":"mpRoom","code":"abcdefghjkmn","players":[]})"))["ok"] == true);
+    // A ticket for a room named by its code is private; a search stays in its queue.
+    CHECK(call(f, post(R"({"type":"mpTicket","players":2,"mode":"singles","ranked":false,"room":"abcdefghjkmn"})"))["ok"] == true);
+    CHECK(json::parse(f.last_ticket)["queue"] == "private");
+    CHECK(call(f, post(R"({"type":"mpTicket","players":2,"mode":"singles","ranked":false})"))["ok"] == true);
+    CHECK(json::parse(f.last_ticket)["queue"] == "casual");
   }
   std::printf("launcher_yougame: ok\n");
   return 0;

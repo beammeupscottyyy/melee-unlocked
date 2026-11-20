@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "test_env.h"
 // The inputs are built exactly as ghost-ai/train.py builds them from a replay (features.py), and the
 // layers are PyTorch's: Linear, ReLU, GRU (gates r, z, n), Linear heads. Keep the two in step.
 #include "ghost_ai.h"
@@ -62,7 +63,7 @@ Slot g_slots[4];
 struct Ko { bool dead = false; float percent = 0, x = 0, y = 0; unsigned motion = 0; } g_ko[4];
 
 std::string model_path() {
-  if (const char* v = std::getenv("MELEE_GHOST_AI_FILE")) return v;
+  if (const char* v = host::test_env::getenv("MELEE_GHOST_AI_FILE")) return v;
   char exe[MAX_PATH] = {};
   GetModuleFileNameA(nullptr, exe, MAX_PATH);
   std::string dir(exe);
@@ -148,7 +149,7 @@ bool load_file(const std::string& path, Model& m) {
 
 bool load() {
   if (!load_file(model_path(), g_model)) return false;
-  if (const char* p1 = std::getenv("MELEE_GHOST_AI_FILE_P1")) g_has_p1 = load_file(p1, g_model_p1);
+  if (const char* p1 = host::test_env::getenv("MELEE_GHOST_AI_FILE_P1")) g_has_p1 = load_file(p1, g_model_p1);
   return true;
 }
 
@@ -167,7 +168,7 @@ const Model* selected_model(unsigned pro, unsigned slot, uint32_t& row) {
     row = g_model_p1.n_pros == 1 ? 0 : pro;
     return row < g_model_p1.n_pros ? &g_model_p1 : nullptr;
   }
-  if (!std::getenv("MELEE_GHOST_AI_FILE") && pro < kSpecialists) {
+  if (!host::test_env::getenv("MELEE_GHOST_AI_FILE") && pro < kSpecialists) {
     if (g_specialist_status[pro] == 0) {
       std::string path = model_path();
       path.resize(path.find_last_of("\\/") + 1);
@@ -182,7 +183,7 @@ const Model* selected_model(unsigned pro, unsigned slot, uint32_t& row) {
       return &g_specialists[pro];
     }
   }
-  row = std::getenv("MELEE_GHOST_AI_FILE") && g_model.n_pros == 1 ? 0 : pro;
+  row = host::test_env::getenv("MELEE_GHOST_AI_FILE") && g_model.n_pros == 1 ? 0 : pro;
   return base_ready && row < g_model.n_pros ? &g_model : nullptr;
 }
 
@@ -257,13 +258,13 @@ bool available(unsigned pro) {
 }
 
 bool specialist_available(unsigned pro) {
-  if (!std::getenv("MELEE_GHOST_AI_FILE") && phillip_available(pro)) return true;
+  if (!host::test_env::getenv("MELEE_GHOST_AI_FILE") && phillip_available(pro)) return true;
   std::lock_guard<std::mutex> lk(g_mutex);
   uint32_t row;
   if (!selected_model(pro, 1, row)) return false;
   // An explicit one-policy file is used by isolated runtime tests. A release menu must expose a
   // named player only when that player's own independent file exists.
-  return std::getenv("MELEE_GHOST_AI_FILE") != nullptr ||
+  return host::test_env::getenv("MELEE_GHOST_AI_FILE") != nullptr ||
          (pro < kSpecialists && g_specialist_status[pro] == 1);
 }
 
@@ -294,7 +295,7 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
     std::lock_guard<std::mutex> lk(g_mutex);
     on = g_enabled;
   }
-  if (on && !std::getenv("MELEE_GHOST_AI_FILE") && !(o.slot == 0 && std::getenv("MELEE_GHOST_AI_FILE_P1")) && phillip_ai::act(o, out))
+  if (on && !host::test_env::getenv("MELEE_GHOST_AI_FILE") && !(o.slot == 0 && host::test_env::getenv("MELEE_GHOST_AI_FILE_P1")) && phillip_ai::act(o, out))
     return true;
   std::lock_guard<std::mutex> lk(g_mutex);
   uint32_t model_pro = 0;
@@ -391,8 +392,8 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
 
   // How sure it plays: below 1 it keeps to what the pro most likely held (fewer stray inputs).
   // MELEE_GHOST_TEMP (tests) sets it to compare.
-  static const float temp_all = [] { const char* v = std::getenv("MELEE_GHOST_TEMP"); return v ? (float)std::atof(v) : kTemperature; }();
-  static const float temp_p1 = [] { const char* v = std::getenv("MELEE_GHOST_TEMP_P1"); return v ? (float)std::atof(v) : -1.f; }();
+  static const float temp_all = [] { const char* v = host::test_env::getenv("MELEE_GHOST_TEMP"); return v ? (float)std::atof(v) : kTemperature; }();
+  static const float temp_p1 = [] { const char* v = host::test_env::getenv("MELEE_GHOST_TEMP_P1"); return v ? (float)std::atof(v) : -1.f; }();
   const float requested_temp = (o.slot == 0 && temp_p1 > 0) ? temp_p1 : temp_all;
   const float temp = std::isfinite(requested_temp) && requested_temp > 0 ? requested_temp : kTemperature;
   const int stick = sample(s.rng, ls, kStick, temp);
@@ -412,7 +413,7 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
 
   // Self-play (MELEE_GHOST_ROLLOUT=<folder>, tests and training only): each frame what it saw, what it
   // chose and how likely that was, for ghost-ai/selfplay.py. The memory is written every 64 frames.
-  static const char* rollout = std::getenv("MELEE_GHOST_ROLLOUT");
+  static const char* rollout = host::test_env::getenv("MELEE_GHOST_ROLLOUT");
   if (rollout && *rollout) {
     struct Rec {
       float cont[55];

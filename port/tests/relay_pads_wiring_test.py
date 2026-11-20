@@ -37,10 +37,20 @@ class RelayPadsWiringTest(unittest.TestCase):
     def setUpClass(cls):
         cls.window = code(source("port/runtime/host/window.cpp"))
 
-    def test_state_returns_relay_before_native_work(self):
+    def test_state_asks_provider_then_relay_before_native_work(self):
         state = function(self.window, "xinput_state")
-        self.assertRegex(state, r'^\s*if\s*\(yougame::relay_pads::active\(\)\)\s*'
-                               r'return yougame::relay_pads::read\(idx, state\);')
+        # The app's provider (yougame_controller_relay.h) first: the raw relay seats read every
+        # relayed pad as an Xbox pad, so with them first a PlayStation or Switch pad was read twice.
+        provider = re.match(r'\s*if\s*\(controller_relay::active\(\)\)\s*\{', state)
+        self.assertIsNotNone(provider)
+        sample = block(state, provider.end())
+        self.assertNotIn("relay_pads", sample)
+        self.assertNotIn("xinput_ask(", sample)
+        self.assertIn("return false;", sample)
+        self.assertIn("return true;", sample)
+        after = state[provider.end() + len(sample) + 1:]
+        self.assertRegex(after, r'^\s*if\s*\(yougame::relay_pads::active\(\)\)\s*'
+                                r'return yougame::relay_pads::read\(idx, state\);')
 
     def test_native_reads_only_inside_poll(self):
         ask = function(self.window, "xinput_ask")
@@ -48,6 +58,9 @@ class RelayPadsWiringTest(unittest.TestCase):
         self.assertIsNotNone(gate)
         native = block(ask, gate.end())
         self.assertRegex(native, r'return XInputGetState\(\(DWORD\)idx, state\) == ERROR_SUCCESS;')
+        # With the provider installed nothing is asked: neither Windows nor the raw relay seats.
+        # Any line of the function (the box feed is checked first since 0.9.216).
+        self.assertRegex(ask, re.compile(r'^\s*if\s*\(controller_relay::active\(\)\)\s*return ERROR_DEVICE_NOT_CONNECTED;', re.M))
         self.assertEqual(len(re.findall(r'\bXInputGetState\s*\(', native)), 1)
         self.assertEqual(len(re.findall(r'\bXInputGetState\s*\(', self.window)), 1)
 
@@ -86,6 +99,26 @@ class RelayPadsWiringTest(unittest.TestCase):
         for target in ("melee_source", "melee_port"):
             self.assertRegex(cmake, r'add_executable\(' + target + r'\s')
             self.assertRegex(cmake, r'target_link_libraries\(' + target + r' PRIVATE runtime\b')
+
+    def test_link_installs_provider_before_the_relay_latches(self):
+        link = function(code(source("port/runtime/hle/yougame_link.cpp")), "handle_app_line")
+        install = link.index("host::controller_relay::install(relayed_controllers);")
+        self.assertLess(link.index("if (relay_pads::parse(line, frame, reason))"), install)
+        self.assertLess(install, link.index("g_relay_pads.accept(line, now_ms());"))
+        self.assertEqual(link.count("controller_relay::install("), 1)
+
+    def test_hid_stays_native_until_the_app_sends_hid(self):
+        poll = function(self.window, "relay_hid_poll")
+        self.assertRegex(poll, r'^\s*return relay_owns_hid\(\) \?')
+        self.assertIn("yougame::relay_pads::owns_hid()", function(self.window, "relay_owns_hid"))
+        name = function(code(source("port/runtime/host/hid_pad.cpp")), "hidpad_name")
+        self.assertRegex(name, r'if \(controller_relay::sample\(CaptureDevice::HidPad,slot,s\)\) return s\.name;\s*\}')
+
+    def test_gameplay_and_preview_use_relay_fallback_facts(self):
+        for name, snapshot in (("read_devices", "debug"), ("input_debug_snapshot", "snapshot")):
+            body = function(self.window, name)
+            self.assertIn(f"controller_relay::fallback_facts(input_device_facts({snapshot}))", body)
+            self.assertIn("effective_port_source(g_port_sources, facts, port)", body)
 
     def test_eof_resets_relay_before_exit(self):
         link = function(code(source("port/runtime/hle/yougame_link.cpp")), "read_stdin")

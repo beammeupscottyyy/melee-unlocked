@@ -12,7 +12,7 @@ static s32 mu_xferred;
 
 int mu_card_boot_confirm(unsigned int channel, unsigned int decision)
 {
-    return mu_host && mu_host->version >= 23 && mu_host->card_boot_confirm &&
+    return mu_host && mu_host->version >= 22 && mu_host->card_boot_confirm &&
            mu_host->card_boot_confirm(channel, decision);
 }
 

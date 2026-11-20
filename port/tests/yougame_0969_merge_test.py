@@ -28,12 +28,16 @@ class YouGame0969MergeTest(unittest.TestCase):
         # Choosing the upstream side of the large conflict drops these targets.
         for name in ("lcancel_policy", "slippi_game_prep", "stage_read_pin",
                      "yougame_agent_fight", "yougame_agent_fight_off", "yougame_ranked",
-                     "yougame_relay_pads", "yougame_ranked_rules", "yougame_mode_policy",
+                     "yougame_relay_pads", "yougame_ranked_rules",
                      "host_stub_policy", "yougame_merge", "yougame_0956_merge",
                      "yougame_0962_merge", "yougame_0963_merge", "yougame_0968_merge",
                      "yougame_mod_online", "yougame_mod_online_noslippi"):
             with self.subTest(name=name):
                 self.assertEqual(len(re.findall(r"add_test\(NAME port_" + name + r"\s", cmake)), 1)
+
+        root = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"add_test\(NAME port_yougame_mode_policy\s", root)), 1)
+        self.assertLess(root.index("add_test(NAME port_yougame_mode_policy "), root.index("  return()"))
 
     def test_agent_hook_stays_opt_in_and_imgui_keeps_gamepad_focus_fix(self):
         cmake = (ROOT / "port/CMakeLists.txt").read_text(encoding="utf-8")

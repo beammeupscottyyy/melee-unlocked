@@ -19,8 +19,8 @@
 extern "C" {
 #endif
 
-#define MU_HOST_API_VERSION 26
-#define MU_GAME_API_VERSION 6
+#define MU_HOST_API_VERSION 33
+#define MU_GAME_API_VERSION 10
 #define MU_SLIPPI_RESPONSE_CAPACITY 4096u
 
 /* Values are raw IEEE-754 bits so the two builds can be compared exactly. */
@@ -41,6 +41,14 @@ typedef struct MuStatePod {
     uint32_t rng, scene;
     MuFighterState player[6];
     uint32_t scene_major, match_frame;
+    /* Canonical main/rules menu navigation, without pointers or padding. */
+    uint32_t menu_kind, menu_previous, menu_selection, menu_entering;
+    /* Version 8: console rollback diagnostics only. Explicit scalar words, never raw rules or
+     * pointer-containing result memory. valid=0 keeps the legacy 80-word console digest. */
+    uint32_t console_valid, console_result, console_pauser, console_seconds, console_timer_frames;
+    uint32_t console_stage, console_teams, console_time_limit, console_timer_enabled;
+    uint32_t console_timer_up, console_item_frequency;
+    uint32_t console_stocks[6], console_damage[6];
 } MuStatePod;
 
 /* The console's 40.5 MHz timebase, which the host advances deterministically. */
@@ -151,6 +159,21 @@ typedef struct MuNativeRenderScopeEvent {
     uint32_t phase; /* 1: begin PObj; 2: end PObj */
     uint32_t reserved;
 } MuNativeRenderScopeEvent;
+
+/* Console-only adapter, never transmitted. Remote order is ports ascending, skipping local.
+ * latest is a match body key (including pause); absent ports are confirmed disconnected.
+ * Version 26 adds VALIDATED: an exclusive boundary checked/replayed by the game predictor. */
+enum { MU_CONSOLE_QUERY, MU_CONSOLE_MATCH_BEGIN, MU_CONSOLE_FORWARD,
+       MU_CONSOLE_INPUTS, MU_CONSOLE_REPLAY, MU_CONSOLE_MATCH_END, MU_CONSOLE_FAIL,
+       MU_CONSOLE_BOUNDARY, MU_CONSOLE_BODY_END, MU_CONSOLE_CONFIRM, MU_CONSOLE_COMMIT, MU_CONSOLE_SERVICE,
+       MU_CONSOLE_VALIDATED };
+typedef struct MuConsoleInputs {
+    uint32_t epoch;
+    int32_t local_port;
+    int32_t latest[3];
+    MuPadStatus local;
+    MuPadStatus remote[3][7];
+} MuConsoleInputs;
 
 typedef struct MuHostApi {
     uint32_t version;   /* MU_HOST_API_VERSION */
@@ -375,27 +398,46 @@ typedef struct MuHostApi {
 
     /* Version 21. The colour of the Arcade look's grid (MU_DISPLAY_OPTION_GRID), 0xRRGGBB. */
     uint32_t (*grid_color)(void);
-
-    /* Version 22. Screen shake strength (VIDEO > Screen shake): the camera's quake offset is scaled
-     * by this, 1 the game's own. Camera only, read live; "Disable screen shake" still zeroes it. */
-    float (*screen_shake_scale)(void);
-
-    /* Version 23. YouGame answers only the card scene's create/created prompts.
+    /* Version 22. YouGame answers only the card scene's create/created prompts.
      * The game still probes, creates and writes the save using its own disc assets. */
     int32_t (*card_boot_confirm)(uint32_t channel, uint32_t decision);
-
-    /* Version 24. Each drawn frame, per player slot 0..3, for the community codes' overlays: Nana's
-     * damage (-1 when the player has no Nana in play) and the player's team in a teams match (-1
-     * otherwise). Display only. */
-    void (*hud_extras)(int32_t slot, int32_t nana_damage, int32_t team);
-    /* Version 23. Session-gated diagnostic environment; NULL means unset. */
+    /* Version 22. Session-gated diagnostic environment; NULL means unset. */
     const char* (*test_getenv)(const char* name);
+    /* Version 23. Console session body boundary, before consuming the raw pad queue.
+     * Nonzero replaces its next entry with the confirmed four pads. Inactive returns zero. */
+    int32_t (*console_frame_begin)(void);
+    /* Returns the agreed initial RNG seed only during a console boot. */
+    int32_t (*console_seed)(uint32_t* seed);
+    /* Version 24. Explicit console match lifecycle and input history; zero means failure/inactive.
+     * FORWARD issues once and admits a body, REPLAY injects retained history without issuance.
+     * B1/B2 remain the snapshot commands. QUERY is the console-only opt-in switch. */
+    int32_t (*console_rollback)(int32_t operation, uint32_t body, MuConsoleInputs* inputs);
+    /* Version 25. Non-advancing clock domains for console rollback alarm scheduling.
+     * Zero preserves the ordinary SDK clock path (including console rollback OFF). */
+    int32_t (*console_alarm_clock)(uint64_t* simulation, uint64_t* hardware);
 
-    /* Version 25. Nonzero while the host's ray-traced renderer wants render semantics: the game then
-     * writes the private FIFO tokens 0xF3-0xF6 (mu_rtx_tokens.h) describing its materials, textures,
-     * lights, cameras and particle passes. Display only; zero means not one byte is written. */
+    /* Version 27. Screen shake strength (VIDEO > Screen shake): the camera's quake offset is scaled
+     * by this, 1 the game's own. Read live offline; network sessions keep the game's own scale.
+     * "Disable screen shake" still zeroes the offset. */
+    float (*screen_shake_scale)(void);
+    /* Version 28. Frozen console boot choice: nonzero only when the agreed session
+     * card contains the host's save. Empty-digest sessions keep fresh-card boot. */
+    int32_t (*console_has_save)(void);
+    /* Version 29. Same-process origin continuation/query. No network or native memory transfer.
+     * 0 query canonical boot, 1/2/4 consume mode/scene/body resume flags, 8 skip drawing.
+     * Version 30: 16 queries the Friends CSS lock (never active inside a fight),
+     * 32 admits the canonical Friends boot save loader. */
+    int32_t (*console_origin)(int32_t operation);
+    /* Version 31 (upstream's version 24). Each drawn frame, per player slot 0..3, for the community
+     * codes' overlays: Nana's damage (-1 when the player has no Nana in play) and the player's team
+     * in a teams match (-1 otherwise). Display only. */
+    void (*hud_extras)(int32_t slot, int32_t nana_damage, int32_t team);
+    /* Version 32 (upstream's version 25). Nonzero while the host's ray-traced renderer wants render
+     * semantics: the game then writes the private FIFO tokens 0xF3-0xF6 (mu_rtx_tokens.h) describing
+     * its materials, textures, lights, cameras and particle passes. Display only; zero means not one
+     * byte is written. */
     int32_t (*native_rtx_semantics)(void);
-    /* Version 26. Each drawn frame, per player slot 0..3: a pro AI's tag carries a small robot after
+    /* Version 33 (upstream's version 26). Each drawn frame, per player slot 0..3: a pro AI's tag carries a small robot after
      * the name. `dx` is the robot's centre right of the tag's x and `width` the room the name left for
      * it, both in 640x480 units; width 0 when this tag has none. Display only. */
     void (*hud_pro_tag)(int32_t slot, float dx, float width);
@@ -678,6 +720,8 @@ typedef struct MuGameApi {
      * and changes the few pieces of scene state it needs through these operations (MU_PRACTICE_*).
      * `args` carries inputs and receives outputs; returns 0 on success, -1 for an unknown op. */
     int32_t (*practice)(int32_t op, int32_t* args, int32_t count);
+    /* Version 10: exact MU_CSS_SIZE bytes; returns zero on success, before any body input. */
+    int32_t (*css_state)(int32_t operation, void* bytes, uint32_t size);
 } MuGameApi;
 
 enum {
@@ -697,8 +741,14 @@ enum {
     MU_PRACTICE_TRAINING_PICK = 12,     /* a[0] slot (0 player, 1 CPU), a[1] character, a[2] costume: Training's select starts there */
     MU_PRACTICE_FRAME_PAUSE = 10,       /* a[0] pause (1), run (0) or ask (-1); a[1] step one frame; a[0] out: paused */
     MU_PRACTICE_UNLOCKED = 14,          /* out a[0]: bit per character kind the memory card has unlocked */
-    MU_PRACTICE_PAGE_PAUSE = 15,        /* YouGame app sessions: in [0] -1 query, 0 resume, 1 pause; out [0] flag,
-                                           [1] live match, [2] scene frame counter */
+    MU_PRACTICE_CSS_PICK = 16,     /* out [0] live CSS fighter, [1] costume, [2] physical pad */
+    MU_PRACTICE_FRIENDS_RETURN = 17, /* leave to Online, Friends row highlighted */
+    MU_PRACTICE_PAGE_PAUSE = 15,    /* in [0] -1 query, 0 resume, 1 pause; out [0] flag,
+                                      [1] live match, [2] scene frame counter; with n >= 5 also
+                                      [3] Start's pause, [4] a match scene (game state) */
+    MU_PRACTICE_BOOT_MATCH = 35,    /* agent test: the --match VS game from the main menu, no
+                                      character or stage screens; returns its stage, -1 refused
+                                      (shim/mu_boot_match.c). 32-34 are the CPU bracket's ops. */
 };
 
 /* The library's one export. The host fills `host`, the game fills `game`. */

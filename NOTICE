@@ -11,6 +11,9 @@ the GNU General Public License for more details. You should have received a copy
 General Public License along with this program (LICENSE in the source, licenses\COPYING.txt in
 a release). If not, see <https://www.gnu.org/licenses/>.
 
+Source: download the exact source of this build from its page on YouGame (Download source),
+https://staging.yougame.co/g/melee-unlocked
+
 Releases up to and including 0.8.1 were published under GPL-2.0-or-later. Starting with 0.8.5
 the project is published under GPL-3.0-or-later. Source files whose header names another
 project keep that project's notice (for example GPL-2.0-or-later for code ported from Dolphin
@@ -42,6 +45,7 @@ Third-party components
 Paths are in the source repository. A release carries the license texts in licenses\.
 
 Built into the program:
+Rank badge images (sourceport/game/shim/assets/rank_badges/*.png) © 2026 YouGame, licensed under GPL-3.0-or-later as part of this program. The YouGame name and logo are trademarks of YouGame and are not licensed here.
 - ENet (MIT): port/third_party/enet/LICENSE
 - Dear ImGui (MIT): port/third_party/imgui/LICENSE.txt. Its embedded ProggyClean and
   ProggyForever fonts (MIT): notices in port/third_party/imgui/imgui_draw.cpp
@@ -70,10 +74,30 @@ Built into the program:
   Exception)
 
 Code ported or adapted from other projects:
+- Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0
+  (idea: Chris's friend Tyler, Squad Strike Gecko codes). Optional MELEE_SQUAD_STRIKE mode, off by default.
+  Includes fixes from v1.0.1; the author's confirmation for those is pending.
+  These files: licence not stated; used with the author's permission (11-03-2026); not covered by
+  this repository's GPL grant until the author confirms:
+    port/cmake/squad.cmake
+    port/runtime/abi/mu_squad_wire.h
+    port/runtime/hle/squad_test_spec.h
+    port/runtime/hle/yougame_squad.h
+    port/runtime/host/squad_digest.h
+    sourceport/game/include/mu_squad.h
+    sourceport/game/shim/mu_squad.c
+    sourceport/game/shim/mu_squad_css.c
+    sourceport/game/shim/mu_squad_label_art.h
+    sourceport/game/shim/mu_squad_online.c
+    sourceport/game/tests/squad_lineup.c
+  Chris's gmsquad.c and gmsquad.h became mu_squad.c and mu_squad.h; his mncharsel_squad.h became
+  mu_squad_css.c. The MU_SQUAD-guarded hooks in other files carry the same permission. Everything else
+  stays under this repository's licence.
 - Dolphin (GPL-2.0-or-later): the RVZ and WIA disc image reader, GX shader generation, AX audio emulation, the fres and frsqrte
   tables, the GameCube adapter protocol
 - Slippi Ishiiruka (GPL-2.0-or-later): the Slippi EXI device, online play, replay playback,
   custom texture naming
+- project-slippi/slippi-ssbm-c (GPL-3.0): Ranked selection policy and client screen groundwork
 - Slippi's game code, slippi-ssbm-asm (GPL-3.0): the Slippi codes built into the Static Recomp
   and their native form in the Source Port
 - Slippi's Rust extensions (published with the GPL version 2 text): the music player and game

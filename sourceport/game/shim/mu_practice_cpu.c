@@ -1,3 +1,4 @@
+#include "mu_test_env.h"
 /* Practice CPU, Source Port side: the view of the CPU and its opponent from the Fighter structs, the
  * stage's ledges from its collision lines, the floor below from the game's own floor query, and the
  * model's controller handed to Fighter_procInput through the lab's input path (mu_lab_input).
@@ -5,7 +6,6 @@
  * The settings come from the host (CMD_PRACTICE_CPU, source_host.cpp) once a frame. The model and
  * its state are ordinary game data here, so savestates and the lab's recordings keep them.
  * Offline Training only: never online, while an online match is pending, or in replay playback. */
-#include "mu_test_env.h"
 #include <dolphin/os.h>
 #include <melee/ft/fighter.h>
 #include <melee/ft/forward.h>
@@ -180,7 +180,7 @@ static int pc_land_frames(const Fighter* fp)
 static int pc_allowed(void)
 {
     static int any_mode = -1;
-    if (any_mode < 0) any_mode = getenv("MELEE_PC_ANY_MODE") != NULL;   /* tests only: any offline match */
+    if (any_mode < 0) any_mode = mu_test_getenv("MELEE_PC_ANY_MODE") != NULL;   /* tests only: any offline match */
     return (gm_GetCurrentGameMode() == GM_TRAINING || any_mode) && !mu_online_active() && !mu_online_pending() &&
            !mu_replay_abi_active();
 }
@@ -390,19 +390,19 @@ static void ghost_read_previous(const Fighter* fp, MuGhostFighter* g, unsigned i
 /* What each pro AI fighter really held last frame (pc_drive, after the safety net). */
 static MuGhostAct ghost_applied[4];
 
-/* The pro for this fighter: the one picked, or (MU_PC_PRESET_AI) the pro who plays its character. */
+/* The pro for this fighter: the pro who plays its character, whichever pro was picked (owner 11-19: a
+ * Fox carried the Marth pro's name and was driven by the Marth pro). Only a character no pro plays
+ * (Jigglypuff's slot 2 has no player) takes the picked pro; MU_PC_PRESET_AI has none for it. */
 static int ghost_pro(const Fighter* fp, const MuPcConfig* c)
 {
-    if (c->preset == MU_PC_PRESET_AI) {
-        switch (fp->kind) {
-        case Ft_Kind_Falco: return 0;   /* Mang0 */
-        case Ft_Kind_Mars: return 1;    /* Zain */
-        case Ft_Kind_Purin: return 2;   /* slot 2 */
-        case Ft_Kind_Fox: return 3;     /* Cody Schwab */
-        case Ft_Kind_Yoshi: return 4;   /* aMSa */
-        default: return -1;
-        }
+    switch (fp->kind) {
+    case Ft_Kind_Falco: return 0;   /* Mang0 */
+    case Ft_Kind_Mars: return 1;    /* Zain */
+    case Ft_Kind_Fox: return 3;     /* Cody Schwab */
+    case Ft_Kind_Yoshi: return 4;   /* aMSa */
+    default: break;
     }
+    if (c->preset == MU_PC_PRESET_AI) return -1;
     return (c->preset & 0x80u) ? (int) (c->preset & 0x7Fu) : -1;
 }
 
@@ -440,7 +440,7 @@ static int ghost_drive(Fighter* fp, Fighter* opp, const MuPcConfig* c, MuLabInpu
     obs.applied = ghost_applied[slot];
     ghost_read_previous(fp, &obs.self, obs.frame);
     ghost_read_previous(opp, &obs.opp, obs.frame);
-    if (getenv("MELEE_GHOST_LOG") != NULL) {
+    if (mu_test_getenv("MELEE_GHOST_LOG") != NULL) {
         /* How often the live opponent differs from its end-of-frame state (it should, it moved first). */
         static unsigned int seen, differ, self_differ, self_hit;
         MuGhostFighter live;
@@ -510,12 +510,12 @@ static int pc_drive(Fighter* fp, Fighter* opp, const MuPcConfig* c, MuLabInput* 
          * MELEE_GHOST_NO_NET (tests) leaves it to the network alone. */
         static int no_net = -1;
         const float ax = v.cpu.x < 0.0f ? -v.cpu.x : v.cpu.x;
-        if (no_net < 0) no_net = getenv("MELEE_GHOST_NO_NET") != NULL;
+        if (no_net < 0) no_net = mu_test_getenv("MELEE_GHOST_NO_NET") != NULL;
         const int off_net = no_net || driven == 2;
         /* Off the stage near or below the ledge, no air dodge: it spends every jump and leaves the
          * fighter helpless, and the network's ledge air dodges missed the stage. */
         if (!off_net && v.cpu.airborne && ax > v.ledge_x - 2.0f && v.cpu.y < v.ledge_y + 20.0f) {
-            if ((out->buttons & (MU_PC_L | MU_PC_R | MU_PC_Z)) && getenv("MELEE_GHOST_LOG") != NULL) {
+            if ((out->buttons & (MU_PC_L | MU_PC_R | MU_PC_Z)) && mu_test_getenv("MELEE_GHOST_LOG") != NULL) {
                 OSReport("[ghost] P%d air dodge dropped at %.0f,%.0f buttons %x\n", slot + 1, v.cpu.x, v.cpu.y, out->buttons);
             }
             out->buttons &= ~(MU_PC_L | MU_PC_R | MU_PC_Z);
@@ -548,7 +548,7 @@ static int pc_drive(Fighter* fp, Fighter* opp, const MuPcConfig* c, MuLabInput* 
             rc.freeze = 0;
             if (rc.recovery == MU_PC_RECOVER_GAME) rc.recovery = MU_PC_RECOVER_MIX;
             static int net_logs;
-            if (getenv("MELEE_GHOST_LOG") != NULL && (v.frame % 6u) == 0 && net_logs < 400) {
+            if (mu_test_getenv("MELEE_GHOST_LOG") != NULL && (v.frame % 6u) == 0 && net_logs < 400) {
                 net_logs++;
                 OSReport("[ghost] P%d net at %.0f,%.0f motion %d jumps %d ledge %.0f,%.0f\n", slot + 1, v.cpu.x,
                          v.cpu.y, (int) v.cpu.motion, (int) v.cpu.jumps_left, v.ledge_x, v.ledge_y);
@@ -599,7 +599,7 @@ static int pc_drive(Fighter* fp, Fighter* opp, const MuPcConfig* c, MuLabInput* 
         if (changed) {
             last_plan = pc_state[slot].plan;
             last_driven = driven;
-            if (getenv("MELEE_PC_LOG") != NULL && pc_logs < 400) {
+            if (mu_test_getenv("MELEE_PC_LOG") != NULL && pc_logs < 400) {
                 pc_logs++;
                 OSReport("[practice cpu] frame %d plan %s, motion %d, x %.1f, opp motion %d\n", (int) v.frame,
                          mu_pc_plan_name(pc_state[slot].plan), (int) v.cpu.motion, v.cpu.x, (int) v.opp.motion);
@@ -662,10 +662,10 @@ const char* mu_pro_tag_text(int slot)
     c = pc_settings();
     if (!c->enabled) return NULL;
     g = Player_GetEntity(slot);
-    if (c->preset & 0x80u && c->preset != MU_PC_PRESET_AI) {
+    if (g != NULL && g->user_data != NULL) {
+        pro = ghost_pro(g->user_data, c);   /* the pro who really drives this fighter */
+    } else if (c->preset & 0x80u && c->preset != MU_PC_PRESET_AI) {
         pro = (int) (c->preset & 0x7Fu);
-    } else if (g != NULL && g->user_data != NULL) {
-        pro = ghost_pro(g->user_data, c);
     } else {
         return NULL;
     }

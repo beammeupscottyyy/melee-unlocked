@@ -40,19 +40,21 @@ class YouGame0968MergeTest(unittest.TestCase):
                     self.assertIn("(!opts_.vsync && !fullscreen_state_.exclusive_active) ? DXGI_PRESENT_ALLOW_TEARING : 0u", backend)
                 else:
                     self.assertEqual(backend.count("swapchain_->Present("), 2)
+                self.assertIn("if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);", backend)
+                self.assertIn("&& !yougame::embedded();", backend)
                 present = re.search(
                     r"const HRESULT present_result = \[&\] \{(.*?)\}\(\);",
                     backend, re.S)
                 self.assertIsNotNone(present)
                 wait = "host::perf::Scope wait_cost(host::perf::Stage::Wait);"
                 self.assertLess(present.group(1).index(wait),
-                                present.group(1).index("swapchain_->Present("))
-                self.assertIn("swapchain_->Present(0, DXGI_PRESENT_TEST)", present.group(1))
+                                present.group(1).index("return swapchain_->Present("))
                 extra = "allow_tearing_ && " if name == "gx_d3d11.cpp" else ""
-                self.assertIn(
-                    ": swapchain_->Present(synced ? 1 : 0, (!synced && " + extra +
-                    "!fullscreen_state_.exclusive_active) ? DXGI_PRESENT_ALLOW_TEARING : 0);",
-                    present.group(1))
+                self.assertIn("return swapchain_->Present(present.interval, present.flags);", present.group(1))
+                # The shared policy selects compositor vsync; tearing eligibility still uses
+                # the driver's actual exclusive state, even after a refused fullscreen request.
+                policy = backend.split("const auto present = yougame::box_present::choose(", 1)[1].split(";", 1)[0]
+                self.assertIn(extra + "!fullscreen_state_.exclusive_active, synced, yougame::embed_toplevel())", policy)
                 self.assertNotIn("opts_.exclusive_fullscreen", present.group(1))
 
     def test_ready_observes_successful_real_frames_including_occlusion(self):
@@ -61,7 +63,7 @@ class YouGame0968MergeTest(unittest.TestCase):
         for name in BACKENDS:
             with self.subTest(backend=name):
                 backend = source("port/runtime/gx/" + name)
-                signal = "yougame::parity::signals.presented(SUCCEEDED(present_result) && frame.test_fill < 0);"
+                signal = "yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);"
                 self.assertEqual(backend.count(signal), 1)
                 present = backend.index("const HRESULT present_result =")
                 ready = backend.index(signal)

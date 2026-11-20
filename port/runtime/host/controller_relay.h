@@ -14,11 +14,24 @@ struct Sample {
   int16_t axes[4]{}; // Standard full-range axes; Y increases upwards.
   uint8_t left = 0, right = 0;
   std::string name;
+  bool keyboard_standin = false; // App page keyboard, not a physical controller.
+  bool allow_fallback = true; // Explicit routes still work when automatic port 1 skips this pad.
 };
 struct Snapshot { std::array<Sample, 4> devices{}; };
 // nullptr restores standalone ownership. An active provider owns these families even when
 // its snapshot is empty: disconnection must not fall through to duplicate physical devices.
 using Read = Snapshot (*)();
+// Only the game's PADRead consumes timing samples. Preview/capture readers do not.
+inline thread_local bool game_poll = false;
+inline thread_local uint64_t poll_serial = 0;
+struct GamePoll {
+  GamePoll() { game_poll = true; ++poll_serial; }
+  ~GamePoll() { game_poll = false; }
+};
+using Route = void (*)(CaptureDevice, int, int);
+inline std::atomic<Route> route_observer{nullptr};
+inline void install_route(Route route) { route_observer.store(route, std::memory_order_release); }
+inline void routed(DeviceKind kind, int index, int port);
 using Rumble = void (*)(CaptureDevice, int, bool); // Must enqueue; never wait for app/USB I/O.
 inline std::atomic<Rumble> rumble_writer{nullptr};
 inline void install_rumble(Rumble write) { rumble_writer.store(write,std::memory_order_release); }
@@ -33,6 +46,23 @@ inline bool sample(CaptureDevice family, int index, Sample& out) {
   }
   return false;
 }
+inline CaptureDevice family_of(DeviceKind kind);
+// A live window-keyboard press uses its saved/default bindings even if the app
+// publishes an idle page-keyboard pad. Call only when keyboard actions are held;
+// otherwise the page pad still supplies its own relayed keys. Real pads keep their routes.
+inline PortSource console_source(PortSource source) {
+  Sample device;
+  if (sample(family_of(source.kind), source.index, device) && device.keyboard_standin)
+    return {DeviceKind::Keyboard, 0};
+  return source;
+}
+inline InputDeviceFacts fallback_facts(InputDeviceFacts facts) {
+  const auto read = reader.load(std::memory_order_acquire);
+  if (read) for (const auto& device : read().devices)
+    if (device.family == CaptureDevice::XInputPad && device.index >= 0 && device.index < 4)
+      facts.skip_xinput_fallback[device.index] = !device.allow_fallback;
+  return facts;
+}
 inline CaptureDevice family_of(DeviceKind kind) {
   switch(kind) {
     case DeviceKind::XInputPad:return CaptureDevice::XInputPad;
@@ -41,6 +71,9 @@ inline CaptureDevice family_of(DeviceKind kind) {
     case DeviceKind::HidPad:return CaptureDevice::HidPad;
     default:return CaptureDevice::None;
   }
+}
+inline void routed(DeviceKind kind, int index, int port) {
+  if (const auto route = route_observer.load(std::memory_order_acquire)) route(family_of(kind), index, port);
 }
 inline bool rumble(DeviceKind kind,int index,bool on) {
   if (!active() || kind==DeviceKind::GCAdapter || kind==DeviceKind::Keyboard) return false;

@@ -7,6 +7,7 @@
 #include "commdlg.h"
 #include "winhttp.h"
 #include "winhttp_ws_internal.h"
+#include "winhttp_cancel.h"
 #include <curl/curl.h>
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
@@ -33,6 +34,7 @@
 #include <sys/wait.h>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdint>
 #include <chrono>
 #include <cstdlib>
@@ -1085,6 +1087,7 @@ struct HttpRequest {
   int connect_ms, receive_ms;
   bool upgrade = false;
   HINTERNET websocket = nullptr;
+  std::function<bool()> cancelled;
   ~HttpRequest() { if (websocket) winhttp_ws_close(websocket); }
 };
 enum class Kind { Session, Connect, Request };
@@ -1118,6 +1121,10 @@ HINTERNET WinHttpOpenRequest(HINTERNET connect, LPCWSTR verb, LPCWSTR path, LPCW
   auto* r = new HttpRequest{c, verb ? narrow(verb) : "GET", narrow(path), (flags & WINHTTP_FLAG_SECURE) != 0};
   r->follow = c->session->follow; r->connect_ms = c->session->connect_ms; r->receive_ms = c->session->receive_ms;
   return new Any{Kind::Request, r};
+}
+void WinHttpSetCancelCallback(HINTERNET request, const std::function<bool()>& cancelled) {
+  auto* a = static_cast<Any*>(request);
+  if (a && a->kind == Kind::Request) static_cast<HttpRequest*>(a->p)->cancelled = cancelled;
 }
 BOOL WinHttpSetTimeouts(HINTERNET handle, int, int connect, int, int receive) {
   auto* a = static_cast<Any*>(handle);
@@ -1167,11 +1174,15 @@ BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID) {
   if (r->done) return TRUE;
   if (r->upgrade) {
     r->done = winhttp_ws_open(r->connect->host, r->connect->port, r->secure, r->path, r->headers,
-                             r->connect_ms, r->receive_ms, r->status, r->websocket);
+                             r->connect_ms, r->receive_ms, r->status, r->websocket, r->cancelled);
     return r->done;
   }
   CURL* curl = curl_easy_init();
-  if (!curl) return FALSE;
+  if (!curl) {
+    const int code = errno;
+    std::fprintf(stderr,"slippi http: curl-init errno %d\n",code);
+    g_last_error = code ? DWORD(code) : 12002u; return FALSE;
+  }
   const bool default_port = r->connect->port == 0 || r->connect->port == (r->secure ? 443 : 80);
   std::string url = std::string(r->secure ? "https://" : "http://") + r->connect->host +
                     (default_port ? "" : ":" + std::to_string(r->connect->port)) + r->path;
@@ -1193,8 +1204,12 @@ BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID) {
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r->response);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  const CURLcode rc = curl_easy_perform(curl);
+  const CURLcode rc = winhttp_perform(curl, r->cancelled);
+  long os_error = 0;
+  curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &os_error);
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r->status);
+  // Shared Linux/macOS HTTP implementation. Numeric diagnostics only: no URL, headers or body.
+  if (rc != CURLE_OK) std::fprintf(stderr,"slippi http: curl-perform %d errno %ld\n",int(rc),os_error);
   curl_slist_free_all(list);
   curl_easy_cleanup(curl);
   if (rc != CURLE_OK) { g_last_error = 12002u; return FALSE; }   // ERROR_WINHTTP_TIMEOUT-like

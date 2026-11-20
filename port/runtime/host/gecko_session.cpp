@@ -51,7 +51,7 @@ constexpr bool kOnlineCodes = false;
 void connected(bool consent) {
   g = State{};
   g.consent = consent && kOnlineCodes;
-  if (!consent) return;
+  if (!g.consent) return;   // switched off: no offer goes out
   for (const auto& o : user_gecko::offerable()) {
     if (g.mine.size() >= gecko_online::kMaxCodes) break;
     gecko_online::Offer offer;

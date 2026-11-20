@@ -15,6 +15,7 @@ bool fetch_verified(const std::string&, const std::string&, const std::string&, 
 }
 }  // namespace updater
 }
+namespace yougame { bool active() { return false; } }
 
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { std::printf("FAIL line %d: %s\n", __LINE__, #x); ++failures; } } while (0)

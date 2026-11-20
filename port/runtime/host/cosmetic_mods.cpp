@@ -199,6 +199,8 @@ std::string g_look_pack;
 std::string g_session_stage_pack;
 // Buttons held on any controller, asked when a match's stage is planned (set_stage_button_probe).
 uint32_t (*g_stage_buttons)() = nullptr;
+// A lockstep session is running (set_lockstep_probe).
+bool (*g_lockstep)() = nullptr;
 // Newly built packs have been hash-verified, but are scanned for assets at the next start.
 bool g_look_prepared_this_run = false;
 
@@ -6513,6 +6515,10 @@ void set_stage_button_probe(StageButtonProbe probe) {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_stage_buttons = probe;
 }
+void set_lockstep_probe(LockstepProbe probe) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_lockstep = probe;
+}
 std::string disc_pack_name(const std::string& iso_path) {
   std::error_code ec;
   const std::string key = fs::absolute(fs::u8path(iso_path), ec).u8string();
@@ -6831,8 +6837,12 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
   const bool session = std::any_of(g_assets.begin(), g_assets.end(), [&](const AssetRecord& asset) {
     return session_stage_record(asset) && selection_key(asset) == target;
   });
-  const bool pick_any = g_profile.random_stage_skins || session;
-  if (!pick_any && previous == current->stage_matches.end()) return result;
+  // In a lockstep session (Friends) the two games must load the same stage file, and each game's own
+  // pick (a saved stage skin, a random draw, the disc's alternates by held button) can differ: every
+  // stage is the game's own there, published even for a first match, as a saved skin may be applied.
+  const bool lockstep = g_lockstep && g_lockstep();
+  const bool pick_any = !lockstep && (g_profile.random_stage_skins || session);
+  if (!lockstep && !pick_any && previous == current->stage_matches.end()) return result;
 
   std::vector<std::string> eligible;
   std::vector<uint32_t> eligible_buttons;
@@ -6910,6 +6920,7 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
     }
   }
   if (by_button) {
+  } else if (lockstep) {
   } else if (!pick_any) {
     const auto fixed = g_profile.selections.find(target);
     if (fixed != g_profile.selections.end() && fixed->second != kVanillaSelection) chosen = fixed->second;
@@ -7376,6 +7387,9 @@ std::string active_look_pack() {
   return g_look_pack;
 }
 
+std::atomic<bool> g_tool_recovery{true};   // set_tool_recovery: the host turns it off in the YouGame app
+void set_tool_recovery(bool allowed) { g_tool_recovery = allowed; }
+
 bool build_look_packs(const std::string& patcher_folder, const std::string& retail_disc, const std::string& xdelta_tool,
                       std::string* message) {
   std::string local; if (!message) message = &local;
@@ -7523,6 +7537,7 @@ bool https_get(const std::string& url, const fs::path* out, std::string* text, u
 fs::path prepare_xdelta(const fs::path& preferred, bool recover, std::string* error) {
   std::error_code ec;
   if (!recover && !preferred.empty() && fs::is_regular_file(preferred, ec)) return preferred;
+  if (!g_tool_recovery.load()) { *error = "The patch tool that comes with the game could not be used."; return {}; }
   fs::path root;
   { std::lock_guard<std::mutex> lock(g_mutex); root = g_root; }
   if (root.empty()) { *error = "The cosmetic catalog is not ready to prepare the patch tool."; return {}; }

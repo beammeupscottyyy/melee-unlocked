@@ -5,6 +5,10 @@ import subprocess
 import sys
 import tempfile
 
+if len(sys.argv) == 1:
+    print("SKIP: integration helper requires an explicit game executable and DOL; no game launched")
+    raise SystemExit(0)
+
 exe, dol = map(Path, sys.argv[1:])
 data = bytearray(dol.read_bytes())
 data[-1] ^= 1

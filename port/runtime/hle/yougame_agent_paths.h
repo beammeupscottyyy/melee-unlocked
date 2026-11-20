@@ -57,7 +57,7 @@ inline bool relative_valid(const std::string& input) {
   return true;
 }
 // One root capability per load/session. Only load's identity check reopens by name.
-// Windows-only behavior is UNPROVEN until the native pc2 SDK/runtime review.
+// Windows-only behavior is UNPROVEN until the native Windows SDK/runtime review.
 #ifdef _WIN32
 inline void win_error(DWORD error = GetLastError()) {
   errno = (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS) ? EEXIST : EACCES;
@@ -121,6 +121,8 @@ struct Root {
 #ifdef _WIN32
     // Only a plain DOS drive supplies a trustworthy prefix for VOLUME_NAME_NONE.
     // Reject UNC, device/extended namespaces and drive-relative inputs before I/O.
+    // "E:/x" and "E:\x" are the same folder to Windows (CMake passes the first): check the native form.
+    original.make_preferred();
     const auto& input = original.native();
     if (input.size() < 3 || !((input[0] >= L'A' && input[0] <= L'Z') ||
         (input[0] >= L'a' && input[0] <= L'z')) || input[1] != L':' || input[2] != L'\\') {
@@ -243,7 +245,7 @@ inline bool directory(const fs::path& root, const std::string& relative, bool cr
   for (const auto& part : fs::u8path(slashes(relative))) if (!dirs.descend(part, create)) return false;
   return true;
 }
-enum class Mode { Read, Truncate, Exclusive };
+enum class Mode { Read, Truncate, Exclusive, Append };
 inline FILE* open(const fs::path& root, const std::string& relative, Mode mode, bool parents = false,
                   const Root& capability = session) {
   if (root.empty() || !relative_valid(relative) || (root / fs::u8path(slashes(relative))).u8string().size() > absolute_limit) {
@@ -258,26 +260,30 @@ inline FILE* open(const fs::path& root, const std::string& relative, Mode mode, 
   // FILE_CREATE is exclusive; truncation opens existing, inspects, then truncates.
   HANDLE h = relative_handle(dirs.handles.back(), rel.filename(), write ? GENERIC_WRITE : GENERIC_READ,
                              write ? 2 : 1, false);
-  if (h == INVALID_HANDLE_VALUE && mode == Mode::Truncate && errno == EEXIST)
+  if (h == INVALID_HANDLE_VALUE && (mode == Mode::Truncate || mode == Mode::Append) && errno == EEXIST)
     h = relative_handle(dirs.handles.back(), rel.filename(), GENERIC_WRITE, 1, false);
   if (h == INVALID_HANDLE_VALUE) return nullptr;
   if (!regular(h, write)) { CloseHandle(h); errno = EINVAL; return nullptr; }
+  if (mode == Mode::Append) {
+    LARGE_INTEGER end{};
+    if (!SetFilePointerEx(h, end, nullptr, FILE_END)) { CloseHandle(h); errno = EACCES; return nullptr; }
+  }
   if (mode == Mode::Truncate && !SetEndOfFile(h)) { CloseHandle(h); errno = EACCES; return nullptr; }
   const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_BINARY | (write ? _O_WRONLY : _O_RDONLY));
   if (fd < 0) { CloseHandle(h); return nullptr; }
-  FILE* file = _fdopen(fd, write ? "wb" : "rb");
+  FILE* file = _fdopen(fd, mode == Mode::Append ? "ab" : write ? "wb" : "rb");
   if (!file) _close(fd);
 #else
   const int flags = O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
-  int fd = write ? ::openat(dirs.fd, rel.filename().c_str(), O_WRONLY | O_CREAT | O_EXCL | flags, 0600)
+  int fd = write ? ::openat(dirs.fd, rel.filename().c_str(), O_WRONLY | O_CREAT | O_EXCL | (mode == Mode::Append ? O_APPEND : 0) | flags, 0600)
                  : ::openat(dirs.fd, rel.filename().c_str(), O_RDONLY | flags);
-  if (fd < 0 && errno == EEXIST && mode == Mode::Truncate)
-    fd = ::openat(dirs.fd, rel.filename().c_str(), O_WRONLY | flags);
+  if (fd < 0 && errno == EEXIST && (mode == Mode::Truncate || mode == Mode::Append))
+    fd = ::openat(dirs.fd, rel.filename().c_str(), O_WRONLY | (mode == Mode::Append ? O_APPEND : 0) | flags);
   if (fd < 0) return nullptr;
   struct stat st{};
   if (::fstat(fd, &st) || !S_ISREG(st.st_mode) || (write && st.st_nlink != 1)) { ::close(fd); errno = EINVAL; return nullptr; }
   if (mode == Mode::Truncate && ::ftruncate(fd, 0)) { ::close(fd); return nullptr; }
-  FILE* file = ::fdopen(fd, write ? "wb" : "rb");
+  FILE* file = ::fdopen(fd, mode == Mode::Append ? "ab" : write ? "wb" : "rb");
   if (!file) ::close(fd);
 #endif
   return file;

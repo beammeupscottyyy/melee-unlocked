@@ -157,6 +157,21 @@ def agent_test_hook_enabled(executable):
     return b'agent-test.json' in executable.read_bytes()
 
 
+def package_snapexcl(source: Path, library: Path, original: Path):
+    """Only non-loaded debug sections change in packaging; offsets stay fixed.
+
+    Bind the build's offsets to the final shipped file size, after objcopy/strip.
+    Windows retains its existing build-time size contract.
+    """
+    lines = source.read_text().splitlines()
+    sizes = [line for line in lines if line.startswith('# dll_size ')]
+    if len(sizes) != 1 or sizes[0] != f'# dll_size {original.stat().st_size}':
+        raise SystemExit(f'{source}: dll_size does not match the build library')
+    library.with_suffix('.snapexcl').write_text('\n'.join(
+        f'# dll_size {library.stat().st_size}' if line.startswith('# dll_size ') else line
+        for line in lines) + '\n')
+
+
 def ship_vulkan_cache(source, target):
     """The warmed Vulkan SPIR-V and its recipes (as tools/package_release.py ships them for Windows):
     SPIR-V is the same on every GPU and driver, so a first Linux session on Vulkan builds its common
@@ -201,7 +216,8 @@ def main():
     snapexcl = args.game_build_dir / 'melee_game.snapexcl'
     compat_exe = args.compat_build_dir / (EXE + '_compat')
     compat_game = args.compat_build_dir / 'melee_game_compat.so'
-    for need in (exe, launcher, game, snapexcl, compat_exe, compat_game):
+    compat_snapexcl = args.compat_game_build_dir / 'melee_game.snapexcl'
+    for need in (exe, launcher, game, snapexcl, compat_exe, compat_game, compat_snapexcl):
         if not need.is_file():
             raise SystemExit(f'missing {need} (run tools/build_linux.py first)')
     agent_hook = agent_test_hook_enabled(exe)
@@ -242,7 +258,6 @@ def main():
         raise SystemExit(f'missing {dbg} (built with melee_game)')
     shutil.copy2(game, folder / 'melee_game.so')
     shutil.copy2(dbg, folder / 'melee_game.dbg')
-    shutil.copy2(snapexcl, folder / 'melee_game.snapexcl')
     run('objcopy', '--compress-debug-sections=zlib', folder / 'melee_game.dbg')
     subprocess.run(['objcopy', '--remove-section=.gnu_debuglink', '--add-gnu-debuglink=melee_game.dbg',
                     'melee_game.so'], cwd=folder, check=True)
@@ -332,7 +347,8 @@ def main():
     for package in sorted(packages):
         copyright_file = Path('/usr/share/doc') / package / 'copyright'
         if copyright_file.is_file():
-            shutil.copy2(copyright_file, licenses / f'lib-{package}.txt')
+            shutil.copyfile(copyright_file, licenses / f'lib-{package}.txt')
+            os.chmod(licenses / f'lib-{package}.txt', 0o644)   # a build host's doc files can be 0777 (GitHub Actions runner)
     # librashader (shader presets), loaded at run time with dlopen, so ldd does not list it. Built from
     # its source tag (port/third_party/librashader/README.txt); without it the presets are off.
     rashader = ROOT / 'port/third_party/librashader/bin/librashader.so'
@@ -349,6 +365,9 @@ def main():
         run('patchelf', '--set-rpath', '$ORIGIN', path)
     run('patchelf', '--set-rpath', '$ORIGIN/lib', folder / 'melee_game.so')
     run('patchelf', '--set-rpath', '$ORIGIN/lib', folder / 'melee_game_compat.so')
+    # Last step that changes either game library: bind the snapshot ranges to the shipped size now.
+    package_snapexcl(snapexcl, folder / 'melee_game.so', game)
+    package_snapexcl(compat_snapexcl, folder / 'melee_game_compat.so', compat_game)
     for tool in shader_tools:
         run('patchelf', '--set-rpath', '$ORIGIN/../lib', tool)
     # Prove it: with no help from the environment, every dependency the package bundles resolves to lib/.
@@ -390,6 +409,16 @@ def main():
         shutil.copytree(playback, folder / 'SysPlayback', ignore=shutil.ignore_patterns('README.md', '.git*'))
         (folder / 'SysPlayback/GC').mkdir(exist_ok=True)
         shutil.copy2(coef, folder / 'SysPlayback/GC/dsp_coef.bin')
+    # Two of Slippi's Sys files are mostly Nintendo's own disc assets (compliance review, 10-25): they never ship. The
+    # host rebuilds them from the player's disc (host/sysgen.cpp reads deltas/ beside the program), as on the Mac.
+    deltas = {'files': []}   # 0.9.990: kept, as on Windows (was json.loads(port/sys_deltas/manifest.json))
+    for target in {f['target'] for f in deltas['files']}:
+        for sys_folder in ('Sys', 'SysPlayback'):
+            (folder / sys_folder / 'GameFiles/GALE01' / target).unlink(missing_ok=True)
+    (folder / 'deltas').mkdir()
+    shutil.copy2(ROOT / 'port/sys_deltas/manifest.json', folder / 'deltas/manifest.json')
+    for f in deltas['files']:
+        shutil.copy2(ROOT / 'port/sys_deltas' / f['delta'], folder / 'deltas' / f['delta'])
     (folder / 'Shaders').mkdir()
     (folder / 'Shaders/crt-shaders.pak').write_bytes(shader_pak())
     if (ROOT / 'lang').is_dir():
@@ -404,7 +433,7 @@ def main():
         (folder / sub).mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / 'docs/training-mods.md', folder / 'TrainingMods.md')
     shutil.copy2(UDEV, folder / UDEV.name)
-    staging = 'STAGING AGENT-TEST BUILD: NOT FOR PRODUCTION\n\n' if agent_hook else ''
+    staging = 'STAGING AGENT-TEST BUILD — NOT FOR PRODUCTION\n\n' if agent_hook else ''
     (folder / 'README.txt').write_text(staging + README.format(version=version), encoding='utf-8')
     for src, dst in ((ROOT / 'LICENSE', 'COPYING.txt'), (ROOT / 'NOTICE', 'NOTICE.txt'),
                      (ROOT / 'port/third_party/dht/LICENCE', 'dht.txt'),
@@ -450,6 +479,18 @@ def main():
     tools.mkdir()
     for wanted, names in (('7zr', ('7zz', '7zr', '7za', '7z')), ('xdelta3', ('xdelta3',))):
         found = next((shutil.which(n) for n in names if shutil.which(n)), None)
+        if found and open(found, 'rb').read(2) == b'#!':
+            # Debian's 7zip installs 7zr as a two-line sh wrapper around /usr/lib/7zip/7zr: it only works where that
+            # path exists, so a wrapper is never shipped (build 98 on Actions carried one). Ship the program it runs.
+            import re as _re
+            target = _re.search(r'exec\s+(\S+)', open(found, encoding='utf-8', errors='replace').read())
+            real = target.group(1) if target else ''
+            if real and os.path.isfile(real) and open(real, 'rb').read(4) == b'\x7fELF':
+                print(f'{wanted}: {found} is a wrapper; bundling the program it runs, {real}')
+                found = real
+            else:
+                print(f'warning: {found} is a script wrapper, not a program; {wanted} not bundled')
+                found = None
         if found:
             shutil.copy2(found, tools / wanted)
             for soname, path in ldd(found).items():
@@ -457,7 +498,7 @@ def main():
                     shutil.copy2(os.path.realpath(path), lib / soname)
         else:
             print(f'warning: {wanted} not found on this system; mod archives will need it installed')
-    # A desktop entry players can copy to ~/.local/share/applications.
+    # A desktop entry players can copy to their applications directory.
     (folder / 'MeleeUnlocked.desktop').write_text(
         '[Desktop Entry]\nType=Application\nName=Melee Unlocked\nComment=Super Smash Bros. Melee, natively\n'
         'Exec=sh -c \'cd "$(dirname "$(readlink -f "%k")")" && ./MeleeUnlocked\'\nTerminal=false\nCategories=Game;\n',

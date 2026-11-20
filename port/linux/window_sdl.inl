@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 namespace {
+SdlVideoThread g_sdl_video_thread;
+bool video_thread(SdlVideoThread::Call call) {
+  return g_sdl_video_thread.allow(call, [](const char* message) { host::log("%s", message); });
+}
 SDL_Window* sdl_window() { return static_cast<SDL_Window*>(g_hwnd); }
 #ifdef MELEE_LINUX_X11_EMBED
 // Owned exclusively by the SDL video/render thread. The bridge only queues strings.
@@ -32,6 +36,7 @@ void close_embed(const char* why) {
 }
 
 void pump_embed_commands() {
+  if (!video_thread(SdlVideoThread::Call::EmbedCommands)) return;
   if (!yougame::embedded()) return;
   if (exit_requested()) {  // Includes bridge EOF; preserve any existing nonzero exit code.
     clear_embed_keys(); g_closed = true; return;
@@ -177,6 +182,7 @@ void show_cursor(bool visible) {
 
 // One SDL event, with the same rules as wnd_proc on Windows.
 void handle_event(const SDL_Event& e) {
+  if (!video_thread(SdlVideoThread::Call::Event)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   // Handle native parent events before any window-id filtering or UI callback.
   if (g_x11_embed && e.type == SDL_SYSWMEVENT && e.syswm.msg &&
@@ -186,21 +192,44 @@ void handle_event(const SDL_Event& e) {
     return;
   }
   if (g_closed) return;
+  if (g_x11_embed && e.type == SDL_WINDOWEVENT &&
+      (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)) {
+    // Parent/child focus changes can queue an obsolete SDL loss/gain pair. Check
+    // the server before clearing held keys or telling ImGui the game lost focus.
+    const bool focused = yg_embed_x11_focused(g_x11_embed) != 0;
+    if ((e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) == focused) return;
+  }
   if (g_x11_embed && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
       (!g_embed_focus_requested || !linux_compat::window_focused())) return;
 #endif
-#ifdef __APPLE__
-  // The page owns Escape before fullscreen handling, ImGui or the game menu.
-  if ((yougame::stdio_bridge() || mac_embed::active()) && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
-      e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
-    if (e.type == SDL_KEYDOWN && !e.key.repeat) yougame::relay_key("escape");
+  // Esc with the game's YouGame box on screen is its Back, as on Windows (wnd_proc): before the
+  // embedded route, full screen, the Esc menu, ImGui and the game's bindings.
+  if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
+      g_box_escape.key(e.type == SDL_KEYDOWN, e.key.repeat != 0, [] { return yougame::sign_in_escape(); })) {
     std::lock_guard<std::mutex> lock(g_keys_mutex); set_key(VK_ESCAPE, false);
     return;
   }
+  // Embedded Escape bypasses native fullscreen handling, ImGui NavCancel and pad bindings.
+  // SDL's KMOD_SHIFT includes either Shift, just as the overlay Tab path below does.
+  if ((yougame::stdio_bridge()
+#ifdef __APPLE__
+       || mac_embed::active()
 #endif
+      ) && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
+      e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+    const bool capture_key = yougame::parity::embedded_escape(
+        e.type == SDL_KEYDOWN, (e.key.keysym.mod & KMOD_SHIFT) != 0,
+        e.key.repeat != 0, g_capturing.load(),
+        [](const char* key) { yougame::relay_key(key); }, [] { g_escape_press.store(true); });
+    std::lock_guard<std::mutex> lock(g_keys_mutex); set_key(VK_ESCAPE, capture_key);
+    return;
+  }
   if (e.type == SDL_MOUSEMOTION) {
     g_pointer_moved = GetTickCount64();
     g_pointer_rested = false;
+#ifndef __APPLE__
+    show_cursor(true);
+#endif
   }
   if (e.type == SDL_QUIT || (e.type == SDL_WINDOWEVENT &&
       (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || e.window.event == SDL_WINDOWEVENT_CLOSE)))
@@ -271,6 +300,9 @@ void handle_event(const SDL_Event& e) {
           g_activated.store(true);
 #endif
           g_cursor_reapply = true;
+#ifndef __APPLE__
+          g_pointer_moved = GetTickCount64();
+#endif
           linux_compat::set_window_focused(true);
           host::log("window: the game is in front again");
           return;
@@ -304,14 +336,7 @@ void handle_event(const SDL_Event& e) {
           case SDL_SCANCODE_F6: g_trace_mark.store(2); break;
           case SDL_SCANCODE_F7: g_trace_mark.store(3); break;
           case SDL_SCANCODE_F9: g_trace_mark.store(4); break;
-          case SDL_SCANCODE_ESCAPE:
-#ifdef MELEE_LINUX_X11_EMBED
-            if (g_x11_embed && yougame::stdio_bridge()) {
-              if (!g_capturing.load()) yougame::relay_key("escape");
-              break;
-            }
-#endif
-            g_escape_press.store(true); break;
+          case SDL_SCANCODE_ESCAPE: g_escape_press.store(true); break; // Standalone only; embedded handled above.
           default: break;
         }
       }
@@ -377,10 +402,17 @@ void title_from_another_thread(std::string title) {
 }
 }  // namespace
 
+void window_prefer_background(bool on) {
+#ifdef __APPLE__
+  SDL_SetHintWithPriority(SDL_HINT_MAC_BACKGROUND_APP, on ? "1" : "0", SDL_HINT_OVERRIDE);
+#endif
+}
 bool g_vulkan_window = false;
 void window_prefer_vulkan(bool on) { g_vulkan_window = on; }
 
 void* window_create(int w, int h, const wchar_t* title, bool visible) {
+  // Claim before SDL initialization and the Mac/X11 adapters, including their startup pumps.
+  g_sdl_video_thread.claim();
   g_window_thread.store(std::this_thread::get_id(), std::memory_order_release);
 #ifdef MELEE_LINUX_X11_EMBED
   const bool boxed = yougame::embedded();
@@ -498,8 +530,8 @@ bool window_is_fullscreen() {
   return w && mac_window_is_fullscreen(w);
 }
 // A YouGame full-screen start uses SDL's non-Spaces full screen (a borderless window over the display, no separate
-// macOS Space): AppKit's Space titlebar asks for remote-view services the app's sandbox denies on every frame
-// (pack-platform #15776). SDL reads the hint when the window is created, so call this before window_create.
+// macOS Space): AppKit's Space titlebar asks for remote-view services the app's sandbox denies on every frame.
+// SDL reads the hint when the window is created, so call this before window_create.
 void window_prefer_simple_fullscreen() { SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0"); }
 void window_defer_fullscreen_show() {
   if (!mac_embed::active()) g_deferred_fullscreen_show = true;
@@ -605,9 +637,12 @@ void window_input_capture(bool capture) {
 }
 void window_withhold_buttons(uint16_t mask) { g_ui_withheld.store(mask, std::memory_order_relaxed); }
 bool window_ui_gamecube_pad(PadState& pad) { std::lock_guard<std::mutex> lock(g_ui_pad_mutex); pad = g_ui_pad; return g_ui_gamecube; }
-bool window_ui_pads(PadState pads[4]) {
+bool window_ui_pads(PadState pads[4], PadState navigation_pads[4]) {
   std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
-  for (int i = 0; i < 4; ++i) pads[i] = g_ui_pads[i];
+  for (int i = 0; i < 4; ++i) {
+    pads[i] = g_ui_pads[i];
+    if (navigation_pads) navigation_pads[i] = g_ui_navigation_pads[i];
+  }
   return g_ui_has_pad;
 }
 void window_set_resize_callback(ResizeCallback cb) { g_on_resize = std::move(cb); }
@@ -627,6 +662,7 @@ bool window_take_practice_toggle() { return g_practice_toggle.exchange(false); }
 bool window_take_escape() { return g_escape_press.exchange(false); }
 
 void window_destroy() {
+  if (!video_thread(SdlVideoThread::Call::Destroy)) return;
   yougame::parity::signals.emit(g_overlay_key.cancel());
 #ifdef __APPLE__
   g_deferred_fullscreen_show = false;
@@ -644,9 +680,16 @@ void window_destroy() {
 #ifdef __APPLE__
   mac_embed::destroy();
 #endif
+  g_sdl_video_thread.release();
 }
 
+// Do not even read window/embed state on another thread. exit_requested() is atomic in
+// host.cpp; console waiters read it after this returns. The render owner keeps pumping
+// even without frames (present_loop's empty-queue wait is bounded to 2 ms).
 void window_pump() {
+  if (!video_thread(SdlVideoThread::Call::Pump)) return;
+  // The page's "Game settings" button arrives over the stdio bridge; it opens the menu the way F1 does (as window.cpp).
+  if (yougame::stdio_bridge() && yougame::shortcuts::commands.take_settings()) g_escape_press.store(true);
 #ifdef MELEE_LINUX_X11_EMBED
   pump_embed_commands();
   if (g_closed) return;
@@ -676,20 +719,22 @@ void window_pump() {
       [] { yougame::relay_key("escape"); },
       [](const std::string& line) { log("%s", line.c_str()); });
 #endif
-#ifdef MELEE_LINUX_X11_EMBED
-  if (g_x11_embed) return;  // The page owns the pointer and cursor.
-#endif
   if (!g_hwnd) return;
   const bool focused = (SDL_GetWindowFlags(sdl_window()) & SDL_WINDOW_INPUT_FOCUS) != 0;
+#ifdef __APPLE__
   // No pointer over the game while it has focus and no menu has input; and none after it has rested
   // for a while even then.
   bool visible = !focused || g_ui_capture.load();
   if (visible && !g_pointer_rested && g_pointer_moved && GetTickCount64() - g_pointer_moved >= kPointerRestMs) g_pointer_rested = true;
   if (g_pointer_rested) visible = false;
+#else
+  const bool visible = cursor_idle::visible(GetTickCount64(), g_pointer_moved, focused, g_ui_capture.load());
+#endif
   show_cursor(visible);
 }
 
 void window_set_title(const wchar_t* title) {
+  if (!video_thread(SdlVideoThread::Call::Title)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   // The loader can call from a worker. Keep all Xlib/SDL video calls on the window thread.
   if (window_embedded()) return;
@@ -711,6 +756,7 @@ void loading_show(const wchar_t* what, size_t done, size_t total) {
     g_loading_from_other_thread.store(true);
     return;
   }
+  if (!video_thread(SdlVideoThread::Call::LoadingShow)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   if (yougame::embedded()) {
     window_pump();
@@ -734,6 +780,7 @@ void loading_show(const wchar_t* what, size_t done, size_t total) {
 void loading_close() {
   if (g_loading_from_other_thread.exchange(false)) title_from_another_thread(utf8_title(window_title_base().c_str()));
   if (!on_window_thread()) return;
+  if (!video_thread(SdlVideoThread::Call::LoadingClose)) return;
   if (!g_loading_shown) return;
   g_loading_shown = false;
   if (g_hwnd) SDL_SetWindowTitle(sdl_window(), utf8_title(g_title_before_loading.c_str()).c_str());

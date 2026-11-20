@@ -49,6 +49,10 @@ static void room_teams() {
   }
   read_roster(r, {{"participants",json::array()}});
   for (int i = 0; i < 4; ++i) CHECK(r.seat_team(i) == -1);
+  auto private_roster = roster();
+  for (auto& p : private_roster) p["team"] = nullptr;
+  read_roster(r, {{"participants",private_roster}});
+  for (int port = 0; port < 4; ++port) CHECK(r.seat_team(port) == -1);
   auto bad = roster(); bad.push_back({{"slot",-1},{"team",0}}); bad.push_back({{"slot",4},{"team",1}});
   bad.push_back({{"slot","0"},{"team",0}});
   read_roster(r, {{"participants",bad}});
@@ -127,6 +131,46 @@ static void team_reports() {
   CHECK(team_outcome(0,{"a","b","c","c"},teams) == json({{"void",true}}));
   CHECK(team_outcome(0,{"a","b","c",""},teams) == json({{"void",true}}));
   CHECK(team_outcome(0,ids,nullptr) == json({{"void",true}}));
+
+  const int no_map[4] = {-1,-1,-1,-1};
+  const int different[4] = {0,1,0,1}, partial[4] = {1,0,0,-1};
+  const int unbalanced[4] = {0,0,0,1}, ffa[4] = {0,1,2,3};
+  const json voided = {{"void",true}};
+  CHECK(room_team_outcome(0,ids,teams,no_map,false) == win0);
+  CHECK(room_team_outcome(1,ids,teams,no_map,false) == win1);
+  CHECK(room_team_outcome(0,ids,unbalanced,no_map,false) == voided);
+  CHECK(room_team_outcome(0,ids,ffa,no_map,false) == voided);
+  CHECK(room_team_outcome(0,ids,teams,teams,false) == win0);
+  CHECK(room_team_outcome(0,ids,different,teams,false) == voided);
+  CHECK(room_team_outcome(0,ids,teams,partial,false) == voided);
+  CHECK(room_team_outcome(0,ids,teams,no_map,true) == voided);
+  CHECK(room_team_outcome(0,ids,nullptr,no_map,false) == voided);
+  CHECK(room_team_outcome(0,ids,teams,nullptr,false) == voided);
+
+  // Private rooms: any two CSS colours with two players each become teams 0 and 1, lower colour first.
+  const auto paired = [&](const int (&game)[4], const int* room, bool ranked, std::array<int, 4> want) {
+    int out[4]; outcome_teams(game, room, ranked, out);
+    return std::array<int, 4>{{out[0], out[1], out[2], out[3]}} == want;
+  };
+  const int red_green[4] = {2,0,0,2}, blue_green[4] = {1,2,2,1}, three[4] = {0,1,2,2}, all_green[4] = {2,2,2,2};
+  CHECK(paired(red_green, no_map, false, {{1,0,0,1}}));
+  CHECK(paired(blue_green, no_map, false, {{0,1,1,0}}));
+  CHECK(paired(teams, no_map, false, {{teams[0],teams[1],teams[2],teams[3]}}));
+  CHECK(paired(three, no_map, false, {{0,1,2,2}}));
+  CHECK(paired(all_green, no_map, false, {{2,2,2,2}}));
+  CHECK(paired(unbalanced, no_map, false, {{0,0,0,1}}));
+  CHECK(paired(red_green, no_map, true, {{2,0,0,2}}));
+  CHECK(paired(red_green, teams, false, {{2,0,0,2}}));
+  int rg[4]; outcome_teams(red_green, no_map, false, rg);
+  const int placements[4] = {1,0,0,1};
+  CHECK(team_winner(1,-1,placements,red_green) == -1 && team_winner(1,-1,placements,rg) == 0);
+  CHECK(room_team_outcome(team_winner(1,-1,placements,rg),ids,rg,no_map,false) ==
+        json({{"ranking",{ids[1],ids[2],ids[0],ids[3]}},{"detail",{{"tw",0}}}}));
+
+  Games private_games; private_games.start_game("private-teams");
+  private_games.report_team_result(room_team_outcome(0,ids,teams,no_map,false));
+  json private_finish = win0; private_finish["t"] = "finish"; private_finish["matchId"] = "private-teams";
+  CHECK(private_games.due(1,false,0,ids) == std::vector<json>({private_finish}));
 
   Games games; games.start_game(); games.report_team(0,ids,teams);
   CHECK(games.due(1,true,7,ids)[0] == json({{"t","begin"},{"revision",7}}));

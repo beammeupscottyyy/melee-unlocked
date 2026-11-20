@@ -23,7 +23,9 @@ def body(name):
     for pos in range(start, len(ADAPTER)):
         depth += (ADAPTER[pos] == "{") - (ADAPTER[pos] == "}")
         if not depth:
-            return ADAPTER[start:pos].strip()
+            # The guard must be the first statement; leading comment lines do not count (v0.9.80 added one).
+            code = [line for line in ADAPTER[start:pos].strip().splitlines() if not line.strip().startswith("//")]
+            return "\n".join(code).strip()
     raise AssertionError(f"unterminated definition: {name}")
 
 

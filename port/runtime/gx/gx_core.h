@@ -3,6 +3,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <new>
 #include <vector>
 #include "gx_regs.h"
+#include "prewarm.h"
 #include "native_draw_audit.h"
 #include "../abi/mu_native_pose.h"
 #include "../host/tick_timing.h"
@@ -350,7 +352,7 @@ bool clean_replay_active();
 void set_native_hud_player(int slot, bool present, int damage, int stocks, float tag_x, float tag_y,
                            bool tag_visible);
 void set_native_hud_combo(int slot, int link, float percent, bool stunned);   // MuHostApi.hud_combo, simulation thread
-// Host API 24: Nana's damage and the player's team, for the community codes' overlays.
+// Since host API 31 (upstream's 24): Nana's damage and the player's team, for the community codes' overlays.
 void set_native_hud_extras(int slot, int nana_damage, int team);
 void set_native_hud_pro_tag(int slot, float dx, float width);
 // The actions in which a fighter cannot act for the combo counter: damage and tumble, down and tech,
@@ -394,6 +396,17 @@ inline bool frame_in_match(const Frame& f) {
   const bool match_mode = major == 0x02 || (major >= 0x10 && major <= 0x13) || major == 0x1B || major == 0x1C ||
                           (major >= 0x1D && major <= 0x1F);
   return match_mode && minor >= 2;
+}
+
+// What the app hears as a match (yg {"match":1}): frame_in_match without the screens that follow a
+// VS match. The lobby chip hides during the fight and comes back on the results screen, which is
+// minor 4 and up in VS and its variants (2 the match, 3 sudden death).
+inline bool frame_in_app_match(const Frame& f) {
+  if (!frame_in_match(f)) return false;
+  const uint8_t major = f.scene_major;
+  const bool vs_family = major == 0x02 || (major >= 0x10 && major <= 0x13) || major == 0x1B || major == 0x1C ||
+                         (major >= 0x1D && major <= 0x1F);
+  return !vs_family || f.scene_minor <= 3;
 }
 
 // Whether a frame's scene is presented wide when a widescreen mode is on. Every screen in the game
@@ -736,6 +749,11 @@ bool subframes_active();
 struct RenderOptions;
 struct Backend {
   virtual ~Backend() = default;
+  virtual PrewarmStats prewarm_stats() const { return {}; }
+  // Simulation restart, dispatched synchronously on the backend's owning thread.
+  // Unknown backends refuse BEFORE game memory is restored.
+  virtual bool supports_game_reset() const { return false; }
+  virtual void reset_game_state() {}
   virtual const RenderOptions* presentation_options() const { return nullptr; }
   virtual void resize(int, int) {}
   virtual void presentation_stats(uint32_t* frames, uint32_t* pipelines, uint32_t* textures) const {
@@ -765,6 +783,12 @@ struct Backend {
   // display's own counts while frames come slower than the refresh: a fixed display still refreshes
   // at its full rate and repeats frames, a variable one refreshes once per frame. Render thread.
   virtual int variable_refresh() const { return -1; }
+  // Latency probe (MELEE_TRACE_LATENCY=1 with an input script): the id of the present just made,
+  // 0 when this renderer cannot tell when a present reached the screen; then, for that id, when it
+  // did on the now_seconds clock: 1 known (*seconds set), 0 not yet, -1 never. Only Vulkan with
+  // VK_GOOGLE_display_timing knows (Linux and macOS drivers); OpenGL and Direct3D say -1. Render thread.
+  virtual uint64_t probe_present_id() { return 0; }
+  virtual int probe_presented(uint64_t, double*) { return -1; }
   // NVIDIA frame generation running now with a fixed multiplier (2 to 6): the presentation loop
   // renders that many times fewer frames, and generation fills the rest up to the target rate.
   // 1 when it is off or in Dynamic mode (NVIDIA picks the multiplier itself).
@@ -772,9 +796,8 @@ struct Backend {
   // The display's counts could be read at the last look (false while Windows composes the window).
   virtual bool display_counts_readable() const { return false; }
   // From the presentation loop, every frame: the monitor's nominal refresh rate (what the verdict
-  // above is judged against), and whether to present synced even with V-Sync off. The loop asks for
-  // that on a display that follows the frames, where it costs no delay while the rate stays under
-  // the refresh, and stops every tear.
+  // above is judged against), and an explicit scanline-sync request. VRR detection changes the
+  // frame cap only; it must not silently turn V-Sync on when the player has switched it off.
   virtual void set_display_refresh(double /*hz*/, bool /*tear_free*/) {}
   // Scanline sync on a fixed-refresh display (vblank_clock.h): the first vertical blank at or after
   // `after` (now_seconds clock) and the refresh period, or false with the reason in `why`. Render thread.
@@ -794,6 +817,8 @@ struct Backend {
 };
 
 void init(Backend* backend);
+bool supports_game_reset();
+std::function<void()> capture_boot_state();
 void write_fifo(uint32_t value, int bytes);   // write-gather pipe byte stream
 void write_fifo_bytes(const uint8_t* data, size_t bytes);   // the same stream in bulk, big-endian as the pipe carries it
 void stats(uint64_t* commands, uint64_t* draws, uint64_t* vertices, uint32_t* efb_copies);

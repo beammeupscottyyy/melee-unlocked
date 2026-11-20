@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <cstdlib>
 #include "winhttp_ws_internal.h"
+#include "winhttp_cancel.h"
 #include "winhttp_ws_protocol.h"
 #include <curl/curl.h>
 #ifdef __APPLE__
@@ -11,9 +12,11 @@
 #endif
 #include <poll.h>
 #include <sys/socket.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -39,19 +42,29 @@ struct Deadline {
 };
 struct WebSocket {
   CURL* curl = nullptr;
+  CURLM* multi = nullptr;
   curl_socket_t fd = CURL_SOCKET_BAD;
   std::atomic<bool> closed{false};
   std::atomic<int> receive_ms{0};
+  std::function<bool()> opening_cancelled;
   std::mutex send_mutex, io_mutex;
   winhttp_ws::Decoder decoder; // reader only
-  ~WebSocket() { if (curl) curl_easy_cleanup(curl); }
+  std::vector<uint8_t> close_frame;  // the peer's close payload, once it has come (reader only)
+  bool closed_by_peer = false;
+  ~WebSocket() {
+    if (multi) { curl_multi_remove_handle(multi, curl); curl_multi_cleanup(multi); }
+    if (curl) curl_easy_cleanup(curl);
+  }
 
   DWORD wait(short events, const Deadline& deadline) {
     while (!closed) {
+      if (opening_cancelled && opening_cancelled()) return io_error;
       pollfd p{fd, events, 0};
-      const int n = poll(&p, 1, deadline.remaining());
+      const int remaining = deadline.remaining();
+      const int slice = opening_cancelled && (remaining < 0 || remaining > 50) ? 50 : remaining;
+      const int n = poll(&p, 1, slice);
       if (n > 0) return (p.revents & events) ? NO_ERROR : io_error;
-      if (!n) return timeout_error;
+      if (!n) { if (deadline.remaining() == 0) return timeout_error; continue; }
       if (errno != EINTR) break;
     }
     return io_error;
@@ -127,9 +140,11 @@ bool has_token(const std::string& text, const std::string& token) {
 } // namespace
 
 BOOL winhttp_ws_open(const std::string& host, INTERNET_PORT port, bool secure, const std::string& path,
-                    const std::vector<std::string>& headers, int connect_ms, int receive_ms, long& status, HINTERNET& socket) {
+                    const std::vector<std::string>& headers, int connect_ms, int receive_ms, long& status, HINTERNET& socket,
+                    const std::function<bool()>& cancelled) {
   auto ws = std::make_shared<WebSocket>();
   ws->receive_ms = receive_ms;
+  ws->opening_cancelled = cancelled;
   ws->curl = curl_easy_init();
   if (!ws->curl || host.find_first_of("\r\n") != std::string::npos || path.find_first_of("\r\n ") != std::string::npos) return FALSE;
   const bool default_port = port == 0 || port == (secure ? 443 : 80);
@@ -143,7 +158,7 @@ BOOL winhttp_ws_open(const std::string& host, INTERNET_PORT port, bool secure, c
   curl_easy_setopt(ws->curl, CURLOPT_NOSIGNAL, 1L);
   if (connect_ms > 0) curl_easy_setopt(ws->curl, CURLOPT_CONNECTTIMEOUT_MS, (long)connect_ms);
   // libcurl's default peer/hostname verification and system CA store remain enabled.
-  if (curl_easy_perform(ws->curl) != CURLE_OK ||
+  if (winhttp_perform(ws->curl, cancelled, &ws->multi) != CURLE_OK ||
       curl_easy_getinfo(ws->curl, CURLINFO_ACTIVESOCKET, &ws->fd) != CURLE_OK || ws->fd == CURL_SOCKET_BAD) return FALSE;
   std::array<uint8_t, 16> random;
 #ifdef __APPLE__
@@ -186,6 +201,7 @@ BOOL winhttp_ws_open(const std::string& host, INTERNET_PORT port, bool secure, c
   const size_t body = end + 4;
   ws->decoder.feed(reinterpret_cast<const uint8_t*>(response.data() + body), response.size() - body);
   // The object address is only an opaque registry key, never dereferenced through HINTERNET.
+  ws->opening_cancelled = {}; // the callback only belongs to the synchronous open
   socket = ws.get();
   std::lock_guard<std::mutex> lock(sockets_mutex);
   sockets.emplace(socket, std::move(ws));
@@ -231,6 +247,7 @@ DWORD WinHttpWebSocketReceive(HINTERNET socket, LPVOID buffer, DWORD size, LPDWO
     const auto result = ws->decoder.next(static_cast<uint8_t*>(buffer), size, count, decoded_type, control);
     if (result == winhttp_ws::Result::Error) return io_error;
     if (result == winhttp_ws::Result::Data || result == winhttp_ws::Result::Close) {
+      if (result == winhttp_ws::Result::Close) { ws->close_frame = control; ws->closed_by_peer = true; }
       *got = (DWORD)count;
       *type = static_cast<WINHTTP_WEB_SOCKET_BUFFER_TYPE>(decoded_type);
       return NO_ERROR;
@@ -245,6 +262,19 @@ DWORD WinHttpWebSocketReceive(HINTERNET socket, LPVOID buffer, DWORD size, LPDWO
     if (error) return error;
     ws->decoder.feed(data, received);
   }
+}
+// The peer's close code and reason, as WinHTTP gives them after a close buffer: 1005 when the close
+// carried no code, and ERROR_INVALID_OPERATION (4317) before any close came.
+DWORD WinHttpWebSocketQueryCloseStatus(HINTERNET socket, USHORT* status, LPVOID reason, DWORD length, LPDWORD reason_length) {
+  auto ws = find_socket(socket);
+  if (!ws || !status || !reason_length || (!reason && length)) return invalid_parameter;
+  if (!ws->closed_by_peer) return 4317;
+  const std::vector<uint8_t>& frame = ws->close_frame;
+  *status = frame.size() >= 2 ? USHORT((frame[0] << 8) | frame[1]) : USHORT(1005);
+  const DWORD n = frame.size() > 2 ? (DWORD)std::min<size_t>(frame.size() - 2, length) : 0;
+  if (n) std::memcpy(reason, frame.data() + 2, n);
+  *reason_length = n;
+  return NO_ERROR;
 }
 DWORD WinHttpWebSocketShutdown(HINTERNET socket, USHORT status, LPVOID reason, DWORD length) {
   auto ws = find_socket(socket);

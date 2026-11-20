@@ -286,7 +286,7 @@ def main() -> int:
     ap.add_argument("--new-name", help="append a row for this name (e.g. Mang0) and train it")
     ap.add_argument("--opponent", help="only games against this character (libmelee name): a matchup fine-tune")
     ap.add_argument("--character", help="the pro's character (libmelee name); default from the policy's catalog name")
-    ap.add_argument("--data", type=Path, default=Path(os.environ.get("MELEE_GHOST_AI_HOME", "C:/Users/Chandler/NEW project/ghost-ai")))
+    ap.add_argument("--data", type=Path, default=Path(os.environ.get("MELEE_GHOST_AI_HOME", "<path-to-your-ghost-ai-folder>")))
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=128)

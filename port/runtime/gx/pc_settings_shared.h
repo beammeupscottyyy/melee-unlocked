@@ -8,6 +8,7 @@
 #include "input_bindings.h"
 #include <array>
 #include <cstdint>
+#include "settings_page_navigation.h"
 
 namespace gx {
 
@@ -50,6 +51,7 @@ struct SettingsState {
   // Standalone settings window: the panel fills the OS window instead of floating inside one, so
   // what opens is the settings box itself rather than a box inside an empty frame.
   bool fill_window = false;
+  settings_page::Navigation page_navigation;
   int active_tab = 0;             // shared across overlay styles A and B
   bool home_focus_reset = false;  // discard stale ImGui navigation focus when reopening the menu
   int settings_controller_port = 0;  // most recently used controller while the settings panel is open

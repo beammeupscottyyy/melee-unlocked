@@ -11,6 +11,8 @@ namespace coming_soon_overlay {
 
 // The online menu's first page is on screen this frame. Game thread.
 void showing();
+// The first row's sticker text (a string literal that lives for the whole run). Game thread.
+void first_row_text(const char* text);
 // Each YouGame row's offset on screen (x, y for rows 0-2, 640x480 game pixels) from where it sits with
 // the menu camera untilted; the stickers follow it. Game thread, with showing().
 void set_offsets(const float offsets[6]);

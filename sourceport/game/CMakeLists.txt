@@ -32,6 +32,7 @@ if(NOT EXISTS "${D}/src/melee/gm/gmmain.c")
   message(FATAL_ERROR "melee_game: no game sources at ${D}")
 endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+include("${REPO}/tools/rank_badges.cmake")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # LP64 must never widen the console's explicit long fields or its audio sample
   # buffers. Keep the original source/Windows build intact; compile a lexical
@@ -49,6 +50,21 @@ endif()
 set(SDK "${D}/libs/dolphin/src/dolphin")
 # ---- how game code is compiled: one definition, shared by the game and by the parity library ----
 add_library(game_flags INTERFACE)
+option(MELEE_DOUBLES "Experimental console Doubles" OFF)
+if(MELEE_DOUBLES)
+  target_compile_definitions(game_flags INTERFACE MELEE_DOUBLES=1)
+  # Only this translation unit is renamed; the existing entry still calls main.
+  set_source_files_properties("${D}/src/melee/gm/gmmain.c" PROPERTIES
+    COMPILE_DEFINITIONS "main=mu_doubles_game_main")
+endif()
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (10-31: Friends + Ranked on the main build)
+if(YOUGAME_RANKED_BRANCH)
+  target_compile_definitions(game_flags INTERFACE YOUGAME_RANKED_BRANCH=1)
+endif()
+option(YOUGAME_AGENT_TEST_HOOK "Compile test-only local Ranked CPU prep" OFF)
+if(YOUGAME_AGENT_TEST_HOOK)
+  target_compile_definitions(game_flags INTERFACE YOUGAME_AGENT_TEST_HOOK)
+endif()
 target_include_directories(game_flags INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include" "${D}/src" "${D}/src/MSL" "${D}/libs/dolphin/include" "${SDK}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include_stub" "${REPO}/port/runtime/abi")
@@ -261,6 +277,11 @@ list(REMOVE_ITEM GAME_SOURCES "${MU_CPU_SOURCE}")
 list(APPEND GAME_SOURCES "${MU_CPU_FIXED}")
 set_source_files_properties("${MU_CPU_FIXED}" PROPERTIES
   INCLUDE_DIRECTORIES "${D}/src/melee/ft/kinds/ftCommon")
+# card.c builds each card command in a stack local, sets only the fields its type uses and copies the
+# whole struct into its ring (fn_803AC168). Zeroed locals keep the unset union bytes and padding free of
+# stack bytes, so two processes at the same frame hold the same ring (Friends join-in-progress).
+set_source_files_properties("${D}/src/sysdolphin/baselib/card.c" PROPERTIES
+  COMPILE_OPTIONS "-ftrivial-auto-var-init=zero")
 set(MU_CPU_HITLAG_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/native_cpu_hitlag_branch.h")
 add_custom_command(OUTPUT "${MU_CPU_HITLAG_FIXTURE}"
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/native_cpu_overlay.py"
@@ -280,6 +301,20 @@ list(APPEND SDK_SOURCES "${SDK}/os/OSAlloc.c" "${SDK}/os/OSArena.c" "${SDK}/pad/
 # Written for the hardware itself, or in its assembly; the native build has its own versions of these.
 list(REMOVE_ITEM SDK_SOURCES "${SDK}/gx/GXFifo.c" "${SDK}/mtx/psmtx.c")
 file(GLOB_RECURSE SHIM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shim/*.c")
+if(NOT MELEE_DOUBLES)
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_doubles.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_doubles_bootstrap.c")
+endif()
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+option(MELEE_SQUAD_STRIKE "Build Squad Strike for offline VS and Friends" OFF)
+# CSS accesses mncharsel's private state through one include, never a second TU.
+list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad_css.c")
+if(MELEE_SQUAD_STRIKE)
+  target_compile_definitions(game_flags INTERFACE MU_SQUAD=1)
+else()
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad.c")
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad_online.c")
+endif()
 # A game library with no Slippi code in it (-DMU_NO_SLIPPI=ON, its own build directory): the online
 # menus, replay playback and recording, practice matchmaking and the online rule codes are left out.
 # Three small files stand in for them: the entry points the game sources call (shim/mu_noslippi.c),
@@ -290,8 +325,8 @@ option(MU_NO_SLIPPI "Build the game without the Slippi menus, replays and online
 set(MU_NO_SLIPPI_ONLY mu_noslippi.c mu_match_info.c mu_p2p_entry.c)
 if(MU_NO_SLIPPI)
   foreach(removed mu_slippi_menu.c mu_slippi_css.c mu_slippi_chat.c mu_slippi_splash.c mu_slippi_sss.c
-                  mu_replay.c mu_replay_abi.c mu_practice.c mu_online_rules.c mu_framedata.c
-                  mu_replay_defend.c)
+                  mu_replay.c mu_replay_abi.c mu_practice.c mu_online_rules.c mu_framedata.c mu_tourney.c
+                  mu_replay_defend.c mu_ranked_setup.c mu_ranked_setup_online.c mu_ranked_rank.c mu_ranked_reveal.c)
     list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/${removed}")
   endforeach()
   target_compile_definitions(game_flags INTERFACE MU_NO_SLIPPI)
@@ -384,7 +419,7 @@ endif()
 
 # rogueMelee's Rogue Mode, native (rogue/): its own C under rogue/melee/rogue (the include root is
 # rogue/, so the decomp's <melee/rogue/...> includes find it), and its edits to the game's source in
-# melee-native.patch, each under #if MU_ROGUE. Offered only with its disc, offline (shim side:
+# Rogue patch routines are gated by MU_ROGUE and require the player's disc.
 # rogue/mu_rogue.c). The flags are the release values of its own build (tools/lib/integration.py).
 option(MU_ROGUE "Build rogueMelee's Rogue Mode natively (rogue/)" ON)
 if(MU_ROGUE)
@@ -464,8 +499,10 @@ set_source_files_properties(${TMCE_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENE
 
 add_library(melee_game SHARED ${GAME_SOURCES} ${LIBC_SOURCES} ${SDK_SOURCES} ${SHIM_SOURCES} $<TARGET_OBJECTS:sdk_math>
   ${TMCE_OBJECTS})
+add_dependencies(melee_game mu_rank_badge_assets)
 set_target_properties(melee_game PROPERTIES PREFIX "" C_STANDARD 11 C_EXTENSIONS ON EXCLUDE_FROM_ALL ON)
 target_link_libraries(melee_game PRIVATE game_flags)
+
 # Right after MEM1 (see port/app/source_host.cpp): the image's statics then have physical addresses
 # GX can hold. The debug information goes to melee_game.dbg so the loaded image stays small enough
 # to fit below 64 MB physical; addr2line reads the .dbg.
@@ -584,6 +621,7 @@ endfunction()
 mu_boundary_fixture(hud_nana "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_hud_scale.c" mu_live_fighter mu_nana_damage)
 mu_boundary_fixture(practice_destination "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_practice.c"
   mu_practice_resolve_pending_mode mu_practice_enter_mode)
+mu_boundary_fixture(boot_match_destination "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_boot_match.c" mu_boot_match_resolve)
 mu_boundary_fixture(skin_cycle_bridge "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_content.c" mu_skin_cycle)
 mu_boundary_fixture(costume_parts "${D}/src/melee/ft/ftparts.c" ftParts_80074D7C ftParts_80074CA0)
 mu_boundary_fixture(stage_item_link "${D}/src/melee/it/kinds/itwhitebea.c" mu_whitebea_block_alive mu_whitebea_validate_block)

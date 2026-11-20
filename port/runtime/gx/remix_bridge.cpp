@@ -7,6 +7,7 @@
 #include "gx_fx_lights.h"
 #include "texture_snapshot.h"
 #include "host.h"
+#include "test_env.h"
 #include "stb/stb_image_write.h"
 
 #if defined(_WIN32) && defined(MELEE_REMIX_SPIKE)
@@ -31,7 +32,8 @@
 namespace gx {
 
 bool remix_requested() {
-  static const bool on = [] { const char* v = std::getenv("MELEE_REMIX"); return v && v[0] == '1'; }();
+  // Never inside YouGame: only the player's Lighting choice turns Remix on there.
+  static const bool on = [] { const char* v = host::test_env::getenv("MELEE_REMIX"); return v && v[0] == '1'; }();
   return on;
 }
 bool remix_visible() {
@@ -190,7 +192,8 @@ RemixBridge::~RemixBridge() {
 bool RemixBridge::start(int width, int height, bool hidden, std::string* error, void* parent) {
   Impl& m = *impl_;
   std::wstring dir;
-  if (const wchar_t* v = _wgetenv(L"MELEE_REMIX_DIR")) dir = v;
+  // MELEE_REMIX_DIR never applies inside YouGame: SetDllDirectoryW below makes it a search path for every DLL.
+  if (const wchar_t* v = host::test_env::yougame_session ? nullptr : _wgetenv(L"MELEE_REMIX_DIR")) dir = v;
   else {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);

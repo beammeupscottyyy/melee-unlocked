@@ -6,6 +6,8 @@
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_paths.h"
 #endif
+#include "yougame_box_present.h"
+#include "yougame_link.h"
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -31,11 +33,14 @@
 #include "dxgi_paced_mode.h"
 #include "fullscreen_state.h"
 #include "vrr_detect.h"
+#include "pacing_diagnostics_win.h"
 #include "temporal_history.h"
 #include "vblank_clock.h"
 #include "gx_d3d12.h"
 #include "gx_adapter.h"
 #include "gx_backend.h"   // solver_pair_counter, for the "gpu:" diagnostic line
+#include "pipeline_cache_store.h"
+#include "prewarm_variants.h"
 #include "gpu_readings.h"
 #ifdef MELEE_NO_SLIPPI
 #include "netplay_state.h"   // the same names, answered from the neutral netplay state
@@ -130,7 +135,7 @@ bool rtx_remix_available() {
 #ifdef MELEE_REMIX_SPIKE
   static const bool present = [] {
     std::wstring dir;
-    if (const wchar_t* v = _wgetenv(L"MELEE_REMIX_DIR")) dir = v;
+    if (const wchar_t* v = host::test_env::yougame_session ? nullptr : _wgetenv(L"MELEE_REMIX_DIR")) dir = v;
     else {
       if (!rtx_pack_current(game_dir_w())) return false;   // a pack from another version: nothing of it loads
       dir = (std::filesystem::path(game_dir_w()) / L"Remix").wstring();
@@ -224,7 +229,21 @@ void check(HRESULT hr, const char* what) {
   if (!FAILED(hr)) return;
   const unsigned code = (unsigned)hr;
   if ((code == 0x887A0005u || code == 0x887A0006u || code == 0x887A0007u || code == 0x887A0020u) && g_check_device) {
+    ::gx::cache_store::freeze();   // nothing from a lost device replaces the saved caches
     const HRESULT reason = g_check_device->GetDeviceRemovedReason();
+    // The driver reset or the display changed (a 0.9.220 report: an RTX 5090's driver let go during a
+    // desktop mode change): the game starts again by itself, on Direct3D 11 if it happens again soon,
+    // instead of stopping with a crash report. Only repeated losses are reported.
+    {
+      static std::atomic<bool> once{false};
+      if (!once.exchange(true)) {
+        char why[160];
+        std::snprintf(why, sizeof why, "D3D12 %s %08X, %s", what, code, device_lost_reason(reason));
+        // A GPU whose highest level is Direct3D 11 goes to Direct3D 11 at once (see g_check_level11).
+        if (g_check_level11) switch_settings_to_d3d11();
+        host::restart_after_device_loss(why, switch_settings_to_d3d11);
+      }
+    }
     const char* next = "If this happens again, set Settings > Video > Graphics backend to Direct3D 11.";
     if (g_check_level11 && switch_settings_to_d3d11())
       next = "This GPU is old for Direct3D 12: the game starts on Direct3D 11 from now on (Settings > Video > Graphics backend).";
@@ -413,7 +432,15 @@ struct PipelineRecipe {
 static std::atomic<uint64_t> next_backend_id{1};
 class D3D12Backend : public Backend {
  public:
-  D3D12Backend(HWND hwnd, int w, int h, const D3D12Options& o) : hwnd_(hwnd), opts_(o), client_w_(w), client_h_(h) { init(); start_pso_workers(); prewarm_pipelines();
+  D3D12Backend(HWND hwnd, int w, int h, const D3D12Options& o) : hwnd_(hwnd), opts_(o), client_w_(w), client_h_(h) { recipes_unsaved_ = o.prewarm_only; init(); start_pso_workers(); start_cache_saver(); prewarm_pipelines();
+    // The recipe list is whole now (a list saved halfway through the prewarm would drop recipes):
+    // the merged list goes to the cache root if the file there lacks some, and again whenever new
+    // pipelines arrive.
+    recipes_ready_ = true; cache_saver_.mark_dirty();
+    // A safe point: the prewarm's pipelines and the merged recipe list go to disk now, on the
+    // saver's thread, not only on a timed save or at exit (nothing is written when nothing changed).
+    cache_saver_.request_flush("prewarm");
+    log_pipeline_stats("startup", cache_saver_.saved_bytes());
     prewarm_upscalers();
     host::loading_close();
 #ifdef GX_PC_SETTINGS
@@ -426,6 +453,9 @@ class D3D12Backend : public Backend {
     set_player_tags_always(opts_.player_tags_always != 0);
     set_arcade_display(ArcadeSource::Settings, arcade_settings_bits(opts_)); set_shield_colors(opts_.shield_color, opts_.shield_color_online);
   }
+  PrewarmStats prewarm_stats() const override {
+    return {"d3d12", pipeline_recipes_.size(), pipelines_loaded_.load(), pipelines_compiled_.load()};
+  }
   ~D3D12Backend() override { if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: backend shutdown / gpu wait");
     fg_presenter_wait(); fg_presenter_stop();
     wait_gpu(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: gpu idle / settings destroy");
@@ -437,7 +467,8 @@ class D3D12Backend : public Backend {
     if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: settings destroyed / workers stop");
     stop_pso_workers(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: workers stopped");
     integrate_compiled_psos(); flush_captures(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: captures flushed");
-    save_pipeline_recipes(); save_pipeline_library(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: pipeline cache saved");
+    cache_saver_.stop(); log_pipeline_stats("session", cache_saver_.saved_bytes());
+    if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: pipeline cache saved");
     if (fence_event_) CloseHandle(fence_event_); if (present_timer_) CloseHandle(present_timer_);
     if (frame_latency_waitable_) CloseHandle(frame_latency_waitable_);
     last_poses_.clear();
@@ -451,6 +482,15 @@ class D3D12Backend : public Backend {
     streamline::shutdown_for_process_exit();
     if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: Streamline left for process exit");
     if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: backend destroyed"); }
+  bool supports_game_reset() const override { return true; }
+  void reset_game_state() override {
+    wait_gpu();
+    textures_.clear(); drop_efb_copies(); pending_hd_.clear(); texture_retry_frame_.clear();
+    texture_sets_.clear(); sampler_sets_.clear(); srv_cursor_ = 0; sampler_slots_used_ = 0;
+    for (auto& video : video_textures_) for (auto& slot : video) slot = {};
+    last_poses_.clear(); dlss_reset_ = true; xess_reset_ = true;
+    create_efb();
+  }
   const D3D12Options& options() const { return opts_; }
   const RenderOptions* presentation_options() const override { return &opts_; }
   void presentation_stats(uint32_t* frames, uint32_t* pipelines, uint32_t* textures) const override {
@@ -521,6 +561,7 @@ class D3D12Backend : public Backend {
   }
   VBlankClock vblank_;
   bool vblank_tracked_ = false;
+  pacing_diag::WindowsRecorder pacing_diagnostics_;
   void update_variable_refresh();
   vrr::Detector vrr_;
   bool tear_free_ = false, vrr_readable_ = false;
@@ -666,6 +707,15 @@ class D3D12Backend : public Backend {
   std::mutex pso_mutex_, pipeline_library_mutex_;
   std::condition_variable pso_cv_, pso_done_cv_;
   int pso_wait_budget_us_ = 0;   // per presented frame: how long draws may wait for their real pipeline
+  // What this frame spent its submit time on, logged when a match frame takes 10 ms or more, so a
+  // hitch says whether textures, pipelines, GPU waits or descriptor rollovers caused it.
+  struct SlowFrameCost {
+    uint32_t textures = 0, rollovers = 0, pso_queued = 0, pso_built = 0, gpu_waits = 0;
+    uint64_t texture_bytes = 0;
+    double create_ms = 0, decode_ms = 0, copy_ms = 0, pso_build_ms = 0, pso_wait_ms = 0, gpu_wait_ms = 0;
+  } slow_{};
+  unsigned slow_logged_ = 0;
+  void log_slow_frame(const Frame& frame, double seconds);
   bool capturing_efb_ = false;
   std::deque<PsoJob> pso_jobs_;
   std::vector<PsoResult> pso_done_;
@@ -688,7 +738,26 @@ class D3D12Backend : public Backend {
   }
   void prewarm_pipelines();
   void prewarm_upscalers();
-  void save_pipeline_recipes();
+  // The caches are saved while the game runs (pipeline_cache_store.h): the saver thread calls these
+  // after new pipelines arrive, on an exit or relaunch (flush_all), and once more from the destructor.
+  cache_store::Produce produce_pipeline_recipes(cache_store::Buffer& out);
+  void remember_recipe(const PipelineRecipe& recipe);   // render thread
+  void start_cache_saver();
+  void log_pipeline_stats(const char* why, uint64_t saved_bytes);
+  std::mutex recipes_mutex_;   // pipeline_recipes_: the render thread appends, the saver thread copies what is new
+  // Saver thread: the recipes copied so far (each once) and an order-free hash of them. The prewarm
+  // files recipes in the order the workers finish, so the list's order differs from start to start.
+  size_t recipes_copied_ = 0;
+  std::vector<PipelineRecipe> recipes_unique_;
+  std::unordered_set<std::string> recipes_seen_;
+  uint64_t recipes_set_hash_ = 0;
+  bool recipes_unsaved_ = false;
+  // The root recipes.bin as read at startup (before recipes_ready_): a list it already holds is not
+  // written again, so a start that learned nothing new leaves the file alone.
+  size_t recipes_file_count_ = 0;
+  uint64_t recipes_file_set_hash_ = 0;
+  std::atomic<bool> recipes_ready_{false};   // set after the prewarm
+  std::atomic<uint64_t> pipelines_loaded_{0}, pipelines_compiled_{0};   // from the library / built by the driver
   std::vector<uint32_t> index_scratch_;
   void init();
   void create_swapchain(bool waitable);
@@ -974,16 +1043,18 @@ class D3D12Backend : public Backend {
   bool rtx_have_camera_ = false;
   bool rtx_build_scene();
   // Persistent caches (opts_.shader_cache): compiled shader blobs as files, pipelines in a D3D12
-  // pipeline library serialized at shutdown. First sessions compile; later ones load instantly.
+  // pipeline library the cache saver serializes while the game runs (start_cache_saver). First
+  // sessions compile; later ones load instantly.
   ComPtr<ID3D12PipelineLibrary> pipeline_library_;
   std::vector<uint8_t> pipeline_library_data_;
   bool pipeline_library_dirty_ = false;
   // Windows' pipeline cache faulted under a library call (build_pso): the library is not used again
-  // this session, and at shutdown its file is deleted rather than saved. Under pipeline_library_mutex_.
+  // this session, and the saver deletes its file rather than saving it. Under pipeline_library_mutex_.
   bool pipeline_library_faulted_ = false;
+  bool pipeline_library_removed_ = false;   // its file was deleted after a fault; under pipeline_library_mutex_
   void pipeline_library_fault(const char* call);
   void open_pipeline_library();
-  void save_pipeline_library();
+  cache_store::Produce produce_pipeline_library(cache_store::Buffer& out);
   bool load_shader_blob(const std::string& path, ComPtr<ID3DBlob>& blob);
   void save_shader_blob(const std::string& path, ID3DBlob* blob);
   ComPtr<ID3D12CommandQueue> queue_;
@@ -1139,6 +1210,8 @@ class D3D12Backend : public Backend {
   EfbCopy pending_clear_{};
   std::vector<ComPtr<ID3D12Resource>> frame_garbage_[FRAME_SLOTS];
   std::vector<uint8_t> decode_scratch_;
+  // Last member, so it is destroyed first: its thread reads the library and the recipes above.
+  cache_store::Saver cache_saver_;
 };
 
 void D3D12Backend::init() {
@@ -1577,6 +1650,9 @@ void D3D12Backend::create_swapchain_targets(bool resize) {
 
 void D3D12Backend::apply_fullscreen_mode() {
   fg_presenter_wait();
+  // Every embedded window, child or toplevel: a settings change (Internal resolution) used to reach
+  // ResizeTarget/SetFullscreenState here in child embeds and leave the picture monitor-sized and cropped.
+  if (yougame::embedded()) opts_.exclusive_fullscreen = false;
   if (!swapchain_) return;
   BOOL was_exclusive = FALSE;
   swapchain_->GetFullscreenState(&was_exclusive, nullptr);
@@ -2210,7 +2286,9 @@ void D3D12Backend::wait_gpu() {
   if (fence_->GetCompletedValue() < fence_value_) {
     fence_->SetEventOnCompletion(fence_value_, fence_event_);
     host::perf::Scope wait_cost(host::perf::Stage::Wait);
+    Stopwatch gpu_wait_sw;
     WaitForSingleObject(fence_event_, INFINITE);
+    ++slow_.gpu_waits; slow_.gpu_wait_ms += gpu_wait_sw.lap() * 1e3;
   }
 }
 
@@ -2392,12 +2470,21 @@ static bool guarded_create_pipeline(ID3D12Device* device, const D3D12_GRAPHICS_P
   __try { *hr = device->CreateGraphicsPipelineState(pd, IID_PPV_ARGS(out)); return true; }
   __except (windows_fault_filter(GetExceptionCode())) { *hr = E_FAIL; return false; }
 }
+static bool guarded_serialized_size(ID3D12PipelineLibrary* library, SIZE_T* size) {
+  __try { *size = library->GetSerializedSize(); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *size = 0; return false; }
+}
+static bool guarded_serialize_library(ID3D12PipelineLibrary* library, void* data, SIZE_T size, HRESULT* hr) {
+  __try { *hr = library->Serialize(data, size); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *hr = E_FAIL; return false; }
+}
 
 void D3D12Backend::pipeline_library_fault(const char* call) {
   if (!pipeline_library_faulted_)
     host::log("d3d12: Windows' pipeline cache faulted in %s; pipelines are built without the saved library for the rest "
               "of this session, and the next start builds a new one", call);
   pipeline_library_faulted_ = true;
+  cache_saver_.mark_dirty();   // the saver deletes the file now, not only at exit
 }
 
 ComPtr<ID3D12PipelineState> D3D12Backend::build_pso(const PsoKey& key, const VSUid& vsu, const PSUid& psu, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo,
@@ -2452,7 +2539,7 @@ ComPtr<ID3D12PipelineState> D3D12Backend::build_pso(const PsoKey& key, const VSU
   ID3D12PipelineState* raw = nullptr;
   HRESULT hr = E_FAIL;
   if (library && !guarded_load_pipeline(library, pso_name, &pd, &raw, &hr)) { pipeline_library_fault("LoadGraphicsPipeline"); library = nullptr; raw = nullptr; }
-  if (library && SUCCEEDED(hr) && raw) { pso.Attach(raw); return pso; }
+  if (library && SUCCEEDED(hr) && raw) { pso.Attach(raw); ++pipelines_loaded_; return pso; }
   raw = nullptr;
   if (!guarded_create_pipeline(device_.Get(), &pd, &raw, &hr)) {
     host::log("d3d12: Windows faulted creating pipeline %ls; its draws use the generic pipeline", pso_name);
@@ -2481,26 +2568,30 @@ ComPtr<ID3D12PipelineState> D3D12Backend::build_pso(const PsoKey& key, const VSU
     static std::atomic<int> told{0};   // a whole damaged cache would otherwise fill the log
     if (told.fetch_add(1) < 8) host::log("d3d12: pipeline %ls refused (%08X); built again from source and accepted", pso_name, (unsigned)hr);
   }
+  ++pipelines_compiled_;
   HRESULT stored = E_FAIL;
   if (library && !guarded_store_pipeline(library, pso_name, pso.Get(), &stored)) pipeline_library_fault("StorePipeline");
-  else if (library && SUCCEEDED(stored)) pipeline_library_dirty_ = true;
+  else if (library && SUCCEEDED(stored)) { pipeline_library_dirty_ = true; cache_saver_.mark_dirty(); }
   return pso;
 }
 
 // See Backend::variable_refresh and vrr_detect.h. Called every 32 presents; a window is a second.
 void D3D12Backend::update_variable_refresh() {
   DXGI_FRAME_STATISTICS st{};
-  vrr_readable_ = swapchain_ && SUCCEEDED(swapchain_->GetFrameStatistics(&st));
+  HRESULT diagnostic_statistics_result = E_FAIL;
+  vrr_readable_ = swapchain_ && SUCCEEDED(diagnostic_statistics_result = swapchain_->GetFrameStatistics(&st));
+  pacing_diagnostics_.statistics(diagnostic_statistics_result, st);
   if (!vrr_readable_) { vrr_.restart(); return; }
   static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
   if (!vrr_.add({st.PresentCount, st.SyncRefreshCount, (double)st.SyncQPCTime.QuadPart / qpc_hz}, vrr_nominal_hz_)) return;
   if (vrr_.state() == 1)
     host::log("display: variable refresh (G-Sync or FreeSync) is on: %.0f refreshes a second for %.0f frames on a %.0f Hz "
-              "display; frames are presented synced under %.0f a second", vrr_.refreshes(), vrr_.shown(),
+              "display; frame cap below %.0f fps, V-Sync follows the player's setting", vrr_.refreshes(), vrr_.shown(),
               vrr_nominal_hz_, vrr::under_refresh(vrr_nominal_hz_));
   else
     host::log("display: fixed refresh: %.0f refreshes a second for %.0f frames on a %.0f Hz display", vrr_.refreshes(),
               vrr_.shown(), vrr_nominal_hz_);
+  RenderOptions::live_variable_refresh().store(vrr_.state(), std::memory_order_relaxed);   // the automatic V-Sync reads it
 }
 
 void D3D12Backend::pso_worker() {
@@ -2532,7 +2623,8 @@ void D3D12Backend::integrate_compiled_psos() {
     if (r.vs && !vs_blobs_[r.key.vs]) vs_blobs_[r.key.vs] = r.vs;
     if (r.ps && !ps_blobs_[r.key.ps]) ps_blobs_[r.key.ps] = r.ps;
     // Wireframe pipelines (Lightweight 5, cull bit 4) are not kept: the recipe holds the game's own state only.
-    if (r.pso && r.key.mvec == 0 && !(r.key.cull & 4) && pipeline_recipes_.size() < 16384) pipeline_recipes_.push_back(r.recipe);
+    // Plain or upscaler, at any MSAA count (prewarm_variants.h): the next start builds it again from this recipe.
+    if (r.pso && prewarm_variants::keeps_recipe(r.key.mvec) && !(r.key.cull & 4) && pipeline_recipes_.size() < 16384) remember_recipe(r.recipe);
   }
 }
 
@@ -2695,7 +2787,7 @@ ID3D12PipelineState* D3D12Backend::get_pso(const DrawCall& dc, D3D12_PRIMITIVE_T
   recipe.bp = dc.bp; std::memcpy(recipe.xf, dc.xf_regs, sizeof(recipe.xf));
   if (!prewarming_ && !pso_threads_.empty()) {
     if (psos_pending_.insert(key).second) {
-      ++g_pso_creates;
+      ++g_pso_creates; ++slow_.pso_queued;
       std::lock_guard<std::mutex> lk(pso_mutex_);
       pso_jobs_.push_front(PsoJob{key, vsu, psu, topo, recipe});   // a draw is waiting on it: ahead of prewarm work
       pso_cv_.notify_one();
@@ -2716,7 +2808,9 @@ ID3D12PipelineState* D3D12Backend::get_pso(const DrawCall& dc, D3D12_PRIMITIVE_T
         host::perf::Scope wait_cost(host::perf::Stage::Wait);
         pso_done_cv_.wait_for(lk, std::chrono::microseconds(exact ? 2000 : std::min(pso_wait_budget_us_, 2000)), [&] { return !pso_done_.empty(); });
       }
-      pso_wait_budget_us_ -= (int)(wait_sw.lap() * 1e6);
+      const double waited = wait_sw.lap();
+      pso_wait_budget_us_ -= (int)(waited * 1e6);
+      slow_.pso_wait_ms += waited * 1e3;
       integrate_compiled_psos();
       auto ready = psos_.find(key);
       if (ready != psos_.end()) {
@@ -2730,13 +2824,15 @@ ID3D12PipelineState* D3D12Backend::get_pso(const DrawCall& dc, D3D12_PRIMITIVE_T
     if (key.blend & 1) return nullptr;
     return fallback_pso(key, dc, topo);   // approximate shading until the worker delivers the pipeline
   }
-  ++g_pso_creates;
+  ++g_pso_creates; ++slow_.pso_built;
   ComPtr<ID3DBlob>& vs = vs_blobs_[vh];
   ComPtr<ID3DBlob>& ps = ps_blobs_[ph];
+  Stopwatch build_sw;
   ComPtr<ID3D12PipelineState> pso = build_pso(key, vsu, psu, topo, vs, ps);
+  slow_.pso_build_ms += build_sw.lap() * 1e3;
   psos_[key] = pso;
   if (!pso) return fallback_pso(key, dc, topo);
-  if (!prewarming_ && pipeline_recipes_.size() < 4096) pipeline_recipes_.push_back(recipe);
+  if (!prewarming_ && pipeline_recipes_.size() < 4096) remember_recipe(recipe);
   dc.cached_pipeline_owner = owner, dc.cached_pipeline = pso.Get();
   return pso.Get();
 }
@@ -3070,6 +3166,8 @@ ID3D12Resource* D3D12Backend::get_texture(const TextureRef& t, uint32_t* w, uint
   D3D12_RESOURCE_DESC rd{};
   rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = res_w; rd.Height = res_h; rd.DepthOrArraySize = 1;
   rd.MipLevels = (UINT16)res_levels; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+  Stopwatch texture_sw;
+  ++slow_.textures; slow_.texture_bytes += texture_bytes(res_w, res_h, res_levels);
   HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&e.resource));
   if (out_of_video_memory(hr)) {
     // No room: free cached textures this frame has not drawn and try once more. If it still does
@@ -3081,6 +3179,7 @@ ID3D12Resource* D3D12Backend::get_texture(const TextureRef& t, uint32_t* w, uint
     if (out_of_video_memory(hr)) { texture_retry_frame_[key] = frame_counter_ + TEXTURE_RETRY_FRAMES; return nullptr; }
   }
   check(hr, "texture");
+  slow_.create_ms += texture_sw.lap() * 1e3;
   // Decode each level and copy through the upload ring. A replacement arrives already RGBA8, so it
   // skips the GX decoder and is copied straight out of the decoded PNG.
   lw = res_w; lh = res_h;
@@ -3091,7 +3190,9 @@ ID3D12Resource* D3D12Backend::get_texture(const TextureRef& t, uint32_t* w, uint
       rgba = replacement->pixels.data() + replacement->level_offset[l];
       lw = replacement->level_width[l]; lh = replacement->level_height[l];
     } else {
+      texture_sw.lap();
       decode_texture(level_src, lw, lh, t.format, t.data->palette.data(), t.tlut_format, decode_scratch_);
+      slow_.decode_ms += texture_sw.lap() * 1e3;
       rgba = decode_scratch_.data();
       if (texpack::dumping()) texpack::dump_level(pack_name, l, rgba, lw, lh);
     }
@@ -3105,7 +3206,9 @@ ID3D12Resource* D3D12Backend::get_texture(const TextureRef& t, uint32_t* w, uint
       texture_retry_frame_[key] = frame_counter_ + TEXTURE_RETRY_FRAMES;
       return nullptr;
     }
+    texture_sw.lap();
     for (uint32_t y = 0; y < lh; ++y) memcpy(cpu + (size_t)y * pitch, rgba + (size_t)y * lw * 4, lw * 4);
+    slow_.copy_ms += texture_sw.lap() * 1e3;
     D3D12_TEXTURE_COPY_LOCATION dst{e.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}; dst.SubresourceIndex = l;
     D3D12_TEXTURE_COPY_LOCATION srcloc{upload_ring_.resource(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     srcloc.PlacedFootprint.Offset = gpu - upload_ring_.resource()->GetGPUVirtualAddress();
@@ -3133,6 +3236,7 @@ void D3D12Backend::rotate_heap(D3D12_DESCRIPTOR_HEAP_TYPE type) {
   const bool sampler = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
   auto& heap = sampler ? sampler_heap_ : srv_heap_;
   descriptor_garbage_[slot_].push_back(heap);
+  ++slow_.rollovers;
   D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
   ComPtr<ID3D12DescriptorHeap> replacement;
   check(device_->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&replacement)), "descriptor rollover");
@@ -5086,6 +5190,9 @@ void D3D12Backend::present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource*
   list_->ResourceBarrier(1, &depth_barrier);
 #ifdef GX_PC_SETTINGS
   if (settings_ui_) {
+    // ImGui's texture upload does not check its GPU calls: on a lost device it would crash on a null
+    // buffer. Report the loss here, with its reason and the switch to Direct3D 11.
+    if (const HRESULT removed = device_->GetDeviceRemovedReason(); FAILED(removed)) check(removed, "the settings overlay");
     settings_ui_->draw(list_.Get());
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
     list_->SetDescriptorHeaps(2, heaps);
@@ -5422,6 +5529,17 @@ static void dump_frame(const Frame& frame, const std::string& path) {
   fclose(f);
 }
 
+void D3D12Backend::log_slow_frame(const Frame& frame, double seconds) {
+  const double ms = seconds * 1e3;
+  if (ms < 10.0 || !in_match_ || slow_logged_ >= 200) return;
+  ++slow_logged_;
+  const SlowFrameCost& c = slow_;
+  host::log("d3d12: slow frame %llu: submit %.1f ms; %u new textures (%.2f MB: create %.1f, decode %.1f, copy %.1f ms); "
+            "pipelines %u queued, %u built in %.1f ms, waited %.1f ms; %u GPU waits %.1f ms; %u descriptor rollovers",
+            (unsigned long long)frame.sequence, ms, c.textures, c.texture_bytes / 1048576.0, c.create_ms, c.decode_ms,
+            c.copy_ms, c.pso_queued, c.pso_built, c.pso_build_ms, c.pso_wait_ms, c.gpu_waits, c.gpu_wait_ms, c.rollovers);
+}
+
 void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* overrides) {
   set_presented_test_fill(frame.test_fill);
   remix_floor_tex_.clear();
@@ -5444,10 +5562,13 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
     diag_time = now;
   };
   struct FrameTimer { Stopwatch& sw; ~FrameTimer() { g_prof[11] += sw.lap(); ++g_prof_frames; } } frame_timer{frame_sw};
+  slow_ = {};
+  struct SlowFrameLog { D3D12Backend& backend; const Frame& frame; Stopwatch sw; ~SlowFrameLog() { backend.log_slow_frame(frame, sw.lap()); } } slow_log{*this, frame, {}};
   video_bg::set_enabled(opts_.video_backgrounds);
   video_bg::begin_frame(frame.scene_major, frame.scene_minor);
   set_css_scene(video_bg::learning::scene_slot(frame.scene_major, frame.scene_minor) == 0);
   in_match_ = frame_in_match(frame);
+  cache_saver_.hold(in_match_);   // timed cache saves wait for the next menu (a library copy is large)
   set_lightweight_level(opts_.lightweight);
   publish_look(opts_);
   effects_filter_ = effects_filter(frame, lightweight_effects_level(opts_.effects_level, opts_.lightweight));
@@ -5852,32 +5973,40 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
     streamline::pcl_marker(3); streamline::pcl_marker(4);
     Stopwatch present_sw;
     try {
-      // Synced when V-Sync is on, and on a display that follows the frames (tear_free_, from the
-      // presentation loop): there a frame starts its own refresh, so syncing costs nothing while
-      // the rate stays under the refresh, and a frame that comes a little early waits instead of
-      // tearing. A 0.8.99 player with a 240 Hz G-Sync screen and V-Sync off saw tearing.
-      // Not while DLSS frame generation runs: it paces its own frames and needs V-Sync off in the
-      // game (NVIDIA: V-Sync for it belongs in the driver).
-      // FSR frame generation paces its two presents itself (the second one below), as DLSS's does.
+      // Sync by the player's choice or the explicit scanline-sync diagnostic. Detecting VRR
+      // alone must not force V-Sync on. Frame generation paces its own frames, so it also
+      // suppresses the scanline diagnostic's sync request. FSR frame generation paces its two
+      // presents itself (the second one below), as DLSS's does.
       const bool synced = opts_.vsync || (tear_free_ && fg_applied_ <= 0 && !fsr_fg_generated_);
+      // Keep the existing deadline timer, simulation-locked path and DXGI queue limit.
+      // A subframe without a timer deadline may rely on Reflex/vblank pacing: keep interval 1.
+      const bool paced = (present_deadline_ > 0 || opts_.subframe == SubFrameMode::Off ||
+                          !subframe_useful(opts_.fps_cap)) && !fsr_fg_generated_ && fg_applied_ <= 0 && opts_.reflex_mode <= 0;
+      const auto present = yougame::box_present::choose(yougame::embedded(), opts_.vsync,
+          host::window_is_fullscreen() || fullscreen_state_.exclusive_active,
+          yougame::box_present::agent_override(), true, paced, !fullscreen_state_.exclusive_active, synced, yougame::embed_toplevel());
+      if (const auto line = yougame::box_present::announcement(present)) host::log("%s", line);
       const double present_call = Stopwatch::now();
       // While the window cannot be seen (minimized, or alt-tabbed out of exclusive fullscreen),
       // only test whether it can again, as DXGI asks. Presenting on regardless fed screen capture
       // (a Discord stream) frames that flashed an old picture. Not under frame generation, which
-      // paces its own presents.
-      const bool test_only = occluded_ && fg_applied_ <= 0;
+      // paces its own presents. Embedded launches keep drawing so the first-frame ready signal
+      // releases the app cover.
+      const bool test_only = occluded_ && fg_applied_ <= 0 && !yougame::embedded();
       slot_shown_[slot_] = !test_only;
       const HRESULT present_result = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait);
-        return test_only ? swapchain_->Present(0, DXGI_PRESENT_TEST)
-            : swapchain_->Present(synced ? 1 : 0, (!synced && !fullscreen_state_.exclusive_active) ? DXGI_PRESENT_ALLOW_TEARING : 0); }();
+          if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);
+          return swapchain_->Present(present.interval, present.flags); }();
       const bool now_occluded = present_result == DXGI_STATUS_OCCLUDED;
       if (now_occluded != occluded_) {
         occluded_ = now_occluded;
         host::log(occluded_ ? "d3d12: window hidden, presents paused" : "d3d12: window visible, presents resumed");
       }
-      // Ready = the first real frame drawn, visible or not (see gx_d3d11.cpp).
-      yougame::parity::signals.presented(SUCCEEDED(present_result) && frame.test_fill < 0);
+      yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);
+      if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();
       present_wait_ += Stopwatch::now() - present_call;   // a synced Present waits for the display (see gx_d3d11.cpp)
+      if (!test_only) pacing_diagnostics_.present(present_call, opts_.vsync,
+          present.interval, present.flags, opts_.fps_cap, fullscreen_state_.exclusive_active);
     } catch (const std::system_error& error) {
       streamline::disable_after_resource_error(error.what());
       opts_.frame_generation_mode = 0;
@@ -5985,6 +6114,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
       opts_.capture_path = saved;
     }
   }
+  pacing_diagnostics_.poll(swapchain_.Get(), hwnd_);
 }
 
 }  // namespace
@@ -6116,6 +6246,11 @@ void D3D12Backend::prewarm_pipelines() {
   host::loading_show(L"Loading shaders", 3, 4);
   std::vector<PipelineRecipe> recipes;
   read_recipe_file(shader_cache_root_ + "/recipes.bin", recipes);
+  {  // what the root file holds: the saver writes it again only once the list differs
+    std::unordered_set<std::string> in_file;
+    for (const auto& r : recipes)
+      if (in_file.insert(std::string((const char*)&r, sizeof r)).second) { ++recipes_file_count_; recipes_file_set_hash_ += hash_bytes(&r, sizeof r); }
+  }
   std::error_code ec;
   for (auto& entry : std::filesystem::directory_iterator(shader_cache_root_, ec))
     if (entry.is_directory(ec)) read_recipe_file(entry.path().string() + "/recipes.bin", recipes);
@@ -6124,8 +6259,17 @@ void D3D12Backend::prewarm_pipelines() {
   std::unordered_set<PsoKey, PsoKeyHash> keys_seen;
   Stopwatch timer;
   // All recipes go to the compile workers at once (the pipeline library makes known ones cheap);
-  // the window title shows progress while the game waits to boot.
-  size_t queued = 0;
+  // the window title shows progress while the game waits to boot. The start waits only for the
+  // variant this session draws with (prewarm_variants.h): with an upscaler available, the other one
+  // (plain or with motion vectors for DLSS/XeSS/FSR) compiles behind it after the boot, so the first
+  // match with an upscaler switched on finds it built, and a start never waits for pipelines the
+  // previous session had no reason to save.
+  const bool session_upscaler = opts_.dlss_mode != 0 && upscaler_available() && !remix_mode_;   // configure_dlss's test
+  const bool upscaler_possible = streamline::available() || xess::available() || fsr::available();
+  const uint32_t msaa = msaa_samples_ > 1 && msaa_color_ && !opts_.path_tracing ? msaa_samples_ : 1u;   // msaa_on() without motion vectors
+  const prewarm_variants::Plan plan = prewarm_variants::plan(session_upscaler, upscaler_possible, msaa, opts_.prewarm_only);
+  std::unordered_set<PsoKey, PsoKeyHash> waited;   // queued pipelines the start waits for, until they arrive
+  std::vector<PsoJob> later;                       // the other variant: queued behind them, not waited for
   for (const auto& recipe : recipes) {
     if ((recipe.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && recipe.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE) ||
         (recipe.xf[0x3F] & 15) > 8 || (recipe.xf[9] & 3) > 2) continue;
@@ -6134,52 +6278,101 @@ void D3D12Backend::prewarm_pipelines() {
     DrawCall draw{}; draw.components = recipe.components; draw.bp = recipe.bp;
     std::memcpy(draw.xf_regs, recipe.xf, sizeof(recipe.xf));
     auto topo = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)recipe.topology;
-    // Both pipeline variants: plain, and with motion vectors for DLSS (otherwise the first match
-    // with DLSS on would compile everything again and skip draws meanwhile).
-    const int variants = streamline::available() || xess::available() || fsr::available() ? 2 : 1;
-    for (int mvec = 0; mvec < variants; ++mvec) {
+    for (int v = 0; v < plan.count; ++v) {
+      const prewarm_variants::Variant& variant = plan.variants[v];
       VSUid vsu = make_vs_uid(draw); PSUid psu = make_ps_uid(draw);
-      vsu.motion_vectors = psu.motion_vectors = (uint32_t)mvec;
-      PsoKey key{vsu.hash(), psu.hash(), draw.bp.blendmode() & 0xFFFF, draw.bp.zmode() & 0x1F, draw.bp.cullmode(), (uint32_t)topo, draw.bp.zcontrol() & 7, (uint32_t)mvec};
+      vsu.motion_vectors = psu.motion_vectors = prewarm_variants::motion_vectors(variant.mvec) ? 1u : 0u;
+      PsoKey key{vsu.hash(), psu.hash(), draw.bp.blendmode() & 0xFFFF, draw.bp.zmode() & 0x1F, draw.bp.cullmode(), (uint32_t)topo, draw.bp.zcontrol() & 7, variant.mvec};
       // One recipe per pipeline: recipes that only differ in state the pipeline key ignores are dropped.
-      if (psos_.count(key)) { if (mvec == 0 && keys_seen.insert(key).second) pipeline_recipes_.push_back(recipe); continue; }
+      if (psos_.count(key)) { if (v == 0 && keys_seen.insert(key).second) remember_recipe(recipe); continue; }
       if (!psos_pending_.insert(key).second) continue;
-      if (mvec == 0) keys_seen.insert(key);
-      { std::lock_guard<std::mutex> lk(pso_mutex_); pso_jobs_.push_back(PsoJob{key, vsu, psu, topo, recipe}); }
-      ++queued;
+      if (v == 0) keys_seen.insert(key);
+      PsoJob job{key, vsu, psu, topo, recipe};
+      if (variant.wait) {
+        waited.insert(key);
+        std::lock_guard<std::mutex> lk(pso_mutex_); pso_jobs_.push_back(job);
+      } else {
+        later.push_back(job);
+      }
     }
   }
+  {  // behind every pipeline the start waits for; a draw that needs one goes ahead of them (get_pso)
+    std::lock_guard<std::mutex> lk(pso_mutex_);
+    for (auto& job : later) pso_jobs_.push_back(std::move(job));
+  }
   pso_cv_.notify_all();
-  const size_t total = psos_.size() + queued;
+  const size_t total = waited.size();
   // A cache that is already warm finishes in a moment; the progress panel only appears once the
   // wait is long enough to notice, so a normal launch never flashes it.
   const double panel_after = host::now_seconds() + 0.4;
   for (;;) {
     integrate_compiled_psos();
-    size_t pending = psos_pending_.size();
+    for (auto it = waited.begin(); it != waited.end();) it = psos_pending_.count(*it) ? std::next(it) : waited.erase(it);
+    const size_t pending = waited.size();
     wchar_t title[192]; swprintf_s(title, L"%ls  |  compiling shaders %zu / %zu", host::window_title_base().c_str(), total - pending, total);
     host::window_set_title(title);
     if (pending && host::now_seconds() >= panel_after)
-      host::loading_show(L"Compiling shaders (first launch of this version)", total - pending, total);
+      host::loading_show(L"Preparing graphics for this PC (first start only)", total - pending, total);
     if (!pending) break;
     { host::perf::Scope wait_cost(host::perf::Stage::Wait);
       std::this_thread::sleep_for(std::chrono::milliseconds(20)); }
   }
+  if (!later.empty())
+    host::log("d3d12: %zu pipelines for the other upscaler setting compile after the boot (not waited for)", later.size());
   host::loading_close();
   host::window_set_title(host::window_title_base().c_str());
   host::log("d3d12: prewarmed %zu pipelines from %zu recipes before guest startup in %.1f ms", psos_.size(), pipeline_recipes_.size(), timer.lap()*1000.0);
 }
 
-void D3D12Backend::save_pipeline_recipes() {
-  if (pipeline_recipes_.empty()) return;
-  std::unordered_set<std::string> seen;
-  std::vector<PipelineRecipe> unique;
-  for (const auto& r : pipeline_recipes_) if (seen.insert(std::string((const char*)&r, sizeof r)).second) unique.push_back(r);
-  uint64_t header[3] = {0x3150535247505847ull, unique.size(), hash_bytes(unique.data(), unique.size()*sizeof(PipelineRecipe))};
-  std::vector<uint8_t> data(sizeof(header)+unique.size()*sizeof(PipelineRecipe));
+void D3D12Backend::remember_recipe(const PipelineRecipe& recipe) {
+  { std::lock_guard<std::mutex> lk(recipes_mutex_); pipeline_recipes_.push_back(recipe); }
+  cache_saver_.mark_dirty();
+}
+
+// Saver thread. Only the recipes added since the last save are copied under the lock, so the render
+// thread's remember_recipe never waits behind a copy of the whole list.
+cache_store::Produce D3D12Backend::produce_pipeline_recipes(cache_store::Buffer& data) {
+  if (!recipes_ready_) return cache_store::Produce::Nothing;
+  std::vector<PipelineRecipe> fresh;
+  {
+    std::lock_guard<std::mutex> lk(recipes_mutex_);
+    if (pipeline_recipes_.size() > recipes_copied_) fresh.assign(pipeline_recipes_.begin() + recipes_copied_, pipeline_recipes_.end());
+    recipes_copied_ = pipeline_recipes_.size();
+  }
+  for (const auto& r : fresh)
+    if (recipes_seen_.insert(std::string((const char*)&r, sizeof r)).second) {
+      recipes_unique_.push_back(r);
+      recipes_set_hash_ += hash_bytes(&r, sizeof r);
+      recipes_unsaved_ = true;
+    }
+  if (!recipes_unsaved_) return cache_store::Produce::Nothing;
+  recipes_unsaved_ = false;   // a failed write sets it again (start_cache_saver)
+  if (!opts_.prewarm_only && recipes_unique_.size() == recipes_file_count_ && recipes_set_hash_ == recipes_file_set_hash_) return cache_store::Produce::Nothing;
+  const size_t bytes = recipes_unique_.size() * sizeof(PipelineRecipe);
+  uint64_t header[3] = {0x3150535247505847ull, recipes_unique_.size(), hash_bytes(recipes_unique_.data(), bytes)};
+  data.resize(sizeof(header) + bytes);
   std::memcpy(data.data(), header, sizeof(header));
-  std::memcpy(data.data()+sizeof(header), unique.data(), data.size()-sizeof(header));
-  write_cache(shader_cache_root_+"/recipes.bin", data.data(), data.size());
+  std::memcpy(data.data() + sizeof(header), recipes_unique_.data(), bytes);
+  return cache_store::Produce::Write;
+}
+
+void D3D12Backend::start_cache_saver() {
+  // A failed write is forgotten as saved, so the next round writes it again (pipeline_cache_store.h).
+  cache_saver_.add(shader_cache_root_ + "/recipes.bin", [this](cache_store::Buffer& out) { return produce_pipeline_recipes(out); },
+                   [this] { recipes_unsaved_ = true; });
+  cache_saver_.add(opts_.shader_cache + "/pipelines.bin", [this](cache_store::Buffer& out) { return produce_pipeline_library(out); },
+                   [this] {
+                     std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+                     if (!pipeline_library_faulted_) pipeline_library_dirty_ = true;
+                   });
+  cache_saver_.on_saved([this](uint64_t bytes, const char* why) { log_pipeline_stats(why, bytes); });
+  cache_saver_.start();
+}
+
+// One line per save and per session; the second launch of a version should say compiled=0.
+void D3D12Backend::log_pipeline_stats(const char* why, uint64_t saved_bytes) {
+  host::log("d3d12: pipelines cache_hits=%llu compiled=%llu saved_bytes=%llu (%s)", (unsigned long long)pipelines_loaded_.load(),
+            (unsigned long long)pipelines_compiled_.load(), (unsigned long long)saved_bytes, why);
 }
 
 void D3D12Backend::open_pipeline_library() {
@@ -6187,7 +6380,8 @@ void D3D12Backend::open_pipeline_library() {
   shader_cache_root_ = opts_.shader_cache;
   opts_.shader_cache += "/" GX_SHADER_CACHE_VERSION;
   CreateDirectoryA(opts_.shader_cache.c_str(), nullptr);
-  if (const unsigned long long freed = gx::prune_old_shader_caches(shader_cache_root_, GX_SHADER_CACHE_VERSION))
+  if (const unsigned long long freed =
+          opts_.shader_cache_shared ? 0 : gx::prune_old_shader_caches(shader_cache_root_, GX_SHADER_CACHE_VERSION))
     host::log("shaders: removed the shader caches of earlier builds (%.0f MB)", freed / 1048576.0);
   ComPtr<ID3D12Device1> device1;
   if (FAILED(device_.As(&device1))) { host::log("d3d12: pipeline library unsupported"); return; }
@@ -6210,19 +6404,66 @@ void D3D12Backend::open_pipeline_library() {
   }
 }
 
-void D3D12Backend::save_pipeline_library() {
-  if (pipeline_library_faulted_) {   // its file may be what Windows tripped on: the next start builds a new one
-    DeleteFileA((opts_.shader_cache + "/pipelines.bin").c_str());
-    return;
+// Saver thread. Only the state checks and GetSerializedSize run under pipeline_library_mutex_, which
+// every pipeline build takes: the copy itself runs without it (a pipeline library synchronizes
+// itself, except two loads of the same name, and those happen under the lock), so a 100 MB library
+// never holds back a pipeline worker or a draw waiting for its pipeline. A pipeline stored during
+// the copy marks the library dirty again for the next save; if it made the library outgrow the
+// size asked for, the copy is taken again.
+cache_store::Produce D3D12Backend::produce_pipeline_library(cache_store::Buffer& data) {
+  ComPtr<ID3D12PipelineLibrary> library;
+  SIZE_T size = 0;
+  {
+    std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+    if (pipeline_library_faulted_) {   // its file may be what Windows tripped on: the next start builds a new one
+      if (pipeline_library_removed_) return cache_store::Produce::Nothing;
+      pipeline_library_removed_ = true;
+      return cache_store::Produce::Remove;
+    }
+    if (!pipeline_library_ || !pipeline_library_dirty_) return cache_store::Produce::Nothing;
+    if (!guarded_serialized_size(pipeline_library_.Get(), &size)) {
+      pipeline_library_fault("GetSerializedSize");
+      pipeline_library_removed_ = true;
+      return cache_store::Produce::Remove;
+    }
+    if (size == 0 || size > (SIZE_T)(256 << 20)) return cache_store::Produce::Nothing;
+    library = pipeline_library_;
+    pipeline_library_dirty_ = false;   // a pipeline stored from here on marks it again
   }
-  if (!pipeline_library_ || !pipeline_library_dirty_) return;
-  size_t size = pipeline_library_->GetSerializedSize();
-  std::vector<uint8_t> data(size);
-  if (FAILED(pipeline_library_->Serialize(data.data(), size))) return;
-  std::string path = opts_.shader_cache + "/pipelines.bin";
-  write_cache(path, data.data(), size);
-  host::log("d3d12: pipeline library saved (%zu bytes, %zu pipelines)", size, psos_.size());
-  pipeline_library_dirty_ = false;
+  // A fault here (Windows' cache, as under build_pso) costs the library, as it does there.
+  auto faulted = [&](const char* call) {
+    std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+    pipeline_library_fault(call);
+    if (pipeline_library_removed_) return cache_store::Produce::Nothing;
+    pipeline_library_removed_ = true;
+    return cache_store::Produce::Remove;
+  };
+  const auto copy_started = std::chrono::steady_clock::now();
+  for (int attempt = 0;; ++attempt) {
+    data.resize((size_t)size);   // the saver keeps this buffer between saves: no new allocation, no zero fill
+    HRESULT hr = E_FAIL;
+    if (!guarded_serialize_library(library.Get(), data.data(), size, &hr)) return faulted("Serialize");
+    if (SUCCEEDED(hr)) break;
+    SIZE_T now = 0;
+    if (!guarded_serialized_size(library.Get(), &now)) return faulted("GetSerializedSize");
+    // Not grown (a real failure), or still growing after a few tries: the failed write path marks
+    // it dirty again, so a later save tries once more.
+    if (now <= size || attempt >= 3 || now > (SIZE_T)(256 << 20)) return cache_store::Produce::Failed;
+    size = now;
+  }
+  {  // a worker's call faulted Windows' cache while this copy ran: its bytes are not kept
+    std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+    if (pipeline_library_faulted_) {
+      if (pipeline_library_removed_) return cache_store::Produce::Nothing;
+      pipeline_library_removed_ = true;
+      return cache_store::Produce::Remove;
+    }
+  }
+  const double copy_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_started).count();
+  static std::atomic<int> slow_copies{0};
+  if (copy_ms > 50.0 && slow_copies.fetch_add(1) < 4)
+    host::log("d3d12: copying the pipeline library (%zu bytes) took %.1f ms on the cache saver's thread", (size_t)size, copy_ms);
+  return cache_store::Produce::Write;
 }
 
 bool D3D12Backend::load_shader_blob(const std::string& path, ComPtr<ID3DBlob>& blob) {

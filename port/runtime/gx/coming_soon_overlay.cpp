@@ -36,6 +36,9 @@ std::atomic<float> g_offset[6];          // each row's offset from its untilted 
 struct Anchor { float name_end, centre; };
 constexpr Anchor kRows[3] = {{336, 165}, {300, 222}, {278, 278}};
 constexpr const char* kText = "COMING SOON!";
+// The first row is pickable while YouGame is not found: "Get YouGame", "Open YouGame" or "Opening YouGame..."
+// (yougame::first_row_text, set by the menu each frame; slippi_online.cpp, 0x10 and 0x20).
+std::atomic<const char*> g_first_text{"Get YouGame"};
 
 uint32_t rgba(int r, int g, int b, float a = 1.0f) { return IM_COL32(r, g, b, int(std::clamp(a, 0.0f, 1.0f) * 255)); }
 uint32_t mix(uint32_t a, uint32_t b, float t) {
@@ -105,8 +108,8 @@ void sparkle(ImDrawList* dl, ImVec2 o, float r, uint32_t col) {
 // A rainbow pill with a white rim, colours flowing along it, a shine sweeping over it and twinkles at
 // its ends: COMING SOON! `left` is where its left edge meets its middle line, `u` one game pixel in
 // the window, `t` the seconds since it popped in.
-void sticker(ImDrawList* dl, ImVec2 left, float u, float t) {
-  const float px = 13 * u, tw = practice_menu::text_width(px, kText), w = tw + 18 * u, h = 22 * u;
+void sticker(ImDrawList* dl, ImVec2 left, float u, float t, const char* text) {
+  const float px = 13 * u, tw = practice_menu::text_width(px, text), w = tw + 18 * u, h = 22 * u;
   const ImVec2 c(left.x + w * 0.5f + 3 * u, left.y);
   const float pop = t < 0.0f ? 0.0f : t < 0.18f ? t / 0.18f * 1.18f : t < 0.32f ? 1.18f - (t - 0.18f) / 0.14f * 0.18f : 1.0f;
   if (pop <= 0.0f) return;
@@ -119,7 +122,7 @@ void sticker(ImDrawList* dl, ImVec2 left, float u, float t) {
     const uint32_t base = mix(hue((x - c.x) / w * 0.9f - t * 0.45f, 1.0f), rgba(0, 0, 0), (y - c.y) / h * 0.35f + 0.1f);
     return mix(base, rgba(255, 255, 255), shine(x, y, c, w, t, 1.8f) * 0.85f);
   });
-  practice_menu::text(dl, c.x - tw * 0.5f, c.y - px * 0.55f, px, rgba(255, 255, 255), kText, 0.0f, true);
+  practice_menu::text(dl, c.x - tw * 0.5f, c.y - px * 0.55f, px, rgba(255, 255, 255), text, 0.0f, true);
   for (int i = 0; i < 4; ++i) {
     const float k = std::max(0.0f, std::sin(t * 3.0f + i * 1.7f));
     const ImVec2 o(c.x + (i % 2 ? 1 : -1) * (w * 0.5f - (i < 2 ? 2 : 14) * u), c.y + (i < 2 ? -1 : 1) * (h * 0.5f + 1 * u));
@@ -131,6 +134,8 @@ void sticker(ImDrawList* dl, ImVec2 left, float u, float t) {
 }
 
 }  // namespace
+
+void first_row_text(const char* text) { if (text) g_first_text = text; }
 
 void showing() {
   const int64_t now = now_ms();
@@ -195,7 +200,7 @@ void draw(float x0, float y0, float x1, float y1) {
     const float t = since - 0.35f - 0.09f * float(i);   // after the rows settle, one after another
     const float dx = g_offset[2 * i].load(), dy = g_offset[2 * i + 1].load();
     // On the row's middle line, just after its name (it sat 9 pixels above the middle, tilted).
-    sticker(dl, ImVec2(cx + (kRows[i].name_end + 6 - 320 + dx) * u, y0 + (kRows[i].centre + dy) * u), u, t);
+    sticker(dl, ImVec2(cx + (kRows[i].name_end + 6 - 320 + dx) * u, y0 + (kRows[i].centre + dy) * u), u, t, i == 0 ? g_first_text.load() : kText);
   }
   if (dl == g_picture_list) {
     dl->_PopUnusedDrawCmd();

@@ -2,7 +2,9 @@
 // Mockup provenance: ui_sources/mockups/ORIGIN.md. No game state is written here.
 static bool settings_hit_button(const char* id, ImVec2 size,
                                ImGuiButtonFlags flags = ImGuiButtonFlags_EnableNav) {
-  return ImGui::InvisibleButton(id, size, flags);
+  const bool pressed = ImGui::InvisibleButton(id, size, flags);
+  settings_page::label_item(id);
+  return pressed;
 }
 
 // ---- Search and collapsible sections ----
@@ -123,7 +125,7 @@ static std::vector<SettingsRow> g_open_combos;
 static bool settings_begin_combo(const char* label, const char* preview, ImGuiComboFlags flags = 0) {
   SettingsRow row = settings_row_begin(label);
   if (!row.shown) return false;
-  if (!ImGui::BeginCombo(label, preview, flags)) { settings_row_end(row); return false; }
+  if (!settings_widgets::BeginCombo(label, preview, flags)) { settings_row_end(row); return false; }
   g_open_combos.push_back(std::move(row));
   return true;
 }
@@ -141,17 +143,17 @@ template <class Draw> static bool settings_searchable(const char* label, Draw dr
   settings_row_end(row);
   return changed;
 }
-static bool settings_checkbox(const char* label, bool* v) { return settings_searchable(label, [&] { return ImGui::Checkbox(label, v); }); }
+static bool settings_checkbox(const char* label, bool* v) { return settings_searchable(label, [&] { return settings_widgets::Checkbox(label, v); }); }
 static bool settings_slider_int(const char* label, int* v, int lo, int hi, const char* format = "%d", ImGuiSliderFlags flags = 0) {
-  return settings_searchable(label, [&] { return ImGui::SliderInt(label, v, lo, hi, format, flags); });
+  return settings_searchable(label, [&] { return settings_widgets::SliderInt(label, v, lo, hi, format, flags); });
 }
 static bool settings_color_edit3(const char* label, float col[3], ImGuiColorEditFlags flags = 0) {
-  return settings_searchable(label, [&] { return ImGui::ColorEdit3(label, col, flags); });
+  return settings_searchable(label, [&] { return settings_widgets::ColorEdit3(label, col, flags); });
 }
 
-// A page starts (pc_settings.cpp: `if (settings_page(state.active_tab, N))`). During a search every
+// A page starts (pc_settings.cpp: `if (settings_page_shown(state.active_tab, N))`). During a search every
 // page draws, hidden; otherwise only the active one.
-static bool settings_page(int active_tab, int page) {
+static bool settings_page_shown(int active_tab, int page) {
   if (!g_search && active_tab != page) return false;
   // The page before ends: its last section closes.
   if (!g_search) settings_hide_end();
@@ -245,10 +247,7 @@ static bool settings_close_hit(const char* id, ImVec2 size) {
   return pressed;
 }
 
-// Controller focus on slanted rows and chips. ImGui frames the focused item with an upright
-// rectangle around its hit box, which on a parallelogram sat off the shape and across its
-// neighbours. These buttons hide that rectangle; the caller then draws the same frame (focus
-// color, 2 px line, 4 px outside the edge, as ImGui draws it) around the shape it painted.
+// Shaped buttons suppress the rectangular nav cursor; callers outline the painted face.
 static bool settings_shaped_hit_button(const char* id, ImVec2 size) {
   ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
   const bool pressed = settings_hit_button(id, size);
@@ -263,26 +262,24 @@ static bool settings_nav_frame_on_item() {
          !ImGui::GetCurrentWindow()->DC.NavHideHighlightOneFrame;
 }
 
-// The focus frame around a convex quad, offset outward along each edge.
+// Two-pixel focus outline on the exact face, with a light tint of this panel's accent.
+static void settings_nav_frame_outline(ImDrawList* draw, const ImVec2* outline, int count) {
+  const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(ImGui::GetColorU32(ImGuiCol_NavCursor));
+  const ImU32 light = ImGui::ColorConvertFloat4ToU32(
+      ImVec4(.75f + accent.x * .25f, .75f + accent.y * .25f, .75f + accent.z * .25f, 1.0f));
+  draw->AddPolyline(outline, count, light, ImDrawFlags_Closed, 2.0f);
+}
+
 static void settings_nav_frame(ImDrawList* draw, const ImVec2 (&quad)[4]) {
-  constexpr float distance = 4.0f, thickness = 2.0f;
-  float area = 0.0f;
-  for (int i = 0; i < 4; ++i) {
-    const ImVec2& a = quad[i], & b = quad[(i + 1) % 4];
-    area += a.x * b.y - b.x * a.y;
-  }
-  const float side = area >= 0.0f ? 1.0f : -1.0f;
-  const auto normal = [&](const ImVec2& a, const ImVec2& b) {
-    const float ex = b.x - a.x, ey = b.y - a.y, length = std::sqrt(ex * ex + ey * ey);
-    return length > 0.0f ? ImVec2(side * ey / length, -side * ex / length) : ImVec2(0, 0);
-  };
-  ImVec2 frame[4];
-  for (int i = 0; i < 4; ++i) {
-    const ImVec2 n0 = normal(quad[(i + 3) % 4], quad[i]), n1 = normal(quad[i], quad[(i + 1) % 4]);
-    const float k = distance / std::max(0.2f, 1.0f + n0.x * n1.x + n0.y * n1.y);
-    frame[i] = ImVec2(quad[i].x + (n0.x + n1.x) * k, quad[i].y + (n0.y + n1.y) * k);
-  }
-  draw->AddPolyline(frame, 4, ImGui::GetColorU32(ImGuiCol_NavCursor), ImDrawFlags_Closed, thickness);
+  settings_nav_frame_outline(draw, quad, 4);
+}
+
+// A face lifted up and left off its plate: frame the whole button as players
+// see it, face and the plate edge below it (report d6ad1693).
+static void settings_nav_frame_lifted(ImDrawList* draw, const ImVec2 (&face)[4],
+                                      const ImVec2 (&plate)[4]) {
+  const ImVec2 outline[] = {face[0], face[1], plate[1], plate[2], plate[3], face[3]};
+  settings_nav_frame_outline(draw, outline, 6);
 }
 
 // Hovering a category must not change the active page. Only an explicit
@@ -318,7 +315,6 @@ static ImVec2 g_settings_gd_origin;
 static float g_settings_gd_scale = 1.0f;
 static std::string g_settings_gd_help;
 static float g_settings_gd_back_x = 0;
-static bool g_settings_focus_next_gd_row = false;
 // The GD list (the settings page's scrolling child) and where its rows are this frame, in screen
 // pixels: used to rest the scroll on a row boundary and to keep the focused row whole.
 static ImGuiWindow* g_settings_gd_list = nullptr;
@@ -444,6 +440,7 @@ static SettingsGdRow settings_gd_row(const char* label) {
   row.y = (ImGui::GetCursorScreenPos().y - g_settings_gd_origin.y) / g_settings_gd_scale;
   ImGui::SetCursorScreenPos(row.point(88.5f, row.y));
   row.activated = settings_shaped_hit_button("##kit_row", ImVec2(451.5f * g_settings_gd_scale, 30.0f * g_settings_gd_scale));
+  settings_page::label_item(label);
   const bool nav_frame = settings_nav_frame_on_item();
   if (ImGuiWindow* list = ImGui::GetCurrentWindow(); list == g_settings_gd_list) {
     const float top = ImGui::GetItemRectMin().y, bottom = ImGui::GetItemRectMax().y;
@@ -462,13 +459,6 @@ static SettingsGdRow settings_gd_row(const char* label) {
     }
   }
   row.selected = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
-  if (g_settings_focus_next_gd_row) {
-    // SetKeyboardFocusHere(-1) here targets the item before this row (the category
-    // control that just disappeared), leaving the new page with a dead navigation ID.
-    ImGui::SetItemDefaultFocus();
-    g_settings_focus_next_gd_row = false;
-    row.selected = true;
-  }
   const bool disabled = (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) != 0;
   const ImGuiID id = ImGui::GetID("lift");
   row.lift = ImGui::GetStateStorage()->GetFloat(id, 0.0f);
@@ -480,10 +470,13 @@ static SettingsGdRow settings_gd_row(const char* label) {
   row.quad(96+row.lift,row.y+row.lift,540+row.lift,row.y+30+row.lift,
            row.selected ? settings_accent(2) : IM_COL32(46,54,64,255));
   if (nav_frame) {
-    // Lifted face and its shadow together, in the rows' own slant.
-    const ImVec2 frame[] = {row.point(96+row.lift,row.y+row.lift), row.point(540,row.y+row.lift),
-                            row.point(540,row.y+30), row.point(96+row.lift,row.y+30)};
-    settings_nav_frame(ImGui::GetWindowDrawList(), frame);
+    // Follow the animated lifted face, plus the gold plate while it shows.
+    const ImVec2 frame[] = {row.point(96+row.lift,row.y+row.lift), row.point(540+row.lift,row.y+row.lift),
+                            row.point(540+row.lift,row.y+30+row.lift), row.point(96+row.lift,row.y+30+row.lift)};
+    const ImVec2 plate[] = {row.point(96,row.y), row.point(540,row.y),
+                            row.point(540,row.y+30), row.point(96,row.y+30)};
+    if (row.selected) settings_nav_frame_lifted(ImGui::GetWindowDrawList(), frame, plate);
+    else settings_nav_frame(ImGui::GetWindowDrawList(), frame);
   }
   const char* display_label=std::strcmp(label,"Exclusive fullscreen (experimental)")==0?
       "Exclusive fullscreen":label;
@@ -533,12 +526,8 @@ static bool settings_gd_combo(const char* label, int* value, const char* const i
       static constexpr const char* short_displays[]={"Window","Borderless","Exclusive"};
       if(*value>=0 && *value<3) text=short_displays[*value];
     } else if(std::strcmp(label,"Widescreen")==0) {
-#ifdef MELEE_NO_SLIPPI
-      static constexpr const char* short_widescreen[]={"Off","16:9 code","True 16:9"};
-#else
-      static constexpr const char* short_widescreen[]={"Off","Slippi code","True 16:9"};
-#endif
-      if(*value>=0 && *value<3) text=short_widescreen[*value];
+      static constexpr const char* short_widescreen[]={"Off","Fill screen","16:9","16:10","Custom"};
+      if(*value>=0 && *value<5) text=short_widescreen[*value];
     }
     return text;
   };
@@ -635,6 +624,22 @@ static void settings_quit_button(SettingsState& state, ImVec2 at, ImVec2 size) {
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Close Melee Unlocked (asks first)");
   ImGui::PopStyleColor(3);
   ImGui::PopStyleVar();
+}
+// The same Quit game button on each style's first page (the category list), where its pages' footer has
+// it: Esc then one click quits, no category page first (player request 11-20).
+static void settings_home_quit(SettingsState& state, int appearance) {
+  const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize(), saved = ImGui::GetCursorPos();
+  const float quit_w = ImGui::CalcTextSize("Quit game").x + 20.0f;
+  if (appearance == 0) {
+    // Clean's category rows reach down to its chips: the button goes in the free top right, beside the X.
+    settings_quit_button(state, ImVec2(p.x + s.x - 37.0f - 10.0f - quit_w, p.y + 16.0f), ImVec2(quit_w, 28.0f));
+  } else if (appearance == 2) {
+    const float top = p.y + s.y * (430.0f / 480.0f), menu_x = p.x + s.x - 34.0f;
+    settings_quit_button(state, ImVec2(menu_x - quit_w - 8.0f, top), ImVec2(quit_w, 28.0f * g_settings_gd_scale));
+  } else {
+    settings_quit_button(state, ImVec2(p.x + s.x - 40.0f - quit_w - 8.0f, p.y + s.y - 34.0f), ImVec2(quit_w, 30.0f));
+  }
+  ImGui::SetCursorPos(saved);
 }
 static void settings_page_footer(SettingsState& state, int appearance) {
   const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
@@ -809,7 +814,7 @@ static bool settings_toggle(const char* label, bool* value) {
 }
 static bool settings_toggle_draw(const char* label, bool* value) {
   if (g_settings_form_style == 2 && label[0] != '#') return settings_gd_toggle(label,value);
-  if (g_settings_form_style >= 6) return ImGui::Checkbox(label,value);
+  if (g_settings_form_style >= 6) return settings_widgets::Checkbox(label,value);
   if (ImGui::GetCurrentWindow()->DC.IsSameLine)
     ImGui::NewLine();
   ImGui::PushID(label);
@@ -821,6 +826,7 @@ static bool settings_toggle_draw(const char* label, bool* value) {
   const bool slanted = g_settings_form_style == 0;
   const bool clicked = slanted ? settings_shaped_hit_button("##switch", ImVec2(width, height)) :
                                  settings_hit_button("##switch", ImVec2(width, height));
+  settings_page::label_item(label);
   const bool nav_frame = slanted && settings_nav_frame_on_item();
   if (clicked) *value = !*value;
   const bool focused = ImGui::IsItemHovered() || ImGui::IsItemFocused();
@@ -876,6 +882,7 @@ static bool settings_combo_draw(const char* label, int* value, const char* const
     if (stacked && label[0] != '#') ImGui::TextUnformatted(label);
     ImGui::SetNextItemWidth(stacked ? available : width);
     const bool result=ImGui::Combo("##value",value,items,count);
+    settings_page::label_item(label);
     if (!stacked && label[0] != '#') { ImGui::SameLine(0.0f,4.0f); ImGui::TextUnformatted(label); }
     ImGui::PopID();
     return result;
@@ -883,6 +890,7 @@ static bool settings_combo_draw(const char* label, int* value, const char* const
   ImGui::PushID(label);
   settings_field_label(label);
   const bool result = ImGui::Combo("##value", value, items, count);
+    settings_page::label_item(label);
   ImGui::PopID();
   return result;
 }
@@ -902,6 +910,7 @@ static bool settings_slider_draw(const char* label, int* value, int low, int hig
     ImGui::PushID(label);
     ImGui::SetNextItemWidth(std::min(330.0f, std::max(120.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(label).x - 12.0f)));
     const bool result=ImGui::SliderInt("##value",value,low,high,format,flags);
+    settings_page::label_item(label);
     if (label[0] != '#') { ImGui::SameLine(0.0f,4.0f); ImGui::TextUnformatted(label); }
     ImGui::PopID();
     return result;
@@ -909,6 +918,7 @@ static bool settings_slider_draw(const char* label, int* value, int low, int hig
   ImGui::PushID(label);
   settings_field_label(label);
   const bool result = ImGui::SliderInt("##value", value, low, high, format, flags);
+    settings_page::label_item(label);
   ImGui::PopID();
   return result;
 }
@@ -1126,7 +1136,8 @@ static void settings_dashboard_tiles(SettingsState& state) {
     const float y = top + row * (tile_h + gap) + (1.0f - eased) * 45.0f;
     ImGui::SetCursorScreenPos(ImVec2(x, y));
     ImGui::PushID(i);
-    const bool activated = settings_hit_button("##toy_tile", ImVec2(tile_w, tile_h));
+    const bool activated = settings_shaped_hit_button("##toy_tile", ImVec2(tile_w, tile_h));
+    const bool nav_frame = settings_nav_frame_on_item();
     if (i == state.active_tab) ImGui::SetItemDefaultFocus();
     if (state.home_focus_reset && i == 0) {
       ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
@@ -1164,6 +1175,8 @@ static void settings_dashboard_tiles(SettingsState& state) {
     settings_rounded_gradient(draw,ImVec2(a.x+5,a.y+4),
         ImVec2(b.x-5,a.y+tile_h*.55f),rounding-5,
         IM_COL32(255,255,255,42),IM_COL32(255,255,255,0),ImDrawFlags_RoundCornersTop);
+    if (nav_frame)
+      draw->AddRect(a, ImVec2(b.x,b.y-5), settings_mix_color(tile_color,IM_COL32_WHITE,.75f), rounding, 0, 2.0f);
     draw->PushClipRect(ImVec2(a.x+5,a.y+4),ImVec2(b.x-5,b.y-7),true);
     draw->AddEllipseFilled(ImVec2(a.x+tile_w*.46f,a.y+tile_h*.06f),
                            ImVec2(tile_w*.53f,tile_h*.31f),
