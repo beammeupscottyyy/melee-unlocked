@@ -575,8 +575,11 @@ std::vector<Row> rows_for(Page p) {
         if (any)
           rows.push_back(page_row("Fight a pro", Page::Ghosts, active_pro(c), "Play Phillip's AI as a top player."));
         else {
-          // Without AVX a timed check decides; the row says whether it is running or found the PC too slow.
-          const char* why = neural ? phillip_ai::unavailable_reason() : nullptr;
+          // The row says why: the engine, then the ProAI files, the runtime and (without AVX) the timed check.
+          // It used to ask only when a pro was already available, which never reaches this branch, so every
+          // cause read as a bare "Not available" (player report 11-20).
+          const char* why = !g_f.native_source ? "Source Port only: pick it as the engine in the launcher."
+                                               : phillip_ai::unavailable_reason();
           rows.push_back(action_row("Fight a pro", kActNone, why && why[0] == 'C' ? "Checking..." : "Not available",
                                     why ? why : "Phillip's AI as a top player: Source Port.", false));
         }

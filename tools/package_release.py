@@ -22,6 +22,7 @@ from pathlib import Path
 from verify_generated_gct import verify_generated_gct
 import build_content_release
 from build_content_release import CONTENT_BASE
+import windows_signing
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -533,6 +534,19 @@ def main():
     if (folder / "SysPlayback").is_dir():
         (folder / "SysPlayback/GC").mkdir(exist_ok=True)
         shutil.copy2(coef, folder / "SysPlayback/GC/dsp_coef.bin")
+    # Slippi's three full menu files are mostly the disc's own assets: they never ship. The game rebuilds
+    # them from the player's disc with the deltas beside it (host/sysgen.cpp, deltas/manifest.json).
+    deltas = json.loads((ROOT / "port/sys_deltas/manifest.json").read_text())
+    for target in {f["target"] for f in deltas["files"]}:
+        for sys_folder in ("Sys", "SysPlayback"):
+            (folder / sys_folder / "GameFiles/GALE01" / target).unlink(missing_ok=True)
+    (folder / "deltas").mkdir()
+    shutil.copy2(ROOT / "port/sys_deltas/manifest.json", folder / "deltas/manifest.json")
+    for f in deltas["files"]:
+        shutil.copy2(ROOT / "port/sys_deltas" / f["delta"], folder / "deltas" / f["delta"])
+    # How the YouGame app starts this build (launch arguments, the player's disc, the game window): YouGame reads it
+    # from the top of the release zip, so the published asset goes up on YouGame as it is.
+    shutil.copy2(ROOT / "port/yougame/yougame-native.json", folder / "yougame-native.json")
     # Warmed pipeline recipes: the newest cache namespace that has them (the exe's shader sources
     # decide the namespace, so this must come from the same build).
     recipes = ROOT / "shadercache/recipes.bin"
@@ -663,6 +677,10 @@ def main():
     shutil.copy2(ROOT / "docs/third-party-training-mode-ce.txt", licenses / "training-mode-ce.txt")
     shutil.copy2(ROOT / "docs/training-mods.md", folder / "TrainingMods.md")
     shutil.copy2(ui_src / "gd_melee/ORIGIN.md", licenses / "gd-melee-origin.md")
+    # Optional code signing (docs/windows-signing.md), off unless MU_SIGN_METADATA is set. Every program
+    # this project builds is in the folder by now, and nothing below may zip or hash one before this:
+    # a signature changes the file, so the compat zip and compat.sha256 must be made from signed files.
+    windows_signing.sign_release_binaries(folder)
     # The builds for processors without AVX2 are their own download since 0.9.98, so nobody else
     # downloads them: MeleeUnlocked-<version>-compat-win64.zip, named with its SHA-256 in compat.sha256,
     # which the launcher fetches on a PC that needs it (host/updater.cpp compat_build_download).

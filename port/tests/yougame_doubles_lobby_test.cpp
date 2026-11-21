@@ -397,7 +397,26 @@ int main() {
     // own kind refusal still reroutes in the mode's order. Unknown or absent changes nothing.
     CHECK(invite_mode_kind({{"inviteMode", "singles"}}) == kRoom1v1 &&
           invite_mode_kind({{"inviteMode", "default"}}) == kRoomFriends4 &&
-          invite_mode_kind({{"inviteMode", "teams"}}) == kRoomDoubles);
+          invite_mode_kind({{"inviteMode", "teams"}}) == kRoomDoubles &&
+          invite_mode_kind({{"inviteMode", "arena"}}) == kRoomArena);
+    // The arena's room: a plain 8-seat private ticket on the arena's own key, and the invite for it (never
+    // the app's hold, never nativeBuild); its key never names the Friends lobby, however long the build key.
+    {
+      const json ticket = arena_ticket("mu-key:arena-1", "arenaroom1");
+      CHECK(ticket["type"] == "mpTicket" && ticket["queue"] == "private" && ticket["room"] == "arenaroom1" &&
+            ticket["players"] == kArenaSeats && ticket["lobby"]["version"] == 1 && ticket["lobby"]["minPlayers"] == 2 &&
+            ticket["lobby"]["maxLocalPlayers"] == 1 && ticket["lobby"]["compatibility"] == "mu-key:arena-1" &&
+            !ticket.count("hold"));
+      const json multi = arena_invite("arenaroom1", true), one = arena_invite("arenaroom1", false);
+      CHECK(multi["type"] == "mpFriend" && multi["room"] == "arenaroom1" && multi["players"] == kArenaSeats &&
+            multi["mode"] == "arena" && multi["multi"] == true && !multi.count("nativeBuild"));
+      CHECK(!one.count("multi") && one["mode"] == "arena" && one["players"] == kArenaSeats);
+      const std::string short_key = arena_compatibility("1.0", [](const std::string& v) { return "mu-" + v; });
+      CHECK(short_key == "mu-1.0:arena-1");
+      const std::string long_key = arena_compatibility("1.0", [](const std::string& v) { return std::string(80, 'k') + v; });
+      CHECK(long_key.size() <= 64 && long_key.find(":arena-1") == long_key.size() - 8 &&
+            long_key.find("friends-lobby-1") == std::string::npos);
+    }
     for (const json& bad : {json(), json::object(), json::array(), json("teams"), json{{"inviteMode", "ranked"}},
                             json{{"inviteMode", ""}}, json{{"inviteMode", "Teams"}}, json{{"inviteMode", 2}},
                             json{{"inviteMode", json()}}, json{{"invite_mode", "teams"}}})
@@ -462,6 +481,12 @@ int main() {
         t = join(launch ? json{{"inviteMode", "default"}, {"nativeTeamsInvite", teams_invite}}
                         : json{{"inviteMode", "default"}, {"teamsLobby", 1}});
         CHECK(!t.doubles && t.players == 4 && t.after_doubles == kRoomFriends4);
+        // arena: the arena's 8-seat room and nothing else, so no refusal ever tries another kind.
+        { Events ev; json v = {{"inviteMode", "arena"}, {"room", "modeinviteAB"}, {"players", 8}};
+          if (launch) ev.hello(v); else { v["type"] = "join"; CHECK(ev.push(v, 1)); }
+          CHECK(ev.take_join(true) == "modeinviteAB" && ev.join_arena() && !ev.join_doubles() &&
+                ev.join_players() == kArenaSeats && !ev.mismatch_reroutes("modeinviteAB", true) &&
+                ev.mismatch_next("modeinviteAB", kRoom1v1, "", true) == -1); }
         // Unknown and absent: exactly the old behaviour, for every older shape.
         const std::vector<json> shapes = {
             json::object(), json{{"players", 2}}, json{{"players", 4}}, json{{"compatibility", "mu:friends-lobby-1"}},

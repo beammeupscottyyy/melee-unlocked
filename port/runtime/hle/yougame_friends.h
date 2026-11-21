@@ -256,8 +256,10 @@ inline json doubles_match_ticket(const std::string& compatibility) {
   return {{"type", "mpTicket"}, {"mode", "teams"}, {"teamsLobby", 1}, {"players", 4}, {"ranked", false},
           {"local_partner", kLocalPartnerCapability}, {"lobby", doubles_lobby(compatibility, 4)}};
 }
-// Room kinds (Events::room_kind): what a joined room turned out to be.
-inline constexpr int kRoom1v1 = 0, kRoomFriends4 = 1, kRoomDoubles = 2;
+// Room kinds (Events::room_kind): what a joined room turned out to be. kRoomArena is only ever an invite's
+// own word (inviteMode "arena"): the arena's 8-seat room (slippi_arena.cpp under YouGame) is joined as itself,
+// never tried as another kind and never reached by a retry of one.
+inline constexpr int kRoom1v1 = 0, kRoomFriends4 = 1, kRoomDoubles = 2, kRoomArena = 3;
 // The launch invite the page hands over for a Teams invite (Player.tsx hello, /api/multiplayer/teams):
 // nativeTeamsInvite {v, room, mode:"teams", md?}. Without md it is a Teams home this build's Doubles select
 // may be (tried first; the room decides); md:1 is the legacy console Doubles path (MELEE_DOUBLES).
@@ -266,13 +268,40 @@ inline bool doubles_hint(const json& invite) {
 }
 // The kind an accepted invite opens, from the page's inviteMode (Player.tsx hello reply and join push, PR 2280):
 // "singles" (MU's 1v1 picker) kRoom1v1, "default" (an invite with no mode: MU's 4-player Friends lobby)
-// kRoomFriends4, "teams" (a Teams invite; its push also has teamsLobby:1) kRoomDoubles. -1 when absent (not from
-// an invite) or anything else (unknown): the older hints (players, compatibility, Teams marks) then decide as before.
+// kRoomFriends4, "teams" (a Teams invite; its push also has teamsLobby:1) kRoomDoubles, "arena" (an invite into an
+// arena's room, players 8) kRoomArena. -1 when absent (not from an invite) or anything else (unknown): the older
+// hints (players, compatibility, Teams marks) then decide as before.
 inline int invite_mode_kind(const json& value) {
   if (!value.is_object() || !value.count("inviteMode") || !value["inviteMode"].is_string()) return -1;
   const auto& mode = value["inviteMode"].get_ref<const std::string&>();
-  return mode == "singles" ? kRoom1v1 : mode == "default" ? kRoomFriends4 : mode == "teams" ? kRoomDoubles : -1;
+  return mode == "singles" ? kRoom1v1 : mode == "default" ? kRoomFriends4 : mode == "teams" ? kRoomDoubles
+       : mode == "arena" ? kRoomArena : -1;
 }
+// The arena's room under YouGame: one private room of kArenaSeats for the whole arena (Hero's room limit), keyed
+// by this build's own key plus ":arena-1" (lobby::arena_compatibility), so the Friends lobby's 4-seat rules and its
+// console match never apply. The host opens it with a room code of its own; everyone else joins that code. A plain
+// ticket, never the app's hold: the hold only takes 2 or 4 seats.
+inline constexpr int kArenaSeats = 8;
+inline json arena_ticket(const std::string& compatibility, const std::string& code) {
+  if (room(json{{"room", code}}).empty()) throw std::runtime_error("Invalid YouGame arena room");
+  if (compatibility.empty() || compatibility.size() > 64) throw std::runtime_error("Invalid arena compatibility");
+  return {{"type", "mpTicket"}, {"queue", "private"}, {"room", code}, {"players", kArenaSeats},
+          {"lobby", {{"version", 1}, {"minPlayers", 2}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}}};
+}
+// The app's invite picker for the arena's room. `multi` asks for its several-friends picker, which takes more than
+// 4 seats only from the app build after this one; without it the picker invites one friend at a time.
+inline json arena_invite(const std::string& code, bool multi) {
+  if (room(json{{"room", code}}).empty()) throw std::runtime_error("Invalid YouGame arena room");
+  json q = {{"type", "mpFriend"}, {"room", code}, {"players", kArenaSeats}, {"mode", "arena"}};
+  if (multi) q["multi"] = true;
+  return q;
+}
+// The arena panel's lines for a room that did not open or an invite that did not go: the arena's own plain words,
+// never the app's or the socket's reason ("Test build not available", "This game sent a match request YouGame
+// can't read."), which goes to the log. Reasons that already speak to the player show as they are: a full room in
+// the site's words (invite_room_full), an update, YouGame not open.
+inline constexpr const char* kArenaOpenFailed = "Couldn't open the arena. Try again.";
+inline constexpr const char* kArenaInviteFailed = "Couldn't send the invite. Press Z to try again.";
 // The ticket route's refusals of a Doubles home ticket that mean "not a Doubles home for this build", not "gone"
 // (web/src/app/api/multiplayer/ticket/route.ts): teams_lobby_off 403 (Teams is off on this site), bad_teams_lobby
 // 400/403 (no Teams for this listing or room), teams_lobby_branch 409 (a test build without Teams). Since build 94
@@ -495,6 +524,8 @@ class Events {
   bool join_doubles() const { std::lock_guard<std::mutex> lock(mutex_); return join_doubles_; }
   // The room size the last taken join's push named (2, 4, or 0 when it named none). A hint only.
   int join_players() const { std::lock_guard<std::mutex> lock(mutex_); return join_players_; }
+  // The last taken join is an invite into an arena's room (inviteMode "arena"): the arena joins it, nothing else.
+  bool join_arena() const { std::lock_guard<std::mutex> lock(mutex_); return join_first_ == kRoomArena; }
   // A room that refused the ticket with lobby_mismatch is tried the other way only when nothing else
   // explains it: its kind isn't known yet and the taken join named no size and no compatibility key.
   // lobby_mismatch is also the refusal for a different build or remix (and console_mixed_builds), which
@@ -694,7 +725,14 @@ class Events {
   // refusal can still reroute it (mismatch_reroutes, mismatch_next). Not strict: the room has the final word.
   // The size follows the mode, which is what the menu reads for a Friends lobby (join_players 4) or a 1v1 room;
   // a Teams invite keeps the page's size (join_doubles decides it). mutex_ held.
+  // An arena invite is strict: its room is only ever joined as the arena's (never rerouted, players 8).
   void invite_mode_locked(int kind) {
+    if (kind == kRoomArena) {
+      pending_first_ = kRoomArena;
+      pending_hinted_ = pending_strict_ = true;
+      pending_players_ = kArenaSeats;
+      return;
+    }
     if (kind < 0 || kind > 2) return;
     pending_first_ = kind;
     pending_hinted_ = true;

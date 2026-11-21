@@ -57,6 +57,9 @@ int snprintf(char* buffer, __SIZE_TYPE__ size, const char* format, ...);
 #include <mu_lobby_wire.h>
 #include <melee/lb/lb_00B0.h>
 #include <melee/lb/lbarchive.h>
+#include <melee/lb/lbdvd.h>
+#include <melee/lb/lbfile.h>
+#include <dolphin/dvd.h>
 #include <melee/lb/lbspdisplay.h>
 #include <melee/sc/types.h>
 #include <sysdolphin/baselib/aobj.h>
@@ -185,6 +188,8 @@ static HSD_GObj* squad_icons[4][SQUAD_ICONS_MAX];
 static u32 squad_icons_shown[4];
 /* squad_icons_load has run on this screen with Squad Strike on. */
 static bool squad_icons_tried;
+/* The icons' IfAll is a copy squad_icons_load read itself, not the preload cache's. */
+static bool squad_icon_own;
 /* Per door, the hover squad_preview_member last handled. */
 static u8 squad_seen_icon[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
 static f32 squad_icon_dx, squad_icon_dy, squad_icon_dz;
@@ -197,6 +202,7 @@ static void squad_icons_load(void)
 
     squad_icon_archive = NULL;
     squad_icon_model = NULL;
+    squad_icon_own = false;
     if (mnCharSel_804D6CB0 == NULL ||
         !squad_css_kind() || !gmSquad_ModeAllowed() || mnCharSel_804D6CB0->vs.start.rules.is_teams)
     {
@@ -206,8 +212,9 @@ static void squad_icons_load(void)
     squad_icon_dx = squad_icon_dy = squad_icon_dz = 0.0f;
     squad_icon_scale = 0.9f;
     squad_icon_gap = 2.3f;
-    /* Returns whether it was preloaded, not whether it loaded. */
-    lbArchive_80016F80(&squad_icon_archive, "IfAll");
+    /* Returns whether it was preloaded, not whether it loaded. A copy read here (not preloaded)
+     * belongs to this screen's heap and stays put; a preloaded one can move (squad_icons_check). */
+    squad_icon_own = !lbArchive_80016F80(&squad_icon_archive, "IfAll");
     if (squad_icon_archive == NULL) {
         squad_icon_archive = NULL;
         OSReport("squad: IfAll not loaded, using the text banner\n");
@@ -224,6 +231,38 @@ static void squad_icons_load(void)
         /* Logged so a player's log tells a load failure from a row that could not be placed. */
         OSReport("squad: stock icons loaded\n");
     }
+}
+
+/* IfAll is one of the preload cache's common files (lbdvd.c preloadCommonFiles). A file read at
+ * character select (a fighter, a stage, a mod's larger copy of one) can evict it and reuse its memory,
+ * and the icons built from it, and the next icon built from the kept model, would then read another
+ * file's bytes (0.9.991 crash report: HSD_JObjLoadJoint on an unrelocated offset in squad_icon_create).
+ * Each frame, before anything touches them: when the cache no longer holds the copy the icons came
+ * from, free them and load again. The lookup is the game's own (it waits for a read in progress and
+ * marks the entry in use). A copy squad_icons_load read itself stays put and is never checked. */
+static void squad_icons_check(void)
+{
+    s32 entry;
+    int p, i;
+
+    if (squad_icon_model == NULL || squad_icon_archive == NULL || squad_icon_own) {
+        return;
+    }
+    entry = DVDConvertPathToEntrynum(lbFileGetFullName("IfAll"));
+    if (entry >= 0 && (HSD_Archive*) lbDvd_GetPreloadedArchive(entry) == squad_icon_archive) {
+        return;
+    }
+    for (p = 0; p < 4; p++) {
+        for (i = 0; i < SQUAD_ICONS_MAX; i++) {
+            if (squad_icons[p][i] != NULL) {
+                HSD_GObjFree(squad_icons[p][i]);
+                squad_icons[p][i] = NULL;
+            }
+        }
+        squad_icons_shown[p] = 0;
+    }
+    OSReport("squad: IfAll left the preload cache, icons rebuilt\n");
+    squad_icons_load();
 }
 
 /* Online row: the lineup the last "squad: picks" line showed (count, then kind/colour). */
@@ -1225,6 +1264,7 @@ static bool squad_icon_row(int p, const MuLobbyView* v)
     Vec3 pos;
     f32 x0;
 
+    squad_icons_check();
     if (squad_icon_model == NULL && !squad_icons_tried) {
         /* The screen opened with Squad Strike off (switched on since, from
          * the in-game menu): load the icons now. */

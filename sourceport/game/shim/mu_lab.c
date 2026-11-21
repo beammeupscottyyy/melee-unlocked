@@ -208,6 +208,8 @@ static u32 lab_pressed(void)
     return pressed;
 }
 
+static int lab_bubbles_shown;   /* the lab last set a bubble display (not the model only) */
+
 static void lab_bubbles(void)
 {
     const unsigned int options = mu_game_options();
@@ -215,10 +217,32 @@ static void lab_bubbles(void)
                      : (options & MU_OPTION_LAB_BUBBLES_ONLY) ? 2  /* bubbles only */
                                                               : 3; /* bubbles over the model */
     HSD_GObj* gobj;
+    lab_bubbles_shown = value != 1;
     for (gobj = HSD_GObjPLinkHead[HSD_GOBJ_PLINK_FIGHTER]; gobj != NULL; gobj = gobj->next) {
         Fighter* fp = GET_FIGHTER(gobj);
         if (fp != NULL) {
             fp->x21FC_flag.byte = value;
+        }
+    }
+}
+
+/* The lab's hitboxes switched off: with no other lab tool on, the lab itself turns off and its frame
+ * code stops, so the fighters kept showing hitboxes until Training was left (player report, 0.9.991).
+ * The model comes back once; 20XX TE's own "Collision bubbles" keeps them when it is on. */
+static void lab_bubbles_release(void)
+{
+    HSD_GObj* gobj;
+    if (!lab_bubbles_shown) {
+        return;
+    }
+    lab_bubbles_shown = 0;
+    if (mu_te2(MU_TE2_BUBBLES)) {
+        return;
+    }
+    for (gobj = HSD_GObjPLinkHead[HSD_GOBJ_PLINK_FIGHTER]; gobj != NULL; gobj = gobj->next) {
+        Fighter* fp = GET_FIGHTER(gobj);
+        if (fp != NULL) {
+            fp->x21FC_flag.byte = 1;
         }
     }
 }
@@ -320,6 +344,7 @@ void mu_lab_frame_begin(void)
 {
     u32 pressed;
     if (!lab_on()) {
+        lab_bubbles_release();
         return;
     }
     if (lab_session != (unsigned int) gm_GetCurrentSceneIndex() + 1u) {
@@ -374,6 +399,8 @@ void mu_lab_frame_begin(void)
     }
     if (mu_game_options() & MU_OPTION_LAB) {
         lab_bubbles();
+    } else {
+        lab_bubbles_release();
     }
 }
 

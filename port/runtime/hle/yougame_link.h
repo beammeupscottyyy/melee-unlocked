@@ -79,13 +79,20 @@ void start_channel(bool automated);
 // The Online menu opened: probe again (at most once every 5 s). Never waits; returns at once.
 void online_menu_opened();
 // The online menu's first row while YouGame is not found (coming_soon()). When the YouGame app is
-// installed (its yougame-staging link type: the registry on Windows, xdg-mime on Linux) it reads
-// "Open YouGame": picking it, or entering the Online menu once per run, opens the app on the game's page
-// and looks for it every second for 25 s ("Opening YouGame..."). Otherwise "Get YouGame" opens
-// https://staging.yougame.co/desktop in the player's browser. Hidden or headless runs only log, unless
+// installed (its yougame link type, yougame-staging when the launcher chose staging: the registry on
+// Windows, xdg-mime on Linux) it reads "Open YouGame": picking it, or entering the Online menu once per
+// run, opens the app on the game's page and looks for it every second for 25 s ("Opening YouGame...").
+// Otherwise "Get YouGame" opens https://yougame.co/desktop (staging.yougame.co/desktop when the
+// launcher chose staging) in the player's browser. Hidden or headless runs only log, unless
 // MELEE_TEST_YOUGAME_GET_PAGE=1. Never waits on the game's frame.
 void open_get_page();
 void first_row_picked();
+// The place that asked for YouGame was left (the Online menu backed out of or left for a character
+// select, CMD_YOUGAME_MENU 0x21; a YouGame search cancelled while it waited): YouGame's small window
+// (Windows), still up from that ask, closes as Play offline (never remembered for an ask on use), and
+// one still being looked for closes as soon as it shows. Get YouGame already downloading in it carries
+// on. Never waits.
+void withdraw_ask(const char* why);
 // Game start (main, after start_channel): YouGame's start hook (yougame_start.h) for a game nothing
 // started. YouGame running: nothing. Not on this computer: YouGame's own small window, before the game
 // window. Installed but not running: that window too, never the client window. Quiet in agent, hidden and test runs.
@@ -112,6 +119,11 @@ bool sign_in_escape();
 bool session();
 // The online menu's choice, before its character select: true for a YouGame row. Ignored in the app.
 void set_launcher_session(bool yougame);
+// YouGame's friend flow can run in this game: the Friends row holds a room and opens YouGame's friend
+// picker and the Friends lobby, and an invite's join push takes the player into the friend's room. Always
+// in the app (active()); for a game started on its own, while the local channel to a running YouGame app
+// is up (launcher() with channel_connected()). The old launcher bridge keeps the code search.
+bool friends_flow();
 // The online menu's page for the last pick (game: CMD_YOUGAME_MENU's 1-byte pick): 0 Slippi, 1 YouGame,
 // 2 Unranked on both (YouGame and Slippi); -1 before any pick. Read by the app's routing.
 void set_menu_service(int service);
@@ -121,6 +133,10 @@ int menu_service();
 std::string behind_version_now(bool* can_restart = nullptr);   // can_restart: the launcher can start that release
 // Asks the launcher to start that release once this game closes, in `mode` ("ranked" or "direct").
 bool restart_older(const std::string& mode, std::string* error);
+// A YouGame row pressed while the launcher is not signed in to YouGame: asks the launcher's bridge to open its
+// own Connect (sign-in) window, or bring it to the front (muOpenConnect, off this thread). False when this game
+// has no launcher bridge to ask. The rows open once the launcher is signed in (identity() asks again).
+bool open_launcher_connect();
 // --online-mode ranked|direct: the launcher started this game for that YouGame mode. 1 ranked,
 // 2 direct, 0 none; answered once.
 void set_online_mode_arg(int mode);
@@ -274,6 +290,9 @@ struct Search {
   struct DoublesMatch {
     std::string url, ticket, room, home;
   } doubles_match;
+  // An arena game (slippi_arena.cpp under YouGame): the room players of this game, in ring order (ring slot n
+  // plays port n+1), found in the arena's own room (arena_room below) instead of a room of their own. 2 or 4.
+  std::vector<std::string> arena_fighters;
 };
 
 struct Player {
@@ -380,6 +399,29 @@ uint8_t local_rank();
 enum class Leave { Quit, Lost, Over, Next };
 // A Friends lobby room is parked (close_room Next or Lost) for the lobby's next search to adopt.
 bool lobby_parked();
+
+// The arena's room under YouGame (slippi_arena.cpp): one private room of friends::kArenaSeats for a whole arena,
+// made by its host and joined from an invite. It carries the arena's own messages; each game between two (or
+// four) of its players is found in the same room (Search::arena_fighters). Any thread.
+namespace arena_room {
+// Opens it in the background: `code` empty makes a new room that this player hosts, else joins that room.
+void open(const std::string& code);
+// 0 closed, 1 opening, 2 open, -1 failed or lost (`error` says why).
+int state(std::string* error = nullptr);
+void close();
+std::string code();
+std::string me();     // this player's connection in the room
+std::string host();   // the connection of the player who made it, as first seen (it never moves)
+struct Seat { std::string id, name, conn; };
+std::vector<Seat> roster();
+// Queues one arena message for one connection (empty: everyone else). Sent in batches within the room's limits.
+void send(const std::string& conn, const std::vector<uint8_t>& bytes);
+bool pop(std::string* from, std::vector<uint8_t>* bytes);
+// Opens the app's invite picker for the room in the background. invite_state: 0 idle, 1 open, 2 sent,
+// -1 refused (`error` says why).
+void invite();
+int invite_state(std::string* error = nullptr);
+}  // namespace arena_room
 // Leaves the room: the session is over (the game's online cleanup). Only Ranked reads `why`.
 void end_session(Leave why);
 

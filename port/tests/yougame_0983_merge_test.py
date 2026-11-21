@@ -139,7 +139,7 @@ class YouGame0983MergeTest(unittest.TestCase):
         # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
         # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
         # Build 95: upstream v0.9.112 adds 1 (gricemt: the Ice Climbers come on Icicle Mountain again).
-        self.assertEqual(count, 10147)  # 0.9.990: one more for the rogueMelee Disable fix (main becad61b), one more (single player stock icon lists on an m-ex disc's icon table); 8 more (an m-ex disc's own menu under VS Mode: mnmain 7, gmvsmode 1); one more (TObj palette index past 255); 19 more (the 0.9.216 merge and the online menu description hook); build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
+        self.assertEqual(count, 10150)  # 0.9.992: three more (Final Destination's background guard for skins without its animations, grlast.c); 0.9.990: one more for the rogueMelee Disable fix (main becad61b), one more (single player stock icon lists on an m-ex disc's icon table); 8 more (an m-ex disc's own menu under VS Mode: mnmain 7, gmvsmode 1); one more (TObj palette index past 255); 19 more (the 0.9.216 merge and the online menu description hook); build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
 
 
 if __name__ == '__main__':

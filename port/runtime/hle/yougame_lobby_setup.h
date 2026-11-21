@@ -465,4 +465,24 @@ std::string compatibility(const std::string& version, Make make, Profile profile
   // An identity too long even then: one hash of the whole key, still one room per build.
   return kTag + "mu-k" + hex(mu_fnv64_bytes(MU_FNV64_OFFSET, key.data(), key.size()), 16);
 }
+// The arena's room key: the game's own key with ":arena-1" after it, so no Friends lobby or Doubles home rule
+// (their keys start with their tags) ever applies to the arena's 8-seat room. Shortened like compatibility().
+inline constexpr const char* kArenaTag = ":arena-1";
+template <class Make>
+std::string arena_compatibility(const std::string& version, Make make) {
+  const std::string kTag = kArenaTag;
+  std::string key = make(version);
+  if (key.empty()) return {};
+  if (key.size() + kTag.size() <= 64) return key + kTag;
+  const uint64_t h = mu_fnv64_bytes(MU_FNV64_OFFSET, version.data(), version.size());
+  const auto hex = [](uint64_t v, int digits) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    for (int i = 0; i < digits; ++i) out += kHex[(v >> (4 * (digits - 1 - i))) & 0xF];
+    return out;
+  };
+  const std::string shorter = make("h" + hex(h >> 16, 12));
+  if (!shorter.empty() && shorter.size() + kTag.size() <= 64) return shorter + kTag;
+  return "mu-k" + hex(mu_fnv64_bytes(MU_FNV64_OFFSET, key.data(), key.size()), 16) + kTag;
+}
 }  // namespace yougame::lobby

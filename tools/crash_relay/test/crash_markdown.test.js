@@ -70,6 +70,16 @@ test("old launcher ZIP receives scrubbed logs and drops dump, lobby and unknown 
   assert.doesNotMatch(Buffer.from(report.zip).toString("utf8"), /BINARY_SECRET|ACCOUNT_SECRET|melee_port_crash\.dmp/);
 });
 
+test("the launcher's logs reach the report scrubbed: why a Play started no game, why YouGame did not connect", () => {
+  const bytes = zip([["launcher.log", "2026-11-20 16:40:01 Launch failed: Windows error 5; executable=C:\\Users\\PlayerOne\\Hidden\\game.exe\n"],
+    ["launcher-yougame.log", "2026-11-20 16:40:00 yougame: at start: not connected: YouGame answered 401: the saved sign-in has ended (Connect signs in again) (1 s)\n"]]);
+  const report = sanitizedReport(bytes, "0.9.992", "Source Port", "", "", "logs");
+  assert.match(report.markdown, /## launcher\.log/); assert.match(report.markdown, /Launch failed: Windows error 5/);
+  assert.match(report.markdown, /## launcher-yougame\.log/); assert.match(report.markdown, /YouGame answered 401/);
+  assert.doesNotMatch(report.markdown, /PlayerOne|C:\\Users/);
+  assert.deepEqual([...storedTextFiles(report.zip).keys()], ["launcher.log", "launcher-yougame.log"]);
+});
+
 test("CR runs, terminal controls and fence injection are normalized", () => {
   const report = crashMarkdown(zip([["melee_port.log", "FATAL: missing itPublicData\r\r\nscene: major 01 minor 02 (frame 94)\r\0\x1b\x7f\u0085```\nattack\n````\n"]]));
   assert.ok(report.includes("FATAL: missing itPublicData\nscene: major 01 minor 02 (frame 94)\n"));

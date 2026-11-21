@@ -516,13 +516,18 @@ class ConsoleOffEquivalence(unittest.TestCase):
         # v0.9.87 adds only this guarded presentation reader; reverse its exact bytes.
         shake = """int mu_console_active(void);
 
-/* Camera state participates in rollback snapshots: local strength must not change it online. */
+/* The camera's shake is the viewer's own. Online it may only be lowered: the camera decides which fighters count as
+ * on screen, and only those get their bones refreshed for the next frame's gameplay (ftLib_80086A8C, mu_online.c
+ * camera_tasks), so a shake past the game's own could show a fighter at the edge that the other player's game does
+ * not. Lowering it is the same as "Disable screen shake" (MU_GAME_OPTION_NO_SCREEN_SHAKE) and Slippi's own code,
+ * both always allowed online. A YouGame console session keeps the game's own camera, as it keeps its options. */
 float mu_screen_shake_scale(void)
 {
     if (!mu_host || mu_host->version < 27 || !mu_host->screen_shake_scale) return 1.0f;
-    if (mu_console_active() || mu_online_active() || mu_online_pending()) return 1.0f;
+    if (mu_console_active()) return 1.0f;
     const float scale = mu_host->screen_shake_scale();
-    return scale >= 0.0f && scale <= 4.0f ? scale : 1.0f;
+    if (!(scale >= 0.0f && scale <= 4.0f)) return 1.0f;
+    return scale > 1.0f && (mu_online_active() || mu_online_pending()) ? 1.0f : scale;
 }
 
 """
@@ -706,7 +711,7 @@ int mu_native_rtx_semantics(void)
         # Build 58: upstream v0.9.102 adds 1 (grizumi, the live Fountain of Dreams scenery).
         # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
         # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
-        self.assertEqual(len(hunks), 10147)  # 0.9.990: one more for the rogueMelee Disable fix (main becad61b), one more (single player stock icon lists on an m-ex disc's icon table); 8 more (an m-ex disc's own menu under VS Mode: mnmain 7, gmvsmode 1); 19 more (the 0.9.216 merge and the online menu description hook); build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
+        self.assertEqual(len(hunks), 10150)  # 0.9.992: three more (Final Destination's background guard for skins without its animations, grlast.c); 0.9.990: one more for the rogueMelee Disable fix (main becad61b), one more (single player stock icon lists on an m-ex disc's icon table); 8 more (an m-ex disc's own menu under VS Mode: mnmain 7, gmvsmode 1); 19 more (the 0.9.216 merge and the online menu description hook); build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
         for i, h in enumerate(hunks):
             after = patch[h.end():hunks[i + 1].start() if i + 1 < len(hunks) else len(patch)]
             after = after.split('diff --git ')[0]

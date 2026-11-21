@@ -19,6 +19,10 @@ struct Reply {
 #if defined(_WIN32) && defined(_MSC_VER)
 // The browser engine is on this computer (Microsoft Edge WebView2: part of Windows 11, on nearly every Windows 10).
 bool supported();
+// No WebView2 on this computer: downloads Microsoft's own installer (go.microsoft.com, the Evergreen bootstrapper),
+// checks its Authenticode signature is valid and Microsoft's, runs it silently and waits for it. True once the
+// runtime answers. Blocking (up to about 5 minutes); never on a window thread. *why: the step that failed.
+bool install_runtime(std::string* why);
 // Where the view keeps its session (one folder per YouGame site). Call before anything else.
 void set_folder(const std::wstring& folder);
 // A session folder exists: a sign-in made before may still hold.
@@ -43,6 +47,7 @@ void close();
 void sign_out();
 #else
 inline bool supported() { return false; }
+inline bool install_runtime(std::string* why) { if (why) *why = "not on this system"; return false; }
 inline void set_folder(const std::wstring&) {}
 inline bool remembered() { return false; }
 inline bool sign_in(void*, const std::string&, const std::string&, std::string* error, const std::string& = {},

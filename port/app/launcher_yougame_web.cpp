@@ -19,11 +19,20 @@
 #include <thread>
 #include <vector>
 #include "WebView2.h"
+#include <softpub.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <urlmon.h>
+#include <shlobj.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "shell32.lib")
 
 using Microsoft::WRL::Callback;
 using Microsoft::WRL::ComPtr;
@@ -34,7 +43,8 @@ namespace {
 
 // A page of the site with little on it: the view sits here between requests.
 constexpr const char* kRestPage = "/terms";
-constexpr const char* kSignInPage = "/login";
+// The sign-in form alone (no site header or menus); once signed in it stays put and the check below closes the window.
+constexpr const char* kSignInPage = "/login?bare=1";
 // The view (and its browser processes) ends after this long unused. Long enough that a play session's
 // requests (searches, ticket renewals) find it open: starting it costs a second or two of processor
 // time, which a match in progress should not pay; resting on its page it costs none.
@@ -82,6 +92,81 @@ struct Job {
 };
 
 std::mutex g_mutex;              // the folder, and starting the thread
+
+// The runtime folder handed to WebView2's loader. Empty means the loader finds the runtime itself, from
+// EdgeUpdate's registry record. That record can name a version folder that is gone while a newer one sits
+// beside it (seen on fresh Windows Sandbox images, even right after Microsoft's installer ran), so when the
+// loader finds nothing, the newest version folder on disk that holds the runtime is passed in instead.
+std::mutex g_browser_mutex;
+std::wstring g_browser_folder;
+
+std::wstring browser_folder() {
+  std::lock_guard<std::mutex> lock(g_browser_mutex);
+  return g_browser_folder;
+}
+
+std::wstring known_folder(REFKNOWNFOLDERID id) {
+  PWSTR path = nullptr;
+  std::wstring out;
+  if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &path)) && path) out = path;
+  CoTaskMemFree(path);
+  return out;
+}
+
+// "157.0.4341.60" -> {157, 0, 4341, 60}; anything else -> empty.
+std::vector<unsigned> version_parts(const std::wstring& name) {
+  std::vector<unsigned> parts;
+  std::wstring cur;
+  for (wchar_t c : name + L".") {
+    if (c == L'.') {
+      if (cur.empty() || cur.size() > 6) return {};
+      parts.push_back((unsigned)std::wcstoul(cur.c_str(), nullptr, 10));
+      cur.clear();
+    } else if (c >= L'0' && c <= L'9') {
+      cur += c;
+    } else {
+      return {};
+    }
+  }
+  return parts.size() == 4 ? parts : std::vector<unsigned>{};
+}
+
+// The newest <base>\Microsoft\EdgeWebView\Application\<version> folder that holds both the browser and
+// this architecture's runtime dll, per-machine install first, then per-user. Empty when there is none.
+std::wstring newest_runtime_folder() {
+#if defined(_M_ARM64) || defined(__aarch64__)
+  const wchar_t* arch = L"arm64";
+#elif defined(_WIN64)
+  const wchar_t* arch = L"x64";
+#else
+  const wchar_t* arch = L"x86";
+#endif
+  for (REFKNOWNFOLDERID id : {FOLDERID_ProgramFilesX86, FOLDERID_LocalAppData}) {
+    const std::wstring base = known_folder(id);
+    if (base.empty()) continue;
+    const std::wstring app = base + L"\\Microsoft\\EdgeWebView\\Application\\";
+    std::vector<unsigned> best;
+    std::wstring best_dir;
+    WIN32_FIND_DATAW fd;
+    const HANDLE h = FindFirstFileW((app + L"*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) continue;
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+      const std::vector<unsigned> parts = version_parts(fd.cFileName);
+      if (parts.empty() || (!best_dir.empty() && parts <= best)) continue;
+      const std::wstring dir = app + fd.cFileName;
+      const std::wstring dll = dir + L"\\EBWebView\\" + arch + L"\\EmbeddedBrowserWebView.dll";
+      if (GetFileAttributesW((dir + L"\\msedgewebview2.exe").c_str()) == INVALID_FILE_ATTRIBUTES ||
+          GetFileAttributesW(dll.c_str()) == INVALID_FILE_ATTRIBUTES)
+        continue;
+      best = parts;
+      best_dir = dir;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!best_dir.empty()) return best_dir;
+  }
+  return L"";
+}
 std::wstring g_folder;
 std::atomic<HWND> g_window{nullptr};
 bool g_thread_started = false;
@@ -301,7 +386,8 @@ void create_view() {
   std::error_code ec;
   std::filesystem::create_directories(folder, ec);
   g->creating = true;
-  const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, folder.c_str(), nullptr,
+  const std::wstring browser = browser_folder();
+  const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(browser.empty() ? nullptr : browser.c_str(), folder.c_str(), nullptr,
       Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
           [](HRESULT hr, ICoreWebView2Environment* env) {
             if (FAILED(hr) || !env) { g->creating = false; fail_all("YouGame's sign-in could not start (Microsoft Edge WebView2)."); return S_OK; }
@@ -493,14 +579,95 @@ Reply run(std::unique_ptr<Job> job, int wait_ms) {
 
 }  // namespace
 
+static bool runtime_answers(const wchar_t* browser) {
+  LPWSTR version = nullptr;
+  const bool ok = SUCCEEDED(GetAvailableCoreWebView2BrowserVersionString(browser, &version)) && version && *version;
+  CoTaskMemFree(version);
+  return ok;
+}
+// The loader's own lookup first; when it finds nothing, the newest runtime folder on disk (browser_folder).
+static bool runtime_present() {
+  if (runtime_answers(nullptr)) return true;
+  const std::wstring dir = newest_runtime_folder();
+  if (dir.empty() || !runtime_answers(dir.c_str())) return false;
+  std::lock_guard<std::mutex> lock(g_browser_mutex);
+  g_browser_folder = dir;
+  return true;
+}
+// Asked again until it answers yes: an install made while the launcher runs counts at once.
 bool supported() {
-  static const bool yes = [] {
-    LPWSTR version = nullptr;
-    const bool ok = SUCCEEDED(GetAvailableCoreWebView2BrowserVersionString(nullptr, &version)) && version && *version;
-    CoTaskMemFree(version);
-    return ok;
-  }();
+  static std::atomic<bool> yes{false};
+  if (!yes && runtime_present()) yes = true;
   return yes;
+}
+
+// The file's Authenticode signature is valid (WinVerifyTrust) and its signer is Microsoft Corporation.
+static bool signed_by_microsoft(const std::wstring& file) {
+  WINTRUST_FILE_INFO info{sizeof info};
+  info.pcwszFilePath = file.c_str();
+  WINTRUST_DATA data{sizeof data};
+  data.dwUIChoice = WTD_UI_NONE;
+  data.fdwRevocationChecks = WTD_REVOKE_NONE;
+  data.dwUnionChoice = WTD_CHOICE_FILE;
+  data.pFile = &info;
+  data.dwStateAction = WTD_STATEACTION_VERIFY;
+  GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+  const LONG trust = WinVerifyTrust(nullptr, &action, &data);
+  data.dwStateAction = WTD_STATEACTION_CLOSE;
+  WinVerifyTrust(nullptr, &action, &data);
+  if (trust != ERROR_SUCCESS) return false;
+  HCERTSTORE store = nullptr;
+  HCRYPTMSG msg = nullptr;
+  if (!CryptQueryObject(CERT_QUERY_OBJECT_FILE, file.c_str(), CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                        CERT_QUERY_FORMAT_FLAG_BINARY, 0, nullptr, nullptr, nullptr, &store, &msg, nullptr))
+    return false;
+  bool microsoft = false;
+  DWORD size = 0;
+  if (CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &size) && size) {
+    std::vector<BYTE> buf(size);
+    if (CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, buf.data(), &size)) {
+      const auto* signer = reinterpret_cast<CMSG_SIGNER_INFO*>(buf.data());
+      CERT_INFO ci{};
+      ci.Issuer = signer->Issuer;
+      ci.SerialNumber = signer->SerialNumber;
+      if (PCCERT_CONTEXT cert = CertFindCertificateInStore(store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+                                                           CERT_FIND_SUBJECT_CERT, &ci, nullptr)) {
+        wchar_t name[256] = {};
+        CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr, name, 256);
+        microsoft = std::wstring(name) == L"Microsoft Corporation";
+        CertFreeCertificateContext(cert);
+      }
+    }
+  }
+  CryptMsgClose(msg);
+  CertCloseStore(store, 0);
+  return microsoft;
+}
+
+bool install_runtime(std::string* why) {
+  const auto fail = [&](const char* step) { if (why) *why = step; return false; };
+  if (supported()) return true;
+  wchar_t tmp[MAX_PATH] = {};
+  if (!GetTempPathW(MAX_PATH, tmp)) return fail("no temporary folder");
+  const std::wstring file = std::wstring(tmp) + L"MeleeUnlocked-MicrosoftEdgeWebview2Setup.exe";
+  DeleteFileW(file.c_str());
+  // Microsoft's own link to the WebView2 Evergreen bootstrapper (learn.microsoft.com, "Download the WebView2 Runtime").
+  if (FAILED(URLDownloadToFileW(nullptr, L"https://go.microsoft.com/fwlink/p/?LinkId=2124703", file.c_str(), 0, nullptr)))
+    return fail("the download from Microsoft failed");
+  if (!signed_by_microsoft(file)) { DeleteFileW(file.c_str()); return fail("the downloaded installer is not signed by Microsoft"); }
+  std::wstring cmd = L"\"" + file + L"\" /silent /install";
+  STARTUPINFOW si{sizeof si};
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    DeleteFileW(file.c_str());
+    return fail("the installer did not start");
+  }
+  WaitForSingleObject(pi.hProcess, 5 * 60 * 1000);
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  DeleteFileW(file.c_str());
+  for (int i = 0; i < 20 && !supported(); ++i) Sleep(500);
+  return supported() || fail("the installer finished but WebView2 is still missing");
 }
 
 void set_folder(const std::wstring& folder) {

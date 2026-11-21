@@ -69,8 +69,10 @@ bool open_device() {
   int last_error = LIBUSB_ERROR_NO_DEVICE;
   for (ssize_t index = 0; index < count && !device; ++index) {
     libusb_device_descriptor descriptor{};
+    // Nintendo's adapter (and clones), or the Lossless adapter in its lag-test mode (2e8a:102b, GitHub #76).
     if (libusb_get_device_descriptor(devices[index], &descriptor) != 0 ||
-        descriptor.idVendor != 0x057e || descriptor.idProduct != 0x0337) continue;
+        !((descriptor.idVendor == 0x057e && descriptor.idProduct == 0x0337) ||
+          (descriptor.idVendor == 0x2e8a && descriptor.idProduct == 0x102b))) continue;
     libusb_config_descriptor* configuration = nullptr;
     if (libusb_get_active_config_descriptor(devices[index], &configuration) != 0) continue;
     int selected_interface = -1, alternate_setting = 0;

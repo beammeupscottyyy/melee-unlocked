@@ -236,6 +236,12 @@ class Screen(unittest.TestCase):
         self.assertIn('else if (mu_f4.view.flags & MU_LOBBY_F_STARTED) why = "a match is being set up";', invite)
         self.assertIn('else if (mu_f4.view.flags & MU_LOBBY_F_INVITING) why = "the invite picker is already open";', invite)
         self.assertIn('for (i = 0; why == NULL && i < MU_LOBBY_SEATS; ++i) {', invite)
+        # Only the door whose card opened the picker says "Inviting..."; the other open doors keep "Invite".
+        self.assertIn('mu_f4.invite_door = (unsigned char) (i + 1);', invite)
+        self.assertIn('i == mu_f4_inviting_door(v, mine) ? "Inviting..." : "Invite"', texts)
+        door = body(self.inc, 'static int mu_f4_inviting_door(const MuLobbyView* v, int mine)')
+        self.assertIn('if (!v || !(v->flags & MU_LOBBY_F_INVITING)) return -1;', door)
+        self.assertIn("if (d >= 0 && d < 4 && d != mine && v->seats[d].kind == MU_LOBBY_KIND_OPEN) return d;", door)
 
     def test_a_started_match_is_never_followed_back_to_the_stage_select(self):
         self.assertIn('!(mu_f4.view.flags & (MU_LOBBY_F_HOST | MU_LOBBY_F_STARTED)) && mu_f4.view.my_seat < MU_LOBBY_SEATS', self.inc)
@@ -247,6 +253,14 @@ class Screen(unittest.TestCase):
         self.assertIn('m.connection_state != MU_SLP_MM_CONNECTION_SUCCESS', lock)
         self.assertLess(lock.index('if (m.local_ready && m.remote_ready) {'),
                         lock.index('mu_lobby_css_exit(MU_LOBBY_EXIT_SPLASH);'))
+
+    def test_own_door_is_drawn_hmn_once_it_can_be(self):
+        # The host's own door turned HMN before the screen could draw it and kept Melee's N/A.
+        own = body(self.inc, 'static void mu_f4_own_drawn(int mine)')
+        self.assertIn('if (mu_friends_css_frames < 2 || mine < 0 || mine > 3 || mu_f4.own_drawn == mine + 1 ||', own)
+        self.assertIn('mnCharSel_8025DB34((u8) mine);', own)
+        frame = self.inc[self.inc.index('mu_f4_own_drawn(mine);\n'):]
+        self.assertLess(frame.index('mu_f4_own_drawn(mine);'), frame.index('mu_f4_texts(mine);'))
 
     def test_labels_stay_in_the_menu_font(self):
         line = body(self.inc, 'static void mu_f4_line(int line, const char* s)')

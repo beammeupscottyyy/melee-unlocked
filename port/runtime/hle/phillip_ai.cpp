@@ -966,7 +966,24 @@ bool available(unsigned pro) {
   return g_light_ok.load() > 0;
 }
 
+// Why Fight a pro is not offered, for the Practice menu's row (player report 11-20: a bare "Not available"
+// said nothing). In the order the checks run: the ProAI files, the runtime that plays them, the processor.
 const char* unavailable_reason() {
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    read_catalog();
+    if (g_catalog_state != 1)
+      return "Phillip's AI files are missing. Extract the release zip again.";
+    bool any = false;
+    for (const Entry& e : g_catalog) if (e.kind == "imitation" && present(e)) { any = true; break; }
+    if (!any) return "Phillip's AI files are missing. Extract the release zip again.";
+    if (!runtime_ready())
+#ifdef _WIN32
+      return "Phillip's AI did not start (onnxruntime.dll). Extract the zip again.";
+#else
+      return "Phillip's AI did not start (libonnxruntime.so). Extract it again.";
+#endif
+  }
   if (cpu_has_avx()) return nullptr;
   const int light = g_light_ok.load();
   return light == 0 ? "Checking whether this processor is fast enough for Phillip's AI..." :

@@ -174,7 +174,7 @@ LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
       SendMessageW(edit, EM_SETLIMITTEXT, 2000, 0);
       // The line under the box wraps to as many rows as its words need at this PC's text size, and the
       // buttons and the window follow it: at a fixed two rows its last words were cut off.
-      const wchar_t* about = L"Sends your game logs (the last session and the one before), lobby log, this session's crash file and your marked online matches. "
+      const wchar_t* about = L"Sends your game logs (the last session and the one before), the launcher's and lobby logs, this session's crash file and your marked online matches. "
                              L"Names, accounts, addresses and folder names are removed before anything leaves your PC.";
       RECT measure{0, 0, 456, 0};
       {
@@ -251,9 +251,11 @@ void send_logs(HWND owner, const std::string& dir, const std::string& engine, co
   const std::string game_dir = launcher::crash::newest_game_dir(dir, others);
   // Only a crash from this session's launch counts; an old crash file would mislead the report.
   auto files = launcher::crash::collect_logs(game_dir, g_dir, replay_dirs, newer_than_launch(game_dir + "\\melee_port_crash.txt"));
-  // A report with the lobby log alone says nothing about the game (a 0.8.99 report arrived that way).
+  // A report with the lobby log alone says nothing about the game (a 0.8.99 report arrived that way). The
+  // launcher's log is enough on its own: it says why a Play started no game, or why YouGame did not connect.
   const bool game_log = std::any_of(files.begin(), files.end(), [](const auto& f) {
-    return f.first == "melee_port.log" || f.first == "melee_port.prev.log" || f.first == "melee_port_crash.txt";
+    return f.first == "melee_port.log" || f.first == "melee_port.prev.log" || f.first == "melee_port_crash.txt" ||
+           f.first == "launcher.log";
   });
   if (!game_log) {
     MessageBoxW(owner, L"No game log was found yet. Start the game once (the problem does not have to happen again), "
@@ -300,6 +302,8 @@ void send_logs(HWND owner, const std::string& dir, const std::string& engine, co
     } else if (file.first == "melee_port.prev.log") text += L"\n  - Game log of the session before it (" + size(file.second.size()) + L")";
     else if (file.first == "melee_port_crash.txt") text += L"\n  - This session's crash file";
     else if (file.first == "lobby.log") text += L"\n  - Lobby log";
+    else if (file.first == "launcher.log") text += L"\n  - Launcher log";
+    else if (file.first == "launcher-yougame.log") text += L"\n  - Launcher's YouGame log";
     else if (file.first == "session.trace") {
       size_t matches = 0;
       static const char mark[] = "# match ";

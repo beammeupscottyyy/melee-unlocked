@@ -273,7 +273,13 @@ libusb_device* find_adapter(libusb_device** list, ssize_t count, std::string* ot
   for (ssize_t i = 0; i < count; ++i) {
     libusb_device_descriptor desc{};
     if (libusb_get_device_descriptor(list[i], &desc) != 0) continue;
-    if (desc.idVendor == 0x057E && desc.idProduct == 0x0337) { adapter = list[i]; break; }
+    // Nintendo's adapter (and every clone), or the Lossless adapter in its lag-test mode: it re-enumerates as
+    // 2e8a:102b (its RP2040's own ID) while the Lossless Adapter Manager's test runs, with the same report
+    // stream (GitHub #76). Its endpoints are read from its descriptors below, as for any adapter.
+    if ((desc.idVendor == 0x057E && desc.idProduct == 0x0337) || (desc.idVendor == 0x2E8A && desc.idProduct == 0x102B)) {
+      adapter = list[i];
+      break;
+    }
     if (others && listed < 16) {
       char id[16];
       std::snprintf(id, sizeof id, "%04x:%04x", desc.idVendor, desc.idProduct);
@@ -520,7 +526,7 @@ bool open_hid() {
     std::string path = buf.detail.DevicePath;
     std::string lower = path;
     for (char& c : lower) c = (char)std::tolower((unsigned char)c);
-    if (lower.find("vid_057e&pid_0337") == std::string::npos) continue;
+    if (lower.find("vid_057e&pid_0337") == std::string::npos && lower.find("vid_2e8a&pid_102b") == std::string::npos) continue;
     seen = true;
     HANDLE file = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
@@ -838,6 +844,9 @@ uint32_t gcadapter_poll(PadState out[4]) {
 #else
     if (!read_mirror(rep)) return 0;
 #endif
+    // The PhobGCC settings (calibration, trigger modes, filters) run on every report, as they do on
+    // the adapter's own reports below; without this a YouGame launch ignored the whole PhobGCC menu.
+    phob_process(rep, std::chrono::steady_clock::now());
   } else {
     ensure_scanner_started();
     auto now = std::chrono::steady_clock::now();

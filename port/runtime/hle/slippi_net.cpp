@@ -2655,6 +2655,12 @@ void Matchmaking::startMatchmaking() {
     return;
   }
 #endif
+  // An arena game under YouGame plays in the arena's own room: no Slippi account, blend or code lookup.
+  if (!search_settings_.arena_fighters.empty() && !local_peer.enabled) {
+    if (!yougame::session()) { fail("The arena needs a YouGame sign-in."); return; }
+    startYouGameMatchmaking();
+    return;
+  }
   // Preserve YouGame rooms/tickets and local test peering; never blend an agent into Slippi.
   if (host::test_env::agent_copy() && !local_peer.enabled) {
     if (yougame::active() && !yougame::mode_policy::slippi_menu_mode(
@@ -2992,7 +2998,8 @@ void Matchmaking::dropSlippi() {
 // netplay client connects exactly as before; the address is the one that answered YouGame's punch.
 void Matchmaking::startYouGameMatchmaking(const char* status) {
   // Defense at the YouGame boundary, including scripted/retry callers.
-  if (yougame::active() && !search_settings_.friends_lobby && yougame::mode_policy::slippi_menu_mode(
+  if (yougame::active() && !search_settings_.friends_lobby && search_settings_.arena_fighters.empty() &&
+      yougame::mode_policy::slippi_menu_mode(
           search_settings_.mode, !search_settings_.friend_room.empty())) {
     fail("Sign in to Slippi to play Direct, Teams and Party");
     return;
@@ -3017,6 +3024,11 @@ bool Matchmaking::youGameSearch(yougame::Search* search) {
     search->friends_lobby = true;
     search->lobby_room = search_settings_.lobby_room;
     search->lobby_control = search_settings_.lobby_control;
+    return true;
+  }
+  if (!search_settings_.arena_fighters.empty()) {
+    // The arena's room and its fighters say who plays; the code is only the arena's own word for the match.
+    search->arena_fighters = search_settings_.arena_fighters;
     return true;
   }
 #if MU_SQUAD

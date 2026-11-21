@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 mkdir -p build-mac/throwaway-home/{data,config,cache,state,runtime} build-mac/cards
-queue=/Users/luis/Code/brawl-dolphin/notes/lead-records/yougame-v2-org/tools/heavy-slot.sh
+queue=$HOME/Code/brawl-dolphin/notes/lead-records/yougame-v2-org/tools/heavy-slot.sh
 "$queue" run --label melee-ports:m1-run -- /usr/bin/time -p /usr/bin/env \
   ROSETTA_ADVERTISE_AVX=1 \
   HOME="$root/build-mac/throwaway-home" \

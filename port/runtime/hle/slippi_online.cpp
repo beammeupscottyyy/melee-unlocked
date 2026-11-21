@@ -330,6 +330,9 @@ std::deque<std::unique_ptr<Savestate>> g_available_savestates;
 PlayerSelections g_local_selections;
 bool g_local_random_stage = false;
 Matchmaking::MatchSearchSettings g_last_search;
+// The next search is an arena game under YouGame (arena_start_yg_search): its fighters and the arena's
+// whole word for the match (a player id, longer than the 18 bytes a typed code gets).
+struct ArenaNext { std::vector<std::string> fighters; std::string code; } g_arena_next;
 // The 4-player Friends lobby (yougame_lobby.h) on the 4-door select: armed by the Friends row (the host
 // holds a room) or an accepted lobby invite (a guest joins its room), until the player leaves it (LEAVE).
 // One Control lasts the whole lobby, across its matches. closed: its search failed or its room closed
@@ -1219,15 +1222,24 @@ void start_find_match(const uint8_t* payload, const std::string& friend_room = {
                            !native_profile_mode_error(effective_profile(), (int)Matchmaking::UNRANKED, false);
   std::string sj((const char*)payload + 1, 18);
   sj.erase(std::find(sj.begin(), sj.end(), '\0'), sj.end());
-  if (search.mode == Matchmaking::DIRECT && discord_join_pending()) {
+  const ArenaNext arena = std::move(g_arena_next);
+  g_arena_next = ArenaNext{};
+  if (!arena.fighters.empty()) {
+    // An arena game under YouGame: the arena's room carries it. Not a code the player typed, so it
+    // stays out of the recent codes, and a pending Discord join is left for the player's own Direct.
+    search.arena_fighters = arena.fighters;
+    sj = arena.code;
+  } else if (search.mode == Matchmaking::DIRECT && discord_join_pending()) {
     // Choosing Direct after accepting a Discord Join means join that sender. Use the queued code
     // even if the game's text field still contains its old value; the user need not retype/paste it.
     const std::string invite_sj = utf8_to_shiftjis(g_discord_join_code);
     sj.assign(invite_sj.begin(), invite_sj.begin() + std::min<size_t>(invite_sj.size(), 18));
     g_discord_join_code.clear();
   }
-  if (search.mode == Matchmaking::DIRECT) g_direct_codes->AddOrUpdateCode(shiftjis_to_utf8(sj));
-  else if (search.mode == Matchmaking::TEAMS && friend_room.empty()) g_teams_codes->AddOrUpdateCode(shiftjis_to_utf8(sj));
+  if (arena.fighters.empty()) {
+    if (search.mode == Matchmaking::DIRECT) g_direct_codes->AddOrUpdateCode(shiftjis_to_utf8(sj));
+    else if (search.mode == Matchmaking::TEAMS && friend_room.empty()) g_teams_codes->AddOrUpdateCode(shiftjis_to_utf8(sj));
+  }
   search.connect_code = sj;
   search.friend_room = friend_room;
 #if MU_SQUAD
@@ -2310,7 +2322,10 @@ void prepare_online_status(std::vector<uint8_t>& q) {
   uint8_t app_state = 0;
   if (g_user->IsLoggedIn()) app_state = 1;   // version check: this port speaks SLIPPI_SEMVER; the server enforces the rest
   q.push_back(app_state);
-  std::string name = convert_string_for_game(me.display_name, 15);
+  // A YouGame copy shows the YouGame name, as the match does (local_name above): it showed the Slippi
+  // account's name on the character select (player report, 0.9.992).
+  const std::string yg_name = yougame::session() && yougame::launcher() ? yougame::identity().name : std::string();
+  std::string name = convert_string_for_game(yg_name.empty() ? me.display_name : yg_name, 15);
   q.insert(q.end(), name.begin(), name.end());
   std::string code = convert_connect_code_for_game(me.connect_code);
   q.insert(q.end(), code.begin(), code.end());
@@ -2712,7 +2727,8 @@ bool native_start_match(int mode, const std::string& connect_code, uint8_t chara
   // random legal stage and carries the practice character/costume into the normal online flow.
   uint8_t selections[9] = {0, character, color, 1, 0, 0, 3, (uint8_t)mode, 0};
   // Friends joins the room immediately, but the player still picks and locks in a fighter on CSS.
-  selections[3] = yougame::friends::native_ready(yougame::active(), mode, connect_code, friend_room) ? 1 : 0;
+  // session(): a friend room joined over the local channel waits on CSS as in the app (active() there).
+  selections[3] = yougame::friends::native_ready(yougame::session(), mode, connect_code, friend_room) ? 1 : 0;
   set_match_selections(selections);
   uint8_t find[19] = {};
   find[0] = (uint8_t)mode;
@@ -2875,6 +2891,19 @@ bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t 
     return false;
   }
   return g_matchmaking && g_matchmaking->IsSearching();
+}
+
+bool arena_start_yg_search(int mode, const std::vector<std::string>& fighters, const std::string& code, bool locked,
+                           uint8_t character, uint8_t color, uint8_t team, std::string* error) {
+  if (fighters.size() != 2 && fighters.size() != 4) return false;
+  if (!yougame::session()) {
+    if (error) *error = "The arena needs a YouGame sign-in";
+    return false;
+  }
+  g_arena_next = {fighters, utf8_to_shiftjis(code)};
+  const bool ok = arena_start_search(mode, code, locked, character, color, team, error);
+  g_arena_next = ArenaNext{};   // refused before the search read it: never carried to the player's next search
+  return ok;
 }
 
 bool local_identity(std::string* code, std::string* name) {
@@ -3573,9 +3602,24 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
         q.assign(1, g_friends_css.exchange(false) ? 1 : 0);
         return true;
       }
+      if (payload[0] == 17) {
+        // The split layout's Friends row was confirmed in a game started on its own, with the local channel
+        // up (the menu sends this only then; never in the app, whose pad press opens the flow). The same
+        // request a Friends press makes in the app: the next safe menu tick holds a Friends room and opens
+        // YouGame's friend picker and lobby (native_practice). A confirm the menu made by itself (a row picked
+        // before YouGame was connected, or --online-mode) has no pad press, so it comes this way too.
+        if (!yougame::active() && yougame::friends_flow()) {
+          yougame::friends::events.online_menu(true, true);
+          yougame::friends::events.request_host();
+          host::log("friends: the Friends row was confirmed (local channel)");
+        }
+        return true;
+      }
       // Bit 2 tracks the Online submenu independently of the hidden Friends row.
       g_online_menu_visible = (payload[0] & 4) != 0;
-      yougame::friends::events.online_menu(yougame::active() && (payload[0] & 3) != 0, (payload[0] & 3) == 2);
+      // friends_flow(): the app, or a game started on its own with the local channel up (the split layout's
+      // Friends row). Under the app it is active(), as before.
+      yougame::friends::events.online_menu(yougame::friends_flow() && (payload[0] & 3) != 0, (payload[0] & 3) == 2);
       return true;
     case CMD_YOUGAME_DATA:
       switch (payload[0]) {
@@ -3650,10 +3694,20 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // 0x20: the first row picked while YouGame is Coming soon: open the installed app, else the download page.
       // 0x10: older menus' Coming soon stickers; none are drawn since build 98.2 (the rows look the same
       // connected or not).
+      // 0x21: the menu was left (Back to 1-P Mode, or into a character select) after a 0x20 asked for YouGame:
+      // YouGame's small window, still up from that ask, closes with it (yougame::withdraw_ask).
       // 0x4A: only asks whether a Squad Strike search the player chose to keep is running (the online
       // menu then keeps the select's lineup for the way back; native_practice.cpp).
       if (payload_len == 1 && payload[0] == 0x4A) { q.assign(1, slippi::native_practice::keep_search_squad() ? 1 : 0); return true; }
+      // 0x22: a YouGame row pressed while the launcher is not signed in to YouGame: the launcher's own Connect
+      // (sign-in) window opens, or comes to the front (yougame::open_launcher_connect). Answers 1 when the launcher
+      // was asked, 0 when there is no launcher to ask; the menu then waits on the row and goes on into it once the
+      // rows open, as after 0x20.
+      if (payload_len == 1 && payload[0] == 0x22) { s_yg_pick = 0; q.assign(1, yougame::open_launcher_connect() ? 1 : 0); return true; }
       if (payload_len == 1 && (payload[0] & 0xF0) == 0x10) {
+      } else if (payload_len == 1 && payload[0] == 0x21) {
+        s_yg_pick = 0;
+        yougame::withdraw_ask("Online menu left");
       } else if (payload_len == 1 && payload[0] == 0x20) {
         if (yougame::coming_soon()) yougame::first_row_picked();
         // YouGame is open but signed out (local channel): the sign-in panel, then the menu carries on.
@@ -3694,6 +3748,10 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // The local channel never holds a frame: its identity is asked on the probe's thread, and the
       // rows open on the first visit after it is in.
       if (yougame::launcher() && (yougame::channel_connected() ? yougame::identity().ok : yougame::wait_identity(500).ok)) q[0] |= 4;
+      // Bit 7: the YouGame rows are open over the local channel, so the split layout's Friends row opens
+      // YouGame's friend flow (friends_flow(): a Friends room, its picker and the lobby) instead of Direct's
+      // connect code. The old launcher bridge leaves it clear and keeps Direct.
+      if ((q[0] & 4) && yougame::channel_connected() && yougame::friends_flow()) q[0] |= 128;
       // Bit 6: YouGame is not ready for the rows yet: not open (picking a row starts it), or open and signed
       // out (picking a row opens Sign in by code). Either way the menu then carries on into that row.
       if ((yougame::coming_soon() || yougame::sign_in_needed()) && !yougame::active() && (q[0] & 2)) q[0] |= 64;

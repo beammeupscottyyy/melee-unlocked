@@ -141,7 +141,7 @@ worktree, with the existing memory-gated, muted, isolated runners:
 
 ```sh
 m6check() {
-  /Users/luis/Code/brawl-dolphin/notes/lead-records/yougame-v2-org/tools/heavy-slot.sh run --prio 1 --label melee-ports:m6-verify -- python3 -B port/mac/check_full.py "$@"
+  $HOME/Code/brawl-dolphin/notes/lead-records/yougame-v2-org/tools/heavy-slot.sh run --prio 1 --label melee-ports:m6-verify -- python3 -B port/mac/check_full.py "$@"
 }
 m6check unit
 m6check parity
@@ -311,7 +311,7 @@ settings UI. The shared queue owns each external long check:
 ```sh
 cd /Volumes/YGWorktrees/ClaudeWorktrees/melee-ports/m3-mac-full
 m3check() {
-  /Users/luis/Code/brawl-dolphin/notes/lead-records/yougame-v2-org/tools/heavy-slot.sh run --prio 1 --label melee-ports:m3-parity-window -- python3 -B port/mac/check_full.py "$@"
+  $HOME/Code/brawl-dolphin/notes/lead-records/yougame-v2-org/tools/heavy-slot.sh run --prio 1 --label melee-ports:m3-parity-window -- python3 -B port/mac/check_full.py "$@"
 }
 
 # Hidden rendered parity + cold-cache hitch comparison; then a seeded run.
@@ -403,7 +403,7 @@ picture before swap. `MELEE_TEST_SURFACE` enables the far-corner surface probe.
   the Mac app's datagram handoff remains a release blocker. Local Slippi UDP
   tests do not prove that desktop integration.
 - A Python bytecode-only validation was refused when the system Python attempted
-  to write its default cache under `/Users/luis/Library/Caches/com.apple.python`.
+  to write its default cache under `$HOME/Library/Caches/com.apple.python`.
   That check was stopped and was not retried around the sandbox restriction.
 
 ## Two-instance local test for the lead

@@ -268,8 +268,8 @@ class ReleaseWiringTest(unittest.TestCase):
         friends = source("port/runtime/hle/yougame_friends.h")
         # request_ticket and team_ticket, then the 4-player Friends lobby's lobby_hold and lobby_ticket,
         # and the Doubles home's doubles_lobby and doubles_hold, whose key (lobby_room_key) is built from
-        # the same tagged compatibility_key.
-        self.assertEqual(friends.count('{"compatibility", compatibility}'), 6)
+        # the same tagged compatibility_key, and (PR #86) the arena room's arena_ticket.
+        self.assertEqual(friends.count('{"compatibility", compatibility}'), 7)
         lobby = function(code(raw), "lobby_room_key")
         self.assertIn('compat_tag_with_test_timer(compat_tag', lobby)
         self.assertIn('friends::lobby_hold(lobby_key)', find)

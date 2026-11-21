@@ -62,7 +62,13 @@ class YouGame0965MergeTest(unittest.TestCase):
                 self.assertNotIn("CheckOnlineCompatibility(&error)", function(net, name))
         search = function(net, "startMatchmaking")
         # Standalone's gate and the agent short circuit must remain ahead of app routing.
-        self.assertRegex(search, r"^\s*if \(host::test_env::agent_copy\(\) && !local_peer.enabled\) \{")
+        # PR #86: an arena game's link search (arena_fighters set) runs first, then the agent short circuit.
+        arena = r"^\s*if \(!search_settings_.arena_fighters.empty\(\) && !local_peer.enabled\) \{"
+        self.assertRegex(search, arena)
+        self.assertLess(search.index("search_settings_.arena_fighters.empty()"),
+                        search.index("if (host::test_env::agent_copy() && !local_peer.enabled) {"))
+        self.assertLess(search.index("if (host::test_env::agent_copy() && !local_peer.enabled) {"),
+                        search.index("if (!yougame::session() && !local_peer.enabled)"))
         self.assertLess(search.index("agent_lock::Operation::Matchmaking"),
                         search.index("if (!yougame::session() && !local_peer.enabled)"))
         self.assertIn("if (!user_ || !user_->CheckSessionCompatibility(&error)) {", search)

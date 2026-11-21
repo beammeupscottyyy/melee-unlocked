@@ -56,9 +56,11 @@ inline std::set<uint32_t> visual_only_models(std::string stage_file) {
   // Yoshi's Story, grstory.c: 1 starts its animation and sets a drawing flag on its materials
   // (grStory_801E31C0, a null joint is skipped), and its updates are empty. 2 and 3 carry collision.
   if (stage_file == "grst.dat" || stage_file == "grst.usd") return {1};
-  // Final Destination, grlast.c: 1 and 2 are the backdrop; 4, 5, 6, 8 and 9 are made only by the
-  // stage's demo (grLast_OnDemoInit), never in a match. 7 is left out: it starts a particle generator.
-  if (stage_file == "grnla.dat" || stage_file == "grnla.usd") return {1, 2, 4, 5, 6, 8, 9};
+  // Final Destination, grlast.c: 1 and 2 are the backdrop. 4 to 9 are not: the match's map init
+  // (grLast_8021A9C4 -> grLast_8021B920) makes 4 to 8, the background transformation makes 9, plays
+  // their animations 0 to 8 and waits for each to end (animate_all) before the next step, which draws
+  // random numbers. A skin's copy with other animations crashed the swap (0.9.991 crash report).
+  if (stage_file == "grnla.dat" || stage_file == "grnla.usd") return {1, 2};
   return {};
 }
 

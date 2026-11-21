@@ -274,8 +274,12 @@ def main():
     console = console_functions()
     keep = None
     reasons = {}
-    for f in args.debug_files:
-        ok, refused, clones = eligible_cached(f, args.objdump)
+    # Each debug file is read in its own process at once (the read takes minutes per file, and two
+    # are given for a release: AVX2 and SSE2), then combined in the order given.
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=max(1, len(args.debug_files))) as pool:
+        results = list(pool.map(eligible_cached, args.debug_files, [args.objdump] * len(args.debug_files)))
+    for f, (ok, refused, clones) in zip(args.debug_files, results):
         ok = {n: k for n, k in ok.items() if n not in clones}
         for n in clones:
             reasons.setdefault(n, "clone")

@@ -15,21 +15,74 @@
 #include <vector>
 
 namespace ppc {
+// Melee maps memory at 0x80000000 (cached) and 0xC0000000 (uncached) only. An address below
+// 0x80000000 is no memory on the console (a fault) or in Dolphin (an "Invalid read/write" notice; the
+// read gives 0, the write is dropped). ppc::fast() masks it into RAM instead, so a store to 00003100
+// landed on 80003100. A player's Gecko code made for vanilla, on a disc where its pointer read 0
+// (the 20XX Hack Pack, 11-20), wrote through that null pointer and zeroed low memory: memset at
+// 80003100 and the file table pointer at 80000038; the next memset stopped the game ("unsupported
+// instruction 00000000 at 80003100"). The interpreter (Gecko codes, mod code, Slippi's codes) now
+// treats those addresses as Dolphin does. Only here: fast() is shared with the prebuilt translated
+// game, whose stores keep their own behavior.
+static bool unmapped(uint32_t ea) { return ea < 0x80000000u; }
+static void unmapped_access(Context& c, uint32_t ea, uint32_t bytes, bool write) {
+  static int told = 0;
+  if (told++ < 8)
+    host::log("interpreter: %s of %u bytes at %08X from %s, no memory there on the console: %s, as Dolphin does%s",
+              write ? "write" : "read", bytes, ea, host::symbol_name(c.last_pc), write ? "dropped" : "read as 0",
+              told == 8 ? " (no more of these this run)" : "");
+}
+static uint32_t iload8(Context& c, uint8_t* m, uint32_t ea) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 1, false); return 0; }
+  return ld8(c, m, ea);
+}
+static uint32_t iload16(Context& c, uint8_t* m, uint32_t ea) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 2, false); return 0; }
+  return ld16(c, m, ea);
+}
+static uint32_t iload32(Context& c, uint8_t* m, uint32_t ea) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 4, false); return 0; }
+  return ld32(c, m, ea);
+}
+static uint64_t iload64(Context& c, uint8_t* m, uint32_t ea) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 8, false); return 0; }
+  return ld64(c, m, ea);
+}
+static uint32_t iload32r(Context& c, uint8_t* m, uint32_t ea) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 4, false); return 0; }
+  return ld32r(c, m, ea);
+}
+static uint32_t iload16r(Context& c, uint8_t* m, uint32_t ea) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 2, false); return 0; }
+  return ld16r(c, m, ea);
+}
+static void istore32r(Context& c, uint8_t* m, uint32_t ea, uint32_t v) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 4, true); return; }
+  st32r(c, m, ea, v);
+}
+static void istore16r(Context& c, uint8_t* m, uint32_t ea, uint32_t v) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 2, true); return; }
+  st16r(c, m, ea, v);
+}
 // Observe auxiliary handlers' interpreted stores. Translated stores and
 // runtime stencils keep their original behavior and cost in normal gameplay.
 static void observed_st8(Context& c, uint8_t* m, uint32_t ea, uint32_t v) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 1, true); return; }
   if (store_observer()) store_observer()(c, ea, 1, uint8_t(v));
   st8(c, m, ea, v);
 }
 static void observed_st16(Context& c, uint8_t* m, uint32_t ea, uint32_t v) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 2, true); return; }
   if (store_observer()) store_observer()(c, ea, 2, uint16_t(v));
   st16(c, m, ea, v);
 }
 static void observed_st32(Context& c, uint8_t* m, uint32_t ea, uint32_t v) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 4, true); return; }
   if (store_observer()) store_observer()(c, ea, 4, v);
   st32(c, m, ea, v);
 }
 static void observed_st64(Context& c, uint8_t* m, uint32_t ea, uint64_t v) {
+  if (unmapped(ea)) { unmapped_access(c, ea, 8, true); return; }
   if (store_observer()) store_observer()(c, ea, 8, v);
   st64(c, m, ea, v);
 }
@@ -190,7 +243,7 @@ struct Interp {
       if (!execution_budget.remaining) throw ExecutionBudgetExceeded{};
       --execution_budget.remaining;
     }
-    uint32_t w = ld32(c, m, pc);
+    uint32_t w = iload32(c, m, pc);
     if (ring_on()) { ring[ring_at] = {pc, w, c.r[0], c.r[1], c.r[3], c.r[4], c.r[5], c.r[31], c.lr, c.ctr}; ring_at = (ring_at + 1) % kRing; }
     uint32_t op = w >> 26;
     uint32_t rd = bits(w, 6, 5), ra = bits(w, 11, 5), rb = bits(w, 16, 5), rs = rd;
@@ -216,26 +269,26 @@ struct Interp {
       case 28: R[ra] = R[rs] & uimm; cr0(c, R[ra]); break;
       case 29: R[ra] = R[rs] & (uimm << 16); cr0(c, R[ra]); break;
       // ---------------- D-form loads/stores ----------------
-      case 32: R[rd] = ld32(c, m, A + simm); break;
-      case 33: { uint32_t ea = R[ra] + simm; R[rd] = ld32(c, m, ea); R[ra] = ea; break; }
-      case 34: R[rd] = ld8(c, m, A + simm); break;
-      case 35: { uint32_t ea = R[ra] + simm; R[rd] = ld8(c, m, ea); R[ra] = ea; break; }
+      case 32: R[rd] = iload32(c, m, A + simm); break;
+      case 33: { uint32_t ea = R[ra] + simm; R[rd] = iload32(c, m, ea); R[ra] = ea; break; }
+      case 34: R[rd] = iload8(c, m, A + simm); break;
+      case 35: { uint32_t ea = R[ra] + simm; R[rd] = iload8(c, m, ea); R[ra] = ea; break; }
       case 36: observed_st32(c, m, A + simm, R[rs]); break;
       case 37: { uint32_t ea = R[ra] + simm; observed_st32(c, m, ea, R[rs]); R[ra] = ea; break; }
       case 38: observed_st8(c, m, A + simm, R[rs]); break;
       case 39: { uint32_t ea = R[ra] + simm; observed_st8(c, m, ea, R[rs]); R[ra] = ea; break; }
-      case 40: R[rd] = ld16(c, m, A + simm); break;
-      case 41: { uint32_t ea = R[ra] + simm; R[rd] = ld16(c, m, ea); R[ra] = ea; break; }
-      case 42: R[rd] = (uint32_t)(int32_t)(int16_t)ld16(c, m, A + simm); break;
-      case 43: { uint32_t ea = R[ra] + simm; R[rd] = (uint32_t)(int32_t)(int16_t)ld16(c, m, ea); R[ra] = ea; break; }
+      case 40: R[rd] = iload16(c, m, A + simm); break;
+      case 41: { uint32_t ea = R[ra] + simm; R[rd] = iload16(c, m, ea); R[ra] = ea; break; }
+      case 42: R[rd] = (uint32_t)(int32_t)(int16_t)iload16(c, m, A + simm); break;
+      case 43: { uint32_t ea = R[ra] + simm; R[rd] = (uint32_t)(int32_t)(int16_t)iload16(c, m, ea); R[ra] = ea; break; }
       case 44: observed_st16(c, m, A + simm, R[rs]); break;
       case 45: { uint32_t ea = R[ra] + simm; observed_st16(c, m, ea, R[rs]); R[ra] = ea; break; }
-      case 46: { uint32_t ea = A + simm; for (uint32_t i = rd; i < 32; ++i, ea += 4) R[i] = ld32(c, m, ea); break; }
+      case 46: { uint32_t ea = A + simm; for (uint32_t i = rd; i < 32; ++i, ea += 4) R[i] = iload32(c, m, ea); break; }
       case 47: { uint32_t ea = A + simm; for (uint32_t i = rs; i < 32; ++i, ea += 4) observed_st32(c, m, ea, R[i]); break; }
-      case 48: F0(rd) = F1(rd) = float_bits_to_double(ld32(c, m, A + simm)); break;
-      case 49: { uint32_t ea = R[ra] + simm; F0(rd) = F1(rd) = float_bits_to_double(ld32(c, m, ea)); R[ra] = ea; break; }
-      case 50: U0(rd) = ld64(c, m, A + simm); break;
-      case 51: { uint32_t ea = R[ra] + simm; U0(rd) = ld64(c, m, ea); R[ra] = ea; break; }
+      case 48: F0(rd) = F1(rd) = float_bits_to_double(iload32(c, m, A + simm)); break;
+      case 49: { uint32_t ea = R[ra] + simm; F0(rd) = F1(rd) = float_bits_to_double(iload32(c, m, ea)); R[ra] = ea; break; }
+      case 50: U0(rd) = iload64(c, m, A + simm); break;
+      case 51: { uint32_t ea = R[ra] + simm; U0(rd) = iload64(c, m, ea); R[ra] = ea; break; }
       case 52: observed_st32(c, m, A + simm, double_to_float_bits(F0(rs))); break;
       case 53: { uint32_t ea = R[ra] + simm; observed_st32(c, m, ea, double_to_float_bits(F0(rs))); R[ra] = ea; break; }
       case 54: observed_st64(c, m, A + simm, U0(rs)); break;
@@ -339,18 +392,18 @@ struct Interp {
           case 0: cr_set_s(c, bits(w, 6, 3), (int32_t)R[ra], (int32_t)B); break;
           case 4: break;                                                     // tw
           case 19: R[rd] = mfcr(c); break;
-          case 20: R[rd] = ld32(c, m, ea); break;                            // lwarx
-          case 23: R[rd] = ld32(c, m, ea); break;
+          case 20: R[rd] = iload32(c, m, ea); break;                            // lwarx
+          case 23: R[rd] = iload32(c, m, ea); break;
           case 24: R[ra] = (B & 0x20) ? 0u : (R[rs] << (B & 31)); if (rc) cr0(c, R[ra]); break;
           case 26: R[ra] = cntlzw(R[rs]); if (rc) cr0(c, R[ra]); break;
           case 28: R[ra] = R[rs] & B; if (rc) cr0(c, R[ra]); break;
           case 32: cr_set_u(c, bits(w, 6, 3), R[ra], B); break;
           case 54: case 86: case 246: case 278: case 470: case 982: case 306: case 566: case 598: case 854: break;
-          case 55: { uint32_t e = R[ra] + B; R[rd] = ld32(c, m, e); R[ra] = e; break; }
+          case 55: { uint32_t e = R[ra] + B; R[rd] = iload32(c, m, e); R[ra] = e; break; }
           case 60: R[ra] = R[rs] & ~B; if (rc) cr0(c, R[ra]); break;
           case 83: R[rd] = c.msr; break;
-          case 87: R[rd] = ld8(c, m, ea); break;
-          case 119: { uint32_t e = R[ra] + B; R[rd] = ld8(c, m, e); R[ra] = e; break; }
+          case 87: R[rd] = iload8(c, m, ea); break;
+          case 119: { uint32_t e = R[ra] + B; R[rd] = iload8(c, m, e); R[ra] = e; break; }
           case 124: R[ra] = ~(R[rs] | B); if (rc) cr0(c, R[ra]); break;
           case 144: mtcrf(c, bits(w, 12, 8), R[rs]); break;
           case 146: mtmsr(c, R[rs]); break;
@@ -360,14 +413,14 @@ struct Interp {
           case 210: case 242: break;                                         // mtsr, mtsrin
           case 215: observed_st8(c, m, ea, R[rs]); break;
           case 247: { uint32_t e = R[ra] + B; observed_st8(c, m, e, R[rs]); R[ra] = e; break; }
-          case 279: R[rd] = ld16(c, m, ea); break;
+          case 279: R[rd] = iload16(c, m, ea); break;
           case 284: R[ra] = ~(R[rs] ^ B); if (rc) cr0(c, R[ra]); break;
-          case 311: { uint32_t e = R[ra] + B; R[rd] = ld16(c, m, e); R[ra] = e; break; }
+          case 311: { uint32_t e = R[ra] + B; R[rd] = iload16(c, m, e); R[ra] = e; break; }
           case 316: R[ra] = R[rs] ^ B; if (rc) cr0(c, R[ra]); break;
           case 339: R[rd] = spr_get(bits(w, 16, 5) << 5 | bits(w, 11, 5)); break;
-          case 343: R[rd] = (uint32_t)(int32_t)(int16_t)ld16(c, m, ea); break;
+          case 343: R[rd] = (uint32_t)(int32_t)(int16_t)iload16(c, m, ea); break;
           case 371: R[rd] = ((bits(w, 16, 5) << 5 | bits(w, 11, 5)) == 268) ? (uint32_t)read_tb(c) : (uint32_t)(read_tb(c) >> 32); break;
-          case 375: { uint32_t e = R[ra] + B; R[rd] = (uint32_t)(int32_t)(int16_t)ld16(c, m, e); R[ra] = e; break; }
+          case 375: { uint32_t e = R[ra] + B; R[rd] = (uint32_t)(int32_t)(int16_t)iload16(c, m, e); R[ra] = e; break; }
           case 407: observed_st16(c, m, ea, R[rs]); break;
           case 412: R[ra] = R[rs] | ~B; if (rc) cr0(c, R[ra]); break;
           case 439: { uint32_t e = R[ra] + B; observed_st16(c, m, e, R[rs]); R[ra] = e; break; }
@@ -375,24 +428,24 @@ struct Interp {
           case 467: spr_put(bits(w, 16, 5) << 5 | bits(w, 11, 5), R[rs]); break;
           case 476: R[ra] = ~(R[rs] & B); if (rc) cr0(c, R[ra]); break;
           case 512: c.cr[bits(w, 6, 3)] = (uint8_t)((c.so << 3) | (c.ov << 2) | (c.ca << 1)); c.so = c.ov = c.ca = 0; break;
-          case 534: R[rd] = ld32r(c, m, ea); break;
-          case 535: F0(rd) = F1(rd) = float_bits_to_double(ld32(c, m, ea)); break;
+          case 534: R[rd] = iload32r(c, m, ea); break;
+          case 535: F0(rd) = F1(rd) = float_bits_to_double(iload32(c, m, ea)); break;
           case 536: R[ra] = (B & 0x20) ? 0u : (R[rs] >> (B & 31)); if (rc) cr0(c, R[ra]); break;
-          case 567: { uint32_t e = R[ra] + B; F0(rd) = F1(rd) = float_bits_to_double(ld32(c, m, e)); R[ra] = e; break; }
+          case 567: { uint32_t e = R[ra] + B; F0(rd) = F1(rd) = float_bits_to_double(iload32(c, m, e)); R[ra] = e; break; }
           case 595: case 659: R[rd] = 0; break;                              // mfsr, mfsrin
           case 597: lswi(c, m, A, rd, rb ? rb : 32); break;
-          case 599: U0(rd) = ld64(c, m, ea); break;
-          case 631: { uint32_t e = R[ra] + B; U0(rd) = ld64(c, m, e); R[ra] = e; break; }
-          case 662: st32r(c, m, ea, R[rs]); break;
+          case 599: U0(rd) = iload64(c, m, ea); break;
+          case 631: { uint32_t e = R[ra] + B; U0(rd) = iload64(c, m, e); R[ra] = e; break; }
+          case 662: istore32r(c, m, ea, R[rs]); break;
           case 663: observed_st32(c, m, ea, double_to_float_bits(F0(rs))); break;
           case 695: { uint32_t e = R[ra] + B; observed_st32(c, m, e, double_to_float_bits(F0(rs))); R[ra] = e; break; }
           case 725: stswi(c, m, A, rs, rb ? rb : 32); break;
           case 727: observed_st64(c, m, ea, U0(rs)); break;
           case 759: { uint32_t e = R[ra] + B; observed_st64(c, m, e, U0(rs)); R[ra] = e; break; }
-          case 790: R[rd] = ld16r(c, m, ea); break;
+          case 790: R[rd] = iload16r(c, m, ea); break;
           case 792: R[ra] = sraw(c, R[rs], B); if (rc) cr0(c, R[ra]); break;
           case 824: R[ra] = srawi(c, R[rs], rb); if (rc) cr0(c, R[ra]); break;
-          case 918: st16r(c, m, ea, R[rs]); break;
+          case 918: istore16r(c, m, ea, R[rs]); break;
           case 922: R[ra] = (uint32_t)(int32_t)(int16_t)R[rs]; if (rc) cr0(c, R[ra]); break;
           case 954: R[ra] = (uint32_t)(int32_t)(int8_t)R[rs]; if (rc) cr0(c, R[ra]); break;
           case 983: observed_st32(c, m, ea, (uint32_t)U0(rs)); break;
@@ -572,7 +625,7 @@ void resume_interpret(Context& c, uint8_t* m, uint32_t addr, uint32_t entry_lr) 
           if (in.pc >= r.lo && in.pc < r.hi && host::retrace_count() >= r.from) {
             ++lines;
             host::log("[interp] %08X insn=%08X r0=%08X r1=%08X r3=%08X r4=%08X r5=%08X r6=%08X r12=%08X r27=%08X r28=%08X r29=%08X r30=%08X r31=%08X cr=%08X ctr=%08X",
-                      in.pc, ppc::ld32(c, m, in.pc), c.r[0], c.r[1], c.r[3], c.r[4], c.r[5], c.r[6], c.r[12], c.r[27], c.r[28], c.r[29], c.r[30], c.r[31], ppc::mfcr(c), c.ctr);
+                      in.pc, ppc::iload32(c, m, in.pc), c.r[0], c.r[1], c.r[3], c.r[4], c.r[5], c.r[6], c.r[12], c.r[27], c.r[28], c.r[29], c.r[30], c.r[31], ppc::mfcr(c), c.ctr);
             break;
           }
       in.step(); ++g_interpreted_insns;

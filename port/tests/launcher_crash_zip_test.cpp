@@ -172,7 +172,8 @@ int main() {
   const char* check_string = "123456789";
   CHECK(launcher::crash::crc32((const uint8_t*)check_string, 9) == 0xCBF43926u);
   CHECK(reference_crc32((const uint8_t*)check_string, 9) == 0xCBF43926u);
-  CHECK(std::size(launcher::crash::kParts) == 5);   // crash text, the last session, the one before it, Linux error output, the lobby
+  CHECK(std::size(launcher::crash::kParts) == 7);   // crash text, the last session, the one before it, Linux error output, the lobby,
+                                                  // the launcher's log and its YouGame log
   CHECK(launcher::crash::kMaxZipBytes == 8 * MB);
 
   const fs::path root = fs::temp_directory_path() /
@@ -199,18 +200,22 @@ int main() {
   put(game + "\\melee_port_crash.dmp", text("PrivateTesterAlpha PRIVATE_BINARY C:/Users/PrivateTesterBeta/secret"));
   put(launcher_dir + "\\lobby.log", text("profile PrivateTesterAlpha id PRIVATE_ID connected 192.168.1.44\n"));
   put(game + "\\settings.ini", text("PRIVATE_SETTINGS"));
+  // The launcher's logs (a Play that started no game, YouGame's connection and why it failed): its paths are
+  // the player's own folders.
+  put(launcher_dir + "\\launcher.log", text("2026-11-20 16:40:01 Launch failed: Windows error 5; executable=C:\\Users\\PrivateTesterDelta\\HiddenBuild\\game.exe; directory=C:\\Users\\PrivateTesterDelta\\HiddenBuild\\MeleeUnlocked\n"));
+  put(launcher_dir + "\\launcher-yougame.log", text("2026-11-20 16:40:00 yougame: at start: not connected: YouGame answered 401: the saved sign-in has ended (Connect signs in again) (1 s)\n"));
   auto files = launcher::crash::collect(game, launcher_dir);
-  const std::vector<std::string> expected = {"melee_port_crash.txt", "melee_port.log", "lobby.log"};
+  const std::vector<std::string> expected = {"melee_port_crash.txt", "melee_port.log", "lobby.log", "launcher.log", "launcher-yougame.log"};
   CHECK(names(files) == expected);
   {
     // The session before the last one travels too, when the game kept it: scrubbed like the last one,
     // and it survives the outgoing ZIP's file list.
     put(game + "/melee_port.prev.log", text("scene: major 02 minor 02 (frame 94)" + std::string(1, (char)10) + "slippi: logged in as PrivateTesterAlpha (PTA#123)" + std::string(1, (char)10)));
     auto both = launcher::crash::collect(game, launcher_dir);
-    CHECK(names(both) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log"}));
+    CHECK(names(both) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log", "launcher.log", "launcher-yougame.log"}));
     const auto packed = launcher::crash::capped_zip(both);
     std::vector<Entry> got;
-    CHECK(read_zip(packed, got) && names(got) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log"}));
+    CHECK(read_zip(packed, got) && names(got) == std::vector<std::string>({"melee_port_crash.txt", "melee_port.log", "melee_port.prev.log", "lobby.log", "launcher.log", "launcher-yougame.log"}));
     for (const auto& entry : got)
       if (entry.name == "melee_port.prev.log") {
         const std::string body(entry.data.begin(), entry.data.end());
@@ -225,7 +230,12 @@ int main() {
   CHECK(zip.size() == exact_size(files) && zip.size() <= launcher::crash::kMaxZipBytes);
   const std::string zipped(zip.begin(), zip.end());
   const std::string report = launcher::crash::make_markdown(files, "0.8.62", "Source Port");
-  for (const char* secret : {"PrivateTesterAlpha", "PrivateTesterBeta", "PrivateTesterGamma", "C:/Users/", "/home/",
+  {
+    // The launcher's YouGame reason survives the scrub; the launcher's folders do not.
+    const std::string yg(files.back().second.begin(), files.back().second.end());
+    CHECK(files.back().first == "launcher-yougame.log" && yg.find("YouGame answered 401") != std::string::npos);
+  }
+  for (const char* secret : {"PrivateTesterAlpha", "PrivateTesterBeta", "PrivateTesterGamma", "PrivateTesterDelta", "C:/Users/", "C:\\Users\\", "/home/",
                             "HiddenBuild", "PRIVATE#123", "WXYZ#987", "192.168.1.44", "PRIVATE_BINARY", "PRIVATE_AUTH", "PRIVATE_ID", "PRIVATE_SETTINGS"}) {
     CHECK(zipped.find(secret) == std::string::npos);
     CHECK(report.find(secret) == std::string::npos);

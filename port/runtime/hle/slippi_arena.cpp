@@ -64,6 +64,7 @@ struct Link {
   uint64_t ready_at = 0;       // when it came up: a link up this long with no hello answered is reopened
   uint64_t refused_at = 0;     // a full room said no on this link (either way): dropped 3 s later
   bool was_ready = false, hello_sent = false;
+  std::string yg;              // under YouGame: the connection at the other end, in the arena's own room
 };
 
 template <class T> void drop_later(std::unique_ptr<T>& p) {
@@ -106,6 +107,13 @@ std::atomic<bool> g_search_busy{false};
 std::atomic<uint64_t> g_room_over_ms{0};   // when this game was last put out of a room (0 never)
 std::atomic<uint16_t> g_css_pick{0xFF00};   // character << 8 | costume, kNone character: none
 uint64_t g_test_wait_since = 0;
+// Under YouGame the room is the arena's own YouGame room (yougame::arena_room) and every link is a
+// connection in it; there are no Slippi links, searches or codes. Simulation thread.
+bool g_yg = false;
+bool g_yg_seen_host = false;      // a member: the host was in the room's roster (gone after that: closed)
+bool g_yg_invite = false;         // the host asked to invite while the room was still opening
+int g_yg_invite_seen = 0;         // the invite's last state shown
+uint64_t g_yg_close_at = 0;       // a room left: closed once the goodbye has gone out
 // Warm-up room: this member is in Training; the viewer window waits for the way back (unless the
 // setting keeps it open). The game's score from the first fighter (kScore), for the room's strip.
 bool g_warming = false;
@@ -242,6 +250,10 @@ void put32(std::vector<uint8_t>& o, uint32_t v) { for (int s = 24; s >= 0; s -= 
 uint32_t get32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 bool send(Link& link, const std::vector<uint8_t>& m, bool bulk = false) {
+  if (!link.yg.empty()) {   // the arena's YouGame room carries it (sent in batches within the room's limits)
+    yougame::arena_room::send(link.yg, m);
+    return true;
+  }
   return link.np && link.np->SendArena(m.data(), m.size(), bulk);
 }
 
@@ -953,6 +965,10 @@ void room_over_here(const char* why, bool end_search) {
     const bool searching = st.state >= (int)Matchmaking::INITIALIZING && st.state <= (int)Matchmaking::CONNECTION_SUCCESS;
     if (searching && !st.in_match && (st.mode == Matchmaking::DIRECT || st.mode == Matchmaking::TEAMS)) online::native_cleanup_match();
   }
+  if (g_yg) {
+    g_yg = false; g_yg_seen_host = false; g_yg_invite = false;
+    g_yg_close_at = now_ms() + 800;
+  }
   g_active = false; g_hosting = false; g_room = Room{}; g_self = kNone; g_status.clear();
   g_wait_room = false; g_pair_code.clear(); g_yield_to = nullptr; g_sent_rev = 0xFFFFFFFFu;
   g_next_match_ms = 0; g_test_wait_since = 0; g_relay_tag = 0; g_relay_from = kNone;
@@ -976,8 +992,70 @@ void leave_room() {
   g_notice_until = now_ms() + 5000;
 }
 
+// Under YouGame: this player's YouGame id and name stand for them in the room (the room's seats carry
+// the same id, which the arena's games are found by).
+bool yg_identity() {
+  const yougame::Identity id = yougame::identity();
+  if (!id.ok || id.player_id.empty()) {
+    g_notice = id.error.empty() ? "YouGame is not signed in yet" : id.error;
+    g_notice_until = now_ms() + 6000;
+    return false;
+  }
+  g_code = id.player_id;
+  g_name = id.name.empty() ? std::string("Player") : id.name;
+  return true;
+}
+
+void yg_open(const std::string& room) {
+  g_yg = true;
+  g_yg_seen_host = false;
+  g_yg_close_at = 0;
+  g_links.clear();
+  g_ping.fill(-1);
+  if (room.empty()) {
+    open_room();
+  } else {
+    g_active = true; g_hosting = false; g_room = Room{}; g_self = kNone;
+    event("joining the arena %s", room.c_str());
+  }
+  yougame::arena_room::open(room);
+}
+
+// The room's own acts under YouGame; true when handled.
+bool yg_act(const Pending& p) {
+  if (p.a == Act::JoinYouGame) {
+    if (p.text.empty() || !yg_identity()) return true;
+    if (g_active) leave_room();
+    yg_open(p.text);
+    return true;
+  }
+  if (p.a == Act::OpenRoom) {
+    if (!g_active && yg_identity()) yg_open({});
+    return true;
+  }
+  if (p.a == Act::AddCode) {
+    // Adding a friend is the app's invite for this room: a player not in a room opens one first.
+    if (!g_active) {
+      if (!yg_identity()) return true;
+      yg_open({});
+    }
+    if (!g_hosting) {
+      event("only the host invites");
+      g_notice = "Only the room's host can invite";
+      g_notice_until = now_ms() + 6000;
+      return true;
+    }
+    g_yg_invite = true;
+    return true;
+  }
+  return false;
+}
+
 void do_act(const Pending& p) {
-  if (yougame::session() && !g_test.on) return;   // not on a YouGame row (the app, or one picked under the launcher)
+  if (yougame::session() && !g_test.on) {
+    if (yg_act(p)) return;
+    if (!g_yg) return;   // a Slippi room never runs on a YouGame row (the app, or one picked under the launcher)
+  }
   if (p.a == Act::OpenRoom) {
     if (!g_active && !g_code.empty()) open_room();
     return;
@@ -1122,6 +1200,99 @@ void service_links() {
     g_hosting = false;
     g_room = Room{};
     g_self = kNone;
+  }
+}
+
+// Under YouGame: the arena's room in place of the links. The host keeps a link per member's
+// connection (made at its first message); a member keeps one to the host's.
+void service_yg_links() {
+  namespace ar = yougame::arena_room;
+  const uint64_t now = now_ms();
+  std::string why;
+  const int st = ar::state(&why);
+  if (st == 1) { g_status = g_hosting ? "Opening the room" : "Joining the room"; return; }
+  if (st != 2) {
+    room_over_here(("the arena's room is closed: " + (why.empty() ? std::string("left") : why)).c_str(), true);
+    g_notice = why.empty() ? std::string("The room closed") : why;
+    g_notice_until = now + 8000;
+    return;
+  }
+  if (g_yg_invite && g_hosting) {
+    g_yg_invite = false;
+    g_yg_invite_seen = 0;   // this invite's answer shows even when it is the same as the last one's (a second failure)
+    ar::invite();
+  }
+  const int invite = ar::invite_state(&why);
+  if (invite != g_yg_invite_seen) {
+    g_yg_invite_seen = invite;
+    if (invite == -1) { g_notice = why.empty() ? std::string("Could not invite") : why; g_notice_until = now + 8000; }
+    else if (invite == 2) { g_notice = "Invite sent"; g_notice_until = now + 4000; }
+  }
+  const std::string me = ar::me(), host = ar::host();
+  if (me.empty() || host.empty()) return;   // the room's welcome is on its way
+  const std::vector<ar::Seat> seats = ar::roster();
+  const auto seat_of = [&seats](const std::string& conn) -> const ar::Seat* {
+    for (const ar::Seat& s : seats) if (s.conn == conn) return &s;
+    return nullptr;
+  };
+  if (g_hosting) {
+    // Members who left the room: gone from the arena too.
+    for (Link& l : g_links)
+      if (!seat_of(l.yg)) { if (l.id != kNone) member_gone(l.id); l.id = kNone; }
+    g_links.erase(std::remove_if(g_links.begin(), g_links.end(), [&](const Link& l) { return !seat_of(l.yg); }), g_links.end());
+  } else {
+    if (!seat_of(host)) {
+      if (g_yg_seen_host) g_closed_reason = "the room's host left: the room is closed here";
+      return;
+    }
+    g_yg_seen_host = true;
+    if (g_links.empty()) {
+      Link l;
+      l.yg = host;
+      l.was_ready = true;
+      g_links.push_back(std::move(l));
+      event("in the arena's room: saying hello to the host");
+    }
+    Link& l = g_links[0];
+    if (g_self == kNone && (!l.hello_sent || now - l.ready_at > 6000)) {   // asked again until the host answers
+      std::vector<uint8_t> h = {kHello};
+      put_str(h, g_code);
+      put_str(h, g_name);
+      h.push_back(0);
+      h.push_back(1);
+      l.hello_sent = send(l, h);
+      l.ready_at = now;
+    }
+  }
+  std::string from;
+  std::vector<uint8_t> m;
+  for (int n = 0; n < 4000 && ar::pop(&from, &m); ++n) {
+    if (!g_hosting) {
+      if (from == host) member_message(m);
+      continue;
+    }
+    const ar::Seat* seat = seat_of(from);
+    if (!seat || from == me || m.empty()) continue;
+    Link* l = nullptr;
+    for (Link& k : g_links) if (k.yg == from) l = &k;
+    if (!l) {
+      Link k;
+      k.yg = from;
+      k.was_ready = true;
+      g_links.push_back(std::move(k));
+      l = &g_links.back();
+    }
+    if (m[0] == kHello) {
+      // A member is the room's seat it says it is, and only joins (never hosts: one host per arena).
+      size_t at = 1;
+      std::string code;
+      if (!get_str(m, at, code) || code != seat->id) { event("a hello from another player's seat: ignored"); continue; }
+      std::string name;
+      get_str(m, at, name);
+      if (at < m.size()) m[at] = 0;
+    }
+    host_message(*l, m);
+    g_yield_to = nullptr;
   }
 }
 
@@ -1286,7 +1457,17 @@ void steer_match() {
   }
   std::string error;
   const bool locked = g_test.on && !test_press_start();
-  if (online::arena_start_search(t.mode, t.code, locked, g_test.character, 0, t.team, &error)) {
+  bool started;
+  if (g_yg) {
+    // The arena's room carries the game: its fighters are found by their YouGame ids, in ring order.
+    std::vector<std::string> fighters;
+    for (int s = 0; s < ring_size(g_room); ++s)
+      if (const Member* m = find(g_room, g_room.ring[s])) fighters.push_back(m->code);
+    started = online::arena_start_yg_search(t.mode, fighters, t.code, locked, g_test.character, 0, t.team, &error);
+  } else {
+    started = online::arena_start_search(t.mode, t.code, locked, g_test.character, 0, t.team, &error);
+  }
+  if (started) {
     event("searching for %s (%s)", t.code.c_str(), t.mode == Matchmaking::TEAMS ? "doubles" : "singles");
     g_status = "Connecting to " + t.label;
   } else {
@@ -1501,7 +1682,12 @@ void tick() {
     std::deque<Pending> todo;
     { std::lock_guard<std::mutex> lk(g_mutex); todo.swap(g_pending); }
     if (g_code.empty() && !todo.empty()) online::local_identity(&g_code, &g_name);   // a real room: the Slippi account
-    for (const Pending& p : todo) do_act(p);
+    for (const Pending& p : todo) {
+      // The player's next action clears the last line (a failed invite, a room that did not open). Not the room's
+      // own character report, nor a code it adds for the player (a Direct search that met a room says "Joining").
+      if (p.a != Act::SetCharacter && !(p.a == Act::AddCode && !p.text.empty())) g_notice_until = 0;
+      do_act(p);
+    }
   }
   {
     static int every = 0;
@@ -1520,6 +1706,10 @@ void tick() {
     g_close_room = false;
     room_over_here("left: the room was full", false);
   }
+  if (g_yg_close_at && now_ms() >= g_yg_close_at) {
+    g_yg_close_at = 0;
+    yougame::arena_room::close();
+  }
   if (!g_active) {
     // The room tab's notice (a full room) still reaches the panel while this game is in no room.
     static bool had_notice = false;
@@ -1528,7 +1718,9 @@ void tick() {
     had_notice = notice;
     return;
   }
-  service_links();
+  if (g_yg) service_yg_links();
+  else service_links();
+  if (!g_active) { publish_view(); return; }
   if (g_member_closed || g_closed_reason) {
     const bool host_said = g_member_closed;
     const char* why = g_closed_reason;

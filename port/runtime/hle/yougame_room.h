@@ -19,6 +19,25 @@ inline int connection_seat(const json& participants, const std::string& connecti
     if (p.value("connectionId", "") == connection && p.value("localIndex", 0) == 0) return p.value("slot", -1);
   return -1;
 }
+// An arena game's seats (Search::arena_fighters): each fighter's entry from the arena room's roster, its slot
+// renumbered to its ring slot (so ring slot n plays port n+1, whatever seat the room gave it). Empty until every
+// fighter is in the room.
+inline json arena_roster(const json& participants, const std::vector<std::string>& fighters) {
+  json out = json::array();
+  for (size_t i = 0; i < fighters.size(); ++i) {
+    bool found = false;
+    for (const auto& p : participants) {
+      if (!p.is_object() || p.value("id", "") != fighters[i] || p.value("localIndex", 0) != 0) continue;
+      json seat = p;
+      seat["slot"] = (int)i;
+      out.push_back(std::move(seat));
+      found = true;
+      break;
+    }
+    if (!found) return json::array();
+  }
+  return out;
+}
 inline std::vector<std::string> port_participants(const json& participants, int size) {
   std::vector<std::string> ids(size, "");
   for (const auto& p : participants) {

@@ -211,6 +211,7 @@ Device* find_device_locked(const std::string& path) {
 // The Raw Input registration on Windows takes usage pages 1/4 and 1/5 (joystick, game pad).
 bool wanted(const Device& d) {
   if (d.vendor == 0x057E && d.product == 0x0337) return false;   // the GameCube adapter: libusb owns it
+  if (d.vendor == 0x2E8A && d.product == 0x102B) return false;   // the Lossless adapter in lag-test mode: the same
   return d.parsed.usage_page == 0x01 && (d.parsed.usage == 0x04 || d.parsed.usage == 0x05);
 }
 

@@ -41,6 +41,10 @@ inline constexpr Part kParts[] = {
   // library says why it stopped a program there ("malloc(): corrupted top size") and nowhere else.
   {"melee_port.stderr.log", false, 256 * 1024},
   {"lobby.log", true, 512 * 1024},
+  // The launcher's own lines (launcher.cpp log_line): why a Play started no game, and what the YouGame
+  // connection did at start and on Connect, with why it failed.
+  {"launcher.log", true, 256 * 1024},
+  {"launcher-yougame.log", true, 256 * 1024},
 };
 
 using File = std::pair<std::string, std::vector<uint8_t>>;   // name in the zip, contents
@@ -222,7 +226,8 @@ inline std::vector<uint8_t> capped_zip(std::vector<File>& files, size_t max = kM
   std::vector<File> safe;
   for (const auto& f : files)
     if (f.first == "melee_port_crash.txt" || f.first == "melee_port.log" || f.first == "melee_port.prev.log" ||
-        f.first == "lobby.log" || f.first == "session.trace")
+        f.first == "lobby.log" || f.first == "session.trace" || f.first == "launcher.log" ||
+        f.first == "launcher-yougame.log")
       safe.emplace_back(f.first, private_report_text(f.first, f.second));
   files = std::move(safe);
   std::vector<uint8_t> zip = make_zip(files);

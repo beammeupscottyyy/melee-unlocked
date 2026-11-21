@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <stdexcept>
@@ -188,6 +189,47 @@ std::string sha1(const std::vector<uint8_t>& input) {
   return out;
 }
 
+std::filesystem::path user_data_dir() {
+#ifdef _WIN32
+  wchar_t local[MAX_PATH] = {};
+  const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return {};
+  return std::filesystem::path(local) / L"MeleeUnlocked-YouGame" / L"User";
+#else
+  const char* xdg = std::getenv("XDG_DATA_HOME");
+  const char* home = std::getenv("HOME");
+  std::filesystem::path base;
+  if (xdg && xdg[0] == '/') base = xdg;
+  else if (home && *home) base = std::filesystem::path(home) / ".local" / "share";
+  else return {};
+#ifdef __APPLE__
+  return base / "melee-unlocked" / "User";
+#else
+  return base / "MeleeUnlocked-YouGame" / "User";
+#endif
+#endif
+}
+
+std::filesystem::path choose_data_dir(const std::filesystem::path& build_dir, const std::string& user_dir,
+                                      const std::string& data_dir, const std::filesystem::path& fallback,
+                                      std::string& note) {
+  note.clear();
+  if (!data_dir.empty()) return std::filesystem::u8path(data_dir);
+  if (user_dir.empty()) {
+    if (!fallback.empty()) note = "sys: no --user-dir given; generating into " + fallback.u8string();
+    return fallback;
+  }
+  auto user = std::filesystem::u8path(user_dir).lexically_normal();
+  if (user.filename().empty()) user = user.parent_path();
+  auto derived = user.parent_path();
+  if (derived.empty()) derived = ".";
+  std::error_code ec;
+  // The same test prepare's guard makes: whatever it would refuse goes to the player's own folder.
+  if (fallback.empty() || outside_build(build_dir, derived, ec)) return derived;
+  note = "sys: " + derived.u8string() + " is inside the game folder; generating into " + fallback.u8string();
+  return fallback;
+}
+
 bool Assets::prepare(const Config& config, const Disc& disc, std::string& error) {
   const auto started = std::chrono::steady_clock::now();
   redirects_.clear(); error.clear(); status_message_.clear();
@@ -224,6 +266,10 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
         if (!std::filesystem::exists(folder) && sys == "SysPlayback" &&
             std::filesystem::exists(config.build_dir / "slippi_sys_playback")) folder = config.build_dir / "slippi_sys_playback";
         if (!shipped(folder, file.target).empty()) continue;
+        // A Sys folder this install does not have at all (slippi_sys_general is a source-tree name, never in a
+        // release) needs nothing generated: only the active one and the ones that exist are read. A Linux
+        // release keeps its data inside the install folder, so generating for it failed the start (0.9.990).
+        if (sys != active && !std::filesystem::exists(folder)) continue;
         if (config.data_dir.empty()) return fail(error, file.target + ": generation needs --user-dir or --sysgen-data-dir");
         const auto generated = config.data_dir / "SysGenerated" / sys / file.target;
         std::error_code path_error;

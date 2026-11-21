@@ -4,12 +4,12 @@ Forwards crash report ZIPs from the launcher to a private Discord channel. The w
 the launcher. The source now attaches `crash-<id>.md` beside a scrubbed text-only `crash-<id>.zip`, so a
 report can be attached directly to an assistant or issue. Both files use the same report id.
 
-This relay update is **pending deployment**. The deployed 2026-09-30 Worker described below still
-sends only the ZIP until the updated source is deployed. No real or test report was sent while
-implementing or validating this change.
+Deployed 2026-11-20 (version 5e26e4dd-37cb-401c-a3a2-ef2813322a84): this source, including the launcher's
+logs below. Checked after deploy: GET 405, wrong type 415. No real or test report was sent.
 
 Old and new launchers use the same existing `application/zip` upload and headers. The relay reads
-only the exact basenames `melee_port_crash.txt`, `melee_port.log` and `lobby.log`, scrubs them line
+only the exact basenames `melee_port_crash.txt`, `melee_port.log`, `melee_port.prev.log`, `lobby.log`,
+`launcher.log` and `launcher-yougame.log` (why a Play started no game, why YouGame did not connect), scrubs them line
 by line, then builds a fresh stored ZIP with new checksums. Markdown uses the same scrubbed text.
 **The incoming ZIP is never forwarded. Binary minidumps are always dropped.** Raw diagnostics
 remain on the player's computer; settings and unknown file payloads are excluded.
@@ -78,7 +78,7 @@ Limits: zip only, 8 MB, one report per IP per 10 minutes, 50 per day. The counte
 Object that checks and reserves in a single step, so reports sent at the same moment cannot pass the
 limits together (the earlier KV counters could: their reads and writes are not atomic). With no
 `QUOTA` binding the relay answers 503 instead of running without limits. Tests: `test/quota.test.js`.
-This quota change is **pending deployment**, together with the privacy update above.
+This quota change is deployed with the rest (2026-11-20).
 
 Deployed 2026-09-30 as `melee-crash-relay` (KV namespace RATE 36cc7f4af26b4a8abd15d99aa824aae9, preview URLs off):
 https://melee-crash-relay.firescribe-share-worker.workers.dev/report. Checked: GET 405, wrong type 415,

@@ -576,6 +576,9 @@ class Matchmaking {
     // Slippi's Unranked plays this game's gameplay (vanilla, native_online_policy.h); set by the
     // online menu's search. Only the launcher's Both Unranked reads it: false searches YouGame alone.
     bool slippi_gameplay = false;
+    // An arena game under YouGame (slippi_arena.h): the arena's own room carries it, and these are its
+    // fighters' YouGame player ids in ring order (2 or 4). Empty for every other search.
+    std::vector<std::string> arena_fighters;
   };
   // True when an opponent in the match is on the Unranked block list (codes compared ignoring case
   // and spaces). Public for the unit test.

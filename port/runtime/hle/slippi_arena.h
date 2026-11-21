@@ -46,6 +46,7 @@ enum class Act : uint8_t {
   SetCharacter = 9,              // arg the character, text[0] the costume (sent by the room itself)
   OpenRoom = 20, AddCode = 21,   // the host's own (AddCode carries a connect code)
   LeaveRoom = 22,                // this player leaves the room (a host's room closes with it)
+  JoinYouGame = 23,              // under YouGame: join the arena whose room code is text (an invite)
 };
 void act(Act a, uint8_t arg = 0, const std::string& text = {});
 
@@ -90,7 +91,8 @@ void set_css_hand(int16_t x10, int16_t y10);
 bool css_hand(float* x, float* y);   // false before the first report
 // The online select's mode with the hand (Matchmaking::OnlinePlayMode; -1 a game library that doesn't say).
 void set_css_mode(int mode);
-// Ranked or Unranked: no rooms there (they are a Direct feature), so no ARENA tab or box (pc_settings.cpp).
+// Ranked or Unranked: no rooms there (they are a Direct feature; under YouGame, a YouGame Friends one), so no
+// ARENA tab or box (pc_settings.cpp).
 bool css_ranked_or_unranked();
 // Rooms for players (the tab, the panels, the room logic, the settings rows). MELEE_TEST_ARENA_ROOMS=0
 // (tests only) turns them off, for runs that compare a game with and without them.

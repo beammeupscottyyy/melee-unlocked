@@ -21,7 +21,8 @@ std::chrono::steady_clock::time_point g_next_scan{};
 bool g_ready = false;
 
 bool skipped(uint16_t vendor, uint16_t product) {
-  return vendor == 0x057E && product == 0x0337;   // Nintendo's Wii U / Switch GameCube adapter
+  return (vendor == 0x057E && product == 0x0337) ||   // Nintendo's Wii U / Switch GameCube adapter
+         (vendor == 0x2E8A && product == 0x102B);     // the Lossless adapter in its lag-test mode
 }
 
 void ensure_init() {

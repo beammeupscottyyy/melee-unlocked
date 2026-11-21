@@ -140,7 +140,7 @@ static int yg_flags;
 static int yg_pick;           /* the last row picked was a YouGame row (split layout) */
 static int last_slot = -1;    /* the last row picked (split layout): the cursor goes back to it */
 enum { YG_APP_RANKED = 1, YG_SPLIT = 2, YG_ROWS_OPEN = 4, YG_HEADER = 8, YG_OPEN_RANKED = 16, YG_OPEN_DIRECT = 32,
-       YG_COMING_SOON = 64 };
+       YG_COMING_SOON = 64, YG_FRIENDS_FLOW = 128 };
 /* Started for a YouGame mode (--online-mode): the boot menu confirms that row by itself, like the
  * P2P session's Direct (set at the boot entry, cleared by the menu's think before any match). */
 static int auto_slot = -1;
@@ -148,7 +148,11 @@ static int auto_slot = -1;
  * start hook (CMD_YOUGAME_MENU 0x20) and the menu confirms this row by itself once the rows open.
  * Menu-only, like auto_slot. -1: none. */
 static int yg_wait_slot = -1;
+/* A 0x20 asked for YouGame on this menu (YouGame's own small window may be up over it, Windows): leaving
+ * the menu tells the host (0x21, yougame_ask_withdraw) so the window goes with it. */
+static int yg_asked;
 static unsigned yg_wait_frames;
+static unsigned yg_closed_frames;  /* frames on the Online menu with YouGame's rows still closed */
 static int yg_open;           /* YG_OPEN_* from the first answer that carried it (the host answers it once) */
 enum { SPLIT_SLIPPI = 3, SPLIT_FIRST_SLIPPI = 4 };
 /* The split layout's rows as Slippi mode ids; rows 0-2 are YouGame's, row 3 opens Slippi's page. */
@@ -157,6 +161,20 @@ static const signed char split_mode[8] = { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRAN
                                            MU_SLP_MODE_PARTY };
 static int split_page;        /* 0: Ranked, Unranked, Friends, Slippi; 1: Slippi's four */
 static int split_layout(void) { return !ranked_supported && (yg_flags & YG_SPLIT) != 0; }
+/* YouGame's page under Melee Unlocked's launcher with YouGame's rows open over the local channel to a
+ * running YouGame app (YG_FRIENDS_FLOW): its Friends row opens YouGame's friend flow, as the app's
+ * Friends row does (the host holds a Friends room and opens YouGame's friend picker and the Friends
+ * lobby). Otherwise (the old launcher bridge) it stays a search by connect code. */
+static int split_friends(void)
+{
+    return split_layout() && !slippi_submenu && (yg_flags & YG_FRIENDS_FLOW) != 0;
+}
+/* The cursor is on the row that opens YouGame's friend flow: the app's Friends row, or the launcher's
+ * under split_friends(). */
+static int on_friends_row(int sel)
+{
+    return mu_slippi_menu_option(sel) == MU_SLP_OPT_FRIENDS && (!split_layout() || split_friends());
+}
 /* The two pages (mu_online_pages.inc, included at the end of this file); slippi_submenu is the page. */
 static int pages(void);
 static int pages_start(void);
@@ -414,6 +432,20 @@ static int yougame_query(int pick, char* out, unsigned int cap)
         out[n] = 0;
     }
     return r[0];
+}
+
+/* Leaving the Online menu (Back to 1-P Mode, or into a character select) after a YouGame row asked for
+ * YouGame: the host closes YouGame's small window if it is still up from that ask (EF 0x21). Its
+ * window is topmost and the game keeps reading the pads, so without this it stayed drawn over every
+ * menu the player backed into. Choosing in the window (Play offline, Get YouGame) works as before. */
+static void yougame_ask_withdraw(void)
+{
+    if (!yg_asked) {
+        return;
+    }
+    yg_asked = 0;
+    yg_wait_slot = -1;
+    yougame_query(0x21, NULL, 0);
 }
 
 int mu_slippi_ranked_available(void) { return ranked_supported; }
@@ -909,9 +941,10 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     if (previous_mode == GM_HANYU_CSS) {
         mu_content_mode(-1);   /* back from online: the offline view again */
         *menu_kind = MENU_KIND_8;
-        if (ranked_supported && from_friends_online) {
+        if ((ranked_supported || (split_layout() && (yg_flags & YG_FRIENDS_FLOW))) && from_friends_online) {
             /* Friends runs in Direct mode: back on Online with Friends highlighted, not the Slippi
-             * submenu (and, one B later, the hidden Slippi row). */
+             * submenu (and, one B later, the hidden Slippi row). Under the launcher too, for a friend
+             * room joined over the local channel (an invite accepted there). */
             OSReport("friends: left the friend room's character select; online menu on Friends\n");
             slippi_submenu = 0;
             mu_mnmain_install_online_menu();
@@ -1095,7 +1128,9 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     MenuExitData* data;
     int auto_direct = 0;
     int selected_row, selected_option, steps;
-    int friends_visible = ranked_supported && !slippi_submenu;
+    /* The app's Friends row, or the launcher's over the local channel (split_friends). */
+    int friends_visible = (ranked_supported && !slippi_submenu) || split_friends();
+    int split_friends_press = 0;   /* the launcher's Friends row was confirmed this frame (E6 17 below) */
     /* The Doubles row and its home are on YouGame's page in both layouts: the app's, and the launcher's
      * (the home's tickets then come through the launcher's bridge). */
     const int doubles_visible = pages() && !slippi_submenu;
@@ -1125,6 +1160,19 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
                 auto_slot = yg_wait_slot;
                 yg_wait_slot = -1;
                 OSReport("online menu: YouGame is connected; continuing into row %d\n", auto_slot);
+            }
+        }
+    } else if (mn_804A04F0.cur_menu == MENU_KIND_8 && split_layout() &&
+               !(yg_flags & (YG_ROWS_OPEN | YG_COMING_SOON))) {
+        /* The menu opened before YouGame knew the player (its first answer can come a second after the
+         * launcher's restart): look again about once a second and open the rows as soon as it does,
+         * rather than only on the next visit to this menu. */
+        if (++yg_closed_frames % 60u == 0) {
+            int flags = yougame_query(-1, NULL, 0);
+            if (flags & YG_ROWS_OPEN) {
+                yg_flags = flags;
+                yg_open |= flags & (YG_OPEN_RANKED | YG_OPEN_DIRECT);
+                OSReport("online menu: YouGame is connected; its rows open\n");
             }
         }
     }
@@ -1226,7 +1274,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
      * "Play a friend": Y on the Squad Strike row (A searches online). Squad Strike goes with the
      * Friends row, which opens the friend picker as its own press does; the friend room then plays
      * Squad Strike, and the friend's game joins it. Mapped GameCube Y only, like the Slippi notice. */
-    if (friends_visible && accepts_input && mn_804A04F0.cur_menu == MENU_KIND_8 &&
+    if (ranked_supported && friends_visible && accepts_input && mn_804A04F0.cur_menu == MENU_KIND_8 &&
         mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SQUAD &&
         !(buttons & (MenuInput_Confirm | MenuInput_Back | MenuInput_Up | MenuInput_Down)))
     {
@@ -1285,12 +1333,24 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxForward();
 #endif
     } else if ((buttons & MenuInput_Confirm) && friends_visible &&
-        mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)
+        on_friends_row(mn_804A04F0.hovered_selection))
     {
         /* A and START both confirm Friends. The host keeps the menu here until the
          * picker returns; still apply the ordinary confirm cooldown. */
         mn_804D6BC8.cooldown = 5;
         friends_confirm_hold = 1;
+        if (split_layout()) {
+            /* Over the local channel: a YouGame row (the host's launcher session), the cursor comes back
+             * here, and the host is asked for the friend flow below, after this frame's publish. The app
+             * opens it from the pad press instead; a confirm the menu made itself (auto_slot) has none. */
+            yg_pick = 1;
+            pages_last_option = MU_SLP_OPT_FRIENDS;
+            pages_last_page = 0;
+            yougame_query(yg_pick, NULL, 0);
+            split_friends_press = 1;
+            sfxForward();
+            OSReport("online menu: Friends (YouGame) confirmed; asking for YouGame's friend flow\n");
+        }
     } else if ((buttons & MenuInput_Confirm) && ranked_supported &&
                mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SLIPPI) {
         slippi_submenu = 1;
@@ -1315,10 +1375,22 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         OSReport("online menu: Slippi is not signed in; opening its %s\n", slp.app_state == MU_SLP_APP_UPDATE ? "update" : "log in");
     } else if ((buttons & MenuInput_Confirm) && split_layout() && !pick_slippi() && !yougame_soon() &&
                !(yg_flags & YG_ROWS_OPEN)) {
-        mn_804D6BC8.cooldown = 5;
-        sfxBack();
-        pages_notice_show("Sign in to YouGame to play online.");
-        OSReport("online menu: row %d refused: YouGame is not signed in\n", mn_804A04F0.hovered_selection);
+        /* The launcher is not signed in to YouGame: the host asks it to open its own Connect window (EF 0x22),
+         * and the menu waits on the row as after 0x20, going on into it once the rows open. 0: no launcher to
+         * ask (the row stays refused). */
+        if (yougame_query(0x22, NULL, 0) == 1) {
+            yg_wait_slot = mn_804A04F0.hovered_selection;
+            yg_wait_frames = 0;
+            mn_804D6BC8.cooldown = 30;
+            sfxForward();
+            pages_notice_show("Sign in to YouGame in the new window.");
+            OSReport("online menu: row %d: YouGame is not signed in; opening the launcher's Connect\n", yg_wait_slot);
+        } else {
+            mn_804D6BC8.cooldown = 5;
+            sfxBack();
+            pages_notice_show("Connect YouGame in the launcher first.");
+            OSReport("online menu: row %d refused: YouGame is not signed in\n", mn_804A04F0.hovered_selection);
+        }
 #ifdef MELEE_DOUBLES
     } else if ((buttons & MenuInput_Confirm) && split_layout() && !slippi_submenu && !yougame_soon() &&
                selected_option == MU_SLP_OPT_DOUBLES) {
@@ -1341,6 +1413,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
          * and continues into it once YouGame is connected and the rows open. */
         yg_wait_slot = mn_804A04F0.hovered_selection;
         yg_wait_frames = 0;
+        yg_asked = 1;
         yougame_query(0x20, NULL, 0);
         mn_804D6BC8.cooldown = 30;
         sfxForward();
@@ -1404,6 +1477,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
              * the player uses it there (mu_content.c). Asked before the online major loads. */
             mu_content_mode(slp.mode);
             sfxForward();
+            yougame_ask_withdraw();
             data = gm_GetCurrentSceneExitData();
             data->pending_mode = GM_HANYU_CSS;
             gm_801A4B60();
@@ -1438,6 +1512,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxBack();
         mn_804A04F0.entering_menu = 0;
         mn_80229894(MENU_KIND_1P, SEL_1P_2, 3);
+        yougame_ask_withdraw();
     } else if (buttons & MenuInput_Up) {
         steps = mu_slippi_menu_count();
         direction = PAD_ANY_UP;
@@ -1484,8 +1559,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     {
         /* The entry cooldown still hides the row's selection (a press carried in from the main
          * menu must not open the picker); only the cooldown after a Friends confirm keeps it. */
-        const int friends_hovered =
-            mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS;
+        const int friends_hovered = on_friends_row(mn_804A04F0.hovered_selection);
         u8 friends_menu;
         /* Released on the first frame that takes input with no cooldown pending (not the confirm
          * frame itself, which sets the cooldown above), so there is no frame without selection. */
@@ -1496,6 +1570,11 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         /* Track Online even with the Friends row hidden; bit 2 is status-area visibility. */
         if (online_visible) friends_menu |= 4;
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
+        if (split_friends_press) {
+            /* After the publish, so the host already sees Friends selected (slippi_online.cpp, E6 17). */
+            u8 press = 17;
+            mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &press, 1, NULL, 0, NULL);
+        }
 #if MU_SQUAD
         /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
         if (gmSquad_OnlineFriend() && (!friends_visible || !friends_hovered)) {

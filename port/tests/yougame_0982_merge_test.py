@@ -32,7 +32,8 @@ class YouGame0982MergeTest(unittest.TestCase):
             self.assertIn('lower.find("' + name + '") != std::string::npos', warning)
         self.assertIn('host::log("opengl: WARNING software rendering', warning)
         # 122.28: the automation gate also skips the box inside the YouGame app's player box.
-        self.assertRegex(warning, r"if \(!host::options.no_gc_adapter && !host::window_embedded\(\)\)[^\n]*\n\s*"
+        # PR #85: the Linux build calls it through mu_window_embedded() (false on the Mac app).
+        self.assertRegex(warning, r"if \(!host::options.no_gc_adapter && !mu_window_embedded\(\)\)[^\n]*\n\s*"
                                  r"SDL_ShowSimpleMessageBox\(SDL_MESSAGEBOX_WARNING,")
 
     def test_embedding_keeps_platform_specific_frame_callbacks(self):
