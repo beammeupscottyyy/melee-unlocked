@@ -279,6 +279,7 @@ void load_language() {
   launcher::lang::set_language(code, {widen(g_dir + "\\lang")});
 }
 bool source_available();   // below: the Source Port is installed beside the launcher
+bool recomp_available();   // below: the Static Recomp is there to start
 
 void load_ini() {
   {
@@ -328,6 +329,9 @@ void load_ini() {
   std::string root = repo_root();
   if (g_iso.empty() && !root.empty() && file_exists(root + "\\melee.iso")) g_iso = root + "\\melee.iso";
   if (!g_iso.empty() && !file_exists(g_iso)) g_iso.clear();
+  // A package without the Static Recomp (YouGame's builds ship only the Source Port) could not start it:
+  // the Source Port is picked, whatever an older launcher.ini with no engine line kept.
+  if (g_engine == ENGINE_LEGACY && !recomp_available() && source_available()) g_engine = ENGINE_SOURCE;
 }
 void save_ini() {
   {
@@ -468,6 +472,11 @@ std::string source_exe_dir() {
   return launcher::source_exe_dir(in);
 }
 bool source_available() { return !source_exe_dir().empty(); }
+// melee_port.exe (or its compatibility build) in the game folder, or a source checkout that builds it.
+bool recomp_available() {
+  return file_exists(active_dir() + "\\melee_port.exe") || file_exists(active_dir() + "\\melee_port_compat.exe") ||
+         !repo_root().empty();
+}
 
 // A processor without AVX2 (or the compatibility build picked by hand) gets the _compat programs.
 bool wants_compat_build() { return g_cpu_build == CPU_COMPAT || (g_cpu_build == CPU_AUTO && !cpu_has_avx2()); }
@@ -730,7 +739,8 @@ int build_seg_at(POINT p) {
 #endif
   for (int i = 0; i < kBuildSegments; ++i) {
     RECT r = build_seg_rect(i);
-    if (PtInRect(&r, p)) return (i != 1 && !source_available()) || (i == 2 && !vanilla_supported()) ? -1 : i;
+    if (PtInRect(&r, p))
+      return (i != 1 && !source_available()) || (i == 1 && !recomp_available()) || (i == 2 && !vanilla_supported()) ? -1 : i;
   }
   return -1;
 }
@@ -1070,12 +1080,14 @@ void paint_play(HDC dc) {
     const bool installed = source_available();
     const int on = g_engine == ENGINE_SOURCE && installed ? (g_vanilla.vanilla && vanilla_supported() ? 2 : 0) : 1;
     const std::wstring vanilla_name = launcher::lang::txw(L"Vanilla");
-    const wchar_t* names[kBuildSegments] = {installed ? L"Source Port (Beta)" : L"Source Port (not installed)", L"Static Recomp (Legacy)", vanilla_name.c_str()};
+    const bool recomp = recomp_available();
+    const wchar_t* names[kBuildSegments] = {installed ? L"Source Port" : L"Source Port (not installed)",
+                                            recomp ? L"Static Recomp (Legacy)" : L"Static Recomp (not installed)", vanilla_name.c_str()};
     for (int i = 0; i < kBuildSegments; ++i) {
       const RECT r = build_seg_rect(i);
       COLORREF top = C_BTN, bot = C_BTN, border = C_BTN_BORDER, text = C_DIM;
       if (i == on) { top = C_ACC_HI; bot = C_ACC_LO; border = NO_FILL; text = C_PLAY_TEXT; }
-      else if ((i != 1 && !installed) || (i == 2 && !vanilla_supported())) { top = bot = RGB(0x1A, 0x21, 0x32); border = RGB(0x28, 0x31, 0x47); text = RGB(0x5C, 0x68, 0x7E); }
+      else if ((i != 1 && !installed) || (i == 1 && !recomp) || (i == 2 && !vanilla_supported())) { top = bot = RGB(0x1A, 0x21, 0x32); border = RGB(0x28, 0x31, 0x47); text = RGB(0x5C, 0x68, 0x7E); }
       round_rect(dc, r, 7, top, bot, border);
       draw_text(dc, names[i], r, g_font_small, text, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1941,11 +1953,35 @@ void launch_game_now() {
   // and match state, pause): MELEE_YOUGAME_EXTENSION=1 with MELEE_YOUGAME_MATCH_BRIDGE=1 and the bridge
   // (yougame_link.cpp routed_to_bridge). The app is started quietly (tray, no window) when installed and not
   // running; closed or gone mid-session, the game goes on through the bridge. Unticked: no app, no channel.
-  // Owner 11-20: the extension is only the game's own YouGame button (top left) and its menu; the launcher never
-  // starts the YouGame app for it. The app opens only from Open YouGame (or the player's own start).
+  // Owner 11-21: "Launch with YouGame extension" works whether the YouGame app is open or not, and never opens the
+  // whole app. The button and Shift+Tab menu are the app's, over the game: when the app is installed and not running,
+  // it is started in the background with its own tray link (tray icon only, no window), on a worker so the game
+  // starts at once; the game reaches its channel when it comes up. Matches stay on the launcher's bridge either way.
+  // The app's window opens only from Open YouGame (or the player's own start).
   const bool hybrid = !vanilla_active() && launcher::yougame::extension();
-  const std::string app_channel = hybrid ? yougame_app_channel() : std::string();   // for the log line only
+  // The extension needs this launcher's YouGame app (production since 0.9.993). Without it (only YouGame Staging
+  // on the computer, player report 11-21) the player is told once a session and offered the download page; the
+  // other environment's running app is never taken for it (it used to count as "running" and nothing happened).
+  const std::string app_missing = hybrid ? launcher::yougame::extension_app_missing() : std::string();
+  const std::string app_channel = hybrid && app_missing.empty() && launcher::yougame::app_running() ? yougame_app_channel() : std::string();   // for the log line only
+  if (!app_missing.empty()) {
+    log_line("yougame: extension: %s", app_missing.substr(0, app_missing.find('\n')).c_str());
+    static bool told = false;
+    if (!told && !std::getenv("MELEE_LAUNCHER_TEST")) {
+      told = true;
+      if (MessageBoxW(g_main, widen(app_missing).c_str(), L"YouGame extension", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+        ShellExecuteW(nullptr, L"open", widen(launcher::yougame::open_target()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+  }
+  if (hybrid && app_missing.empty() && app_channel.empty())
+    std::thread([] {
+      std::string detail;
+      launcher::yougame::start_app_quietly(&detail);
+      log_line("yougame: extension: %s", detail.c_str());
+    }).detach();
   SetEnvironmentVariableW(L"MELEE_YOUGAME_EXTENSION", hybrid ? L"1" : nullptr);
+  // The game's Friends row waits for the app's channel (YouGame's friend flow) only when the app is there to come up.
+  SetEnvironmentVariableW(L"MELEE_YOUGAME_APP_EXPECTED", hybrid && launcher::yougame::app_expected() ? L"1" : nullptr);
   SetEnvironmentVariableW(L"MELEE_YOUGAME_POOL", nullptr);   // the bridge's hello names the rooms (pool) now
 #ifdef MELEE_YOUGAME_COMING_SOON
   const std::string yougame_bridge;   // YouGame is not open yet: the game gets no bridge
@@ -1956,7 +1992,7 @@ void launch_game_now() {
   const std::string yougame_bridge = vanilla_active() ? std::string() : launcher::yougame::bridge_url();
   const std::string yougame_decision = vanilla_active() ? std::string()
       : hybrid ? "YouGame: the game uses the launcher's bridge for matches and the YouGame app's channel for the extension (" +
-                     (app_channel.empty() ? std::string("the app is not running; it is not started for the extension") : "the " + app_channel + " app is running") + ")."
+                     (app_channel.empty() ? std::string("the app is not running; it is started in the background (tray, no window) when installed") : "the " + app_channel + " app is running") + ")."
       : std::string("YouGame: the game uses the launcher's bridge (extension off: no YouGame app).");
 #endif
   if (!yougame_decision.empty()) log_line("%s", yougame_decision.c_str());
@@ -2039,6 +2075,20 @@ void browse() {
       mod_manager::open(); std::thread(mod_manager::install_file, std::wstring(file), std::string(), g_iso).detach(); return;
     }
     if (mod_manager::hash_file(file, BCRYPT_MD5_ALGORITHM) != mod_manager::kVanillaMd5) {
+      // Not the vanilla disc. Only a Melee NTSC 1.02 disc can be a mod; anything else (another game, NTSC 1.00 or
+      // 1.01, PAL, a trimmed image) used to be filed under Mods too, where it loaded nothing and the player was
+      // told nothing (player report 11-21: "whenever I browse for an ISO it just goes to the mods tab").
+      std::string why;
+      if (!verify_iso(narrow(file), &why)) {
+        MessageBoxW(g_main, widen("This disc can't be used: " + why + ".\n\nMelee Unlocked needs your Melee NTSC 1.02 ISO "
+                                  "(a full, unmodified disc image). Press Browse and pick that file.").c_str(),
+                    L"Melee Unlocked Launcher", MB_ICONINFORMATION);
+        return;
+      }
+      if (g_iso.empty())
+        MessageBoxW(g_main, L"This is a modded Melee disc, so it goes into Mods.\n\nTo play, Melee Unlocked also needs your "
+                    L"unmodified Melee NTSC 1.02 ISO: press Browse on the Play page and pick it.",
+                    L"Melee Unlocked Launcher", MB_ICONINFORMATION);
       mod_manager::open(); std::thread(mod_manager::install_file, std::wstring(file), std::string(), g_iso).detach();
     } else { set_iso(narrow(file)); save_ini(); }
   }

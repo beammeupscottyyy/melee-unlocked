@@ -2369,6 +2369,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "exclusivefullscreen") options.exclusive_fullscreen = value == "1";
       else if (key == "vsync") { options.vsync = value == "1"; vsync_seen = true; }
       else if (key == "vsyncchoice") vsync_choice_seen = value == "1";
+      else if (key == "vrrfound") options.vrr_found = value == "1";
       else if (key == "vsync_yougame") saved_vsync_yougame = value == "1";
       else if (key == "widescreen") options.widescreen = value == "1";
       else if (key == "fodreflections") options.fod_reflections = value != "0";
@@ -2762,6 +2763,10 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // Every save before this wrote "vsync 1" for players who never touched it, so only "vsync 0" (the
   // default was on) or the new "vsyncchoice 1" is a choice. Inside the YouGame app its own keys decide.
   options.vsync_auto = !g_display_keys.yougame && !vsync_choice_seen && (!vsync_seen || options.vsync);
+  if (options.vsync_auto) {
+    options.vsync = false;
+    host::log("present: vsync off from the start (automatic)");
+  }
   options.show_fps = yougame::display_defaults::show_fps(g_display_keys.yougame, options.show_fps, saved_showfps_yougame);
   if (g_display_keys.yougame)
     host::log("settings: vsync %s%s, fps counter %s (%s)", options.vsync ? "on" : "off",
@@ -5080,6 +5085,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nexclusivefullscreen " << options.exclusive_fullscreen
        << "\nvsync " << (g_display_keys.own_vsync ? g_display_keys.vsync : (options.vsync || options.vsync_auto))
        << (options.vsync_auto ? "" : "\nvsyncchoice 1")
+       << (options.vrr_found ? "\nvrrfound 1" : "")
        << (g_display_keys.own_vsync ? std::string("\nvsync_yougame ") + (options.vsync ? "1" : "0")
            : g_display_keys.saved_vsync_yougame >= 0 ? "\nvsync_yougame " + std::to_string(g_display_keys.saved_vsync_yougame) : std::string())
        << "\nwidescreen " << options.widescreen
@@ -6306,10 +6312,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // Ctrl+F2 (F2 alone was hit by accident next to F1, and writing 90 frames to disk drops the game
   // to about 20 frames a second while it runs).
   if (ImGui::IsKeyPressed(ImGuiKey_F2, false) && ImGui::GetIO().KeyCtrl) { request_frame_capture(90); host::log("capture: Ctrl+F2, writing the next 90 presented frames into capture\\"); }
-  // F3: Lab view on or off. Marked dirty, so it is saved with the other settings the next time the
+  // Ctrl+F3: Lab view on or off (F3 alone turned it on by accident and it stayed on: player report 11-21, as
+  // F2 did for captures above). Marked dirty, so it is saved with the other settings the next time the
   // panel is open (the panel is what writes the settings file).
   // Both engines feed it: the Static Recomp its Slippi frame data, the Source Port a geometry snapshot.
-  if (kLabViewAvailable && ImGui::IsKeyPressed(ImGuiKey_F3, false)) { options.lab_view = !options.lab_view; state.dirty = true; host::log("lab view: %s", options.lab_view ? "on" : "off"); }
+  if (kLabViewAvailable && ImGui::IsKeyPressed(ImGuiKey_F3, false) && ImGui::GetIO().KeyCtrl) { options.lab_view = !options.lab_view; state.dirty = true; host::log("lab view: %s", options.lab_view ? "on" : "off"); }
   // Drawn first, on the background list, so every overlay and window below lands on top of it.
   // Called every frame, off or on, so lab::covering() always describes this frame.
   // An arena room's match window shows the match its own way (host::options.spectate_view, chosen at
@@ -6363,10 +6370,18 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (options.vsync_auto) {   // not chosen: off with G-Sync or FreeSync, on otherwise (on while unknown)
     static const bool assume_vrr = [] { const char* v = std::getenv("MELEE_ASSUME_VRR"); return v && *v == '1'; }();   // tests only
     const int vrr = assume_vrr ? 1 : RenderOptions::live_variable_refresh().load(std::memory_order_relaxed);
-    const bool want = vrr != 1;
+    // Not known yet (the first seconds of a launch): what the last session found stands.
+    // Off on every display since 1.0 (owner, 11-21): V-Sync's wait was the largest single part of the
+    // delay a fresh install had (a menu press: 23.8 ms with it, 14.4 without, on a 200 Hz screen). A
+    // fixed-refresh screen can tear; the V-Sync toggle is the player's choice and ends this rule.
+    const bool want = false;
     if (options.vsync != want) {
       options.vsync = want;
-      host::log("present: vsync %s (automatic: %s)", want ? "on" : "off", vrr == 1 ? "G-Sync or FreeSync found" : "fixed refresh");
+      host::log("present: vsync off (automatic; %s)", vrr == 1 ? "G-Sync or FreeSync found" : vrr == 0 ? "fixed refresh, frames can tear" : "display not judged yet");
+    }
+    if (vrr >= 0 && options.vrr_found != (vrr == 1)) {   // remembered for the next launch
+      options.vrr_found = vrr == 1;
+      state.saved = write_settings_file(state, options);
     }
   }
   {   // the picture's shape as drawn (4:3 with bars, or wider): the room's small window goes in the bar
@@ -7673,7 +7688,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       // The Lab view's own switch, beside the looks it belongs with (owner 11-20; it was under Overlays).
 #ifndef MELEE_NO_SLIPPI   // the Lab view is the Static Recomp's: no switch for it in the build without that engine
     if (kLabViewAvailable) {
-    changed |= settings_toggle("Lab view (F3)", &options.lab_view);
+    changed |= settings_toggle("Lab view (Ctrl+F3)", &options.lab_view);
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("Draws matches the way Slippi Lab draws replays: flat character silhouettes\n"
                         "on a plain stage, over the game image. Display only, so it is safe online;\n"
@@ -9724,7 +9739,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               {0x400u, "Spoof controller plugins", "Character select treats every port as having a controller.", false},
               {0x1000u, "Collision bubbles",
                kLabViewAvailable ? "Shows hitboxes and hurtboxes in matches, drawn inside the match itself.\n"
-                                   "The Lab view (F3, Overlays) is a different tool: its own camera and flat silhouettes."
+                                   "The Lab view (Ctrl+F3, Overlays) is a different tool: its own camera and flat silhouettes."
                                  : "Shows hitboxes and hurtboxes in matches, drawn inside the match itself.", false},
               {0x2000u, "Input display", "An input display for matches and replays.\n"
                                          "The same setting as the Controller overlay (Overlays): switching one switches\n"
@@ -11871,7 +11886,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::SetTooltip("While the Lab view is showing, the game's own 3D scene is not drawn at all,\n"
                             "since it would be covered anyway. Much lighter on the graphics card, so a\n"
                             "weak laptop runs smoother. The game itself runs exactly the same.%s",
-                            options.lab_view ? "" : "\nTurn on Lab view (F3) above to use it.");
+                            options.lab_view ? "" : "\nTurn on Lab view (Ctrl+F3) above to use it.");
       }
 #endif
     }

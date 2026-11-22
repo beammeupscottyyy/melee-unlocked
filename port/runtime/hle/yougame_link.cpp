@@ -271,6 +271,9 @@ const bool kNoApp = [] { const char* v = std::getenv("MELEE_YOUGAME_EXTENSION");
 #else
 const bool kNoApp = false;
 #endif
+// The launcher found the extension's app running or installed (MELEE_YOUGAME_APP_EXPECTED=1): its channel is
+// expected, so the Friends row waits for it (extension_waiting) rather than opening the connect-code search.
+const bool kAppExpected = [] { const char* v = std::getenv("MELEE_YOUGAME_APP_EXPECTED"); return v && v[0] == '1'; }();
 std::atomic<bool> g_channel_allowed{false};          // start(): nothing started this game
 std::mutex g_channel_mutex;
 std::shared_ptr<channel::Connection> g_channel;      // g_channel_mutex; set while probing and while up
@@ -319,6 +322,16 @@ bool g_match_bridge = false;
 // said App, decided on every fetch_identity): the match requests go over the app's channel with the app's sign-in,
 // as for a game the player started, instead of a refusal. Cleared when the channel closes.
 std::atomic<bool> g_app_sign_in{false};
+bool g_hybrid_env = false;                      // started with MELEE_YOUGAME_MATCH_BRIDGE=1 (put back for a restart)
+// A restart (a setting the device cannot adopt, a lost graphics device, a mod's looks) starts a new copy
+// from this process's environment, which start() emptied: the launcher's bridge goes back in for it, so
+// the new copy is signed in like this one. The launcher keeps its last few launch tokens, so this one
+// still answers.
+void restore_bridge_for_restart() {
+  _putenv_s("YOUGAME_BRIDGE", g_bridge_url.c_str());
+  _putenv_s("YOUGAME_TOKEN", g_bridge_token.c_str());
+  _putenv_s(g_hybrid_env ? "MELEE_YOUGAME_MATCH_BRIDGE" : "MELEE_YOUGAME_LAUNCHER", "1");
+}
 bool routed_to_bridge(const json& body) {
   return g_match_bridge && channel::to_launcher_bridge(body.is_object() ? body.value("type", std::string()) : std::string(),
                                                        g_channel_up.load(), g_app_sign_in.load());
@@ -1064,7 +1077,22 @@ class Socket {
   uint64_t agent_test_first_open_at() const { return broker_ ? broker_->agent_test_first_open_at() : 0; }
   void agent_test_drop_room() { if (broker_) broker_->agent_test_drop_room(); }
 #endif
+  // A first connection right after the game starts (or the PC wakes) can find name lookups not ready yet:
+  // WinHTTP 12007 (name not resolved) or 12029 (cannot connect) on the first search, where a second try a
+  // moment later works. One more try after a second, only for those two, before the player is told.
   bool open(const std::string& address, std::string* error, int timeout, const std::function<bool()>& cancelled) {
+    if (open_once(address, error, timeout, cancelled)) return true;
+    constexpr DWORD kNameNotResolved = 12007, kCannotConnect = 12029;   // ERROR_WINHTTP_*; the Linux shim has no names for them
+    if (last_net_error_ != kNameNotResolved && last_net_error_ != kCannotConnect) return false;
+    for (int waited = 0; waited < 1000; waited += 50) {
+      if (cancelled && cancelled()) return false;
+      Sleep(50);
+    }
+    host::log("yougame: socket open: trying once more after WinHTTP %lu", (unsigned long)last_net_error_);
+    return open_once(address, error, timeout, cancelled);
+  }
+  bool open_once(const std::string& address, std::string* error, int timeout, const std::function<bool()>& cancelled) {
+    last_net_error_ = 0;
     // The Unranked queue reopens on the same Socket after a drop: end the old connection and join its
     // reader first. A new std::thread assigned over a joinable one calls std::terminate, which closed
     // the game with "the game stopped itself (abort)" on the first 1006 drop of a search (121.1, 11-17).
@@ -1076,7 +1104,8 @@ class Socket {
     }
     HINTERNET conn = WinHttpConnect(http_session(), u.host.c_str(), u.port, 0);
     if (!conn) {
-      host::log("yougame: socket open failed: at=%s step=connect error=%lu", address.substr(0, address.find('?')).c_str(), (unsigned long)GetLastError());
+      last_net_error_ = GetLastError();
+      host::log("yougame: socket open failed: at=%s step=connect error=%lu", address.substr(0, address.find('?')).c_str(), (unsigned long)last_net_error_);
       *error = "Could not reach YouGame";
       return false;
     }
@@ -1102,6 +1131,7 @@ class Socket {
                 status == 101;
       if (ok) ws_ = WinHttpWebSocketCompleteUpgrade(req, 0);
       if (ok && !ws_ && !step) { step = "complete upgrade"; step_error = GetLastError(); }
+      if (!ws_ && !status) last_net_error_ = step_error;
       if (!ws_ && !(cancelled && cancelled()))
         host::log("yougame: socket open failed: at=%s step=%s error=%lu status=%lu", address.substr(0, address.find('?')).c_str(),
                   step ? step : "status", (unsigned long)step_error, (unsigned long)status);
@@ -1220,6 +1250,7 @@ class Socket {
     cv_.notify_all();
   }
   std::unique_ptr<transport::Stream> broker_;
+  DWORD last_net_error_ = 0;            // own socket: the WinHTTP error of the last failed open with no HTTP status
   std::atomic<int> close_code_{1006};   // own socket: the room's close code, 1006 when the connection just dropped
   std::atomic<bool> stopping_{false};   // our own close(): its receive error is not a drop
   std::atomic<uint64_t> heard_at_{0}, relay_heard_at_{0};
@@ -1744,6 +1775,14 @@ transport::RoomIO room_io(Room& r) {
     const bool none = m.count("void") && m["void"].is_boolean() && m["void"].get<bool>();
     host::log("yougame: ranked set result: %s, %s", ranked::str(m, "disposition").c_str(),
               none ? "no winner" : won ? "this player won" : "the opponent won");
+    // Whether YouGame rated the set, and its reason when it did not ("Room marked this set unrated" on screen
+    // for any reason but pack or void): the player report 11-21 had three unrated sets and no reason anywhere.
+    if (m.count("ratingDisposition") && m["ratingDisposition"].is_object()) {
+      const json& d = m["ratingDisposition"];
+      const bool rated = d.count("rated") && d["rated"].is_boolean() && d["rated"].get<bool>();
+      host::log("yougame: ranked set %s%s%s", rated ? "rated" : "unrated by the room",
+                rated ? "" : ", reason ", rated ? "" : ranked::log_text(ranked::str(d, "reason"), 48).c_str());
+    }
     if (g_rank.result(m, r.set.local_participant())) host::log("yougame: ranked standing: %s", g_rank.header().c_str());
     // No standing in the final (unrated, or no ratings for this seat): the CSS read it before the room
     // recorded the set, so the rank line reads it again now.
@@ -3252,6 +3291,8 @@ void start() {
   slippi_linking::presentation.enabled = take("YOUGAME_SLIPPI_LINKABLE") == "1";
   g_launcher = take("MELEE_YOUGAME_LAUNCHER") == "1" && !g_stdio;
   take("MELEE_YOUGAME_MATCH_BRIDGE");
+  g_hybrid_env = hybrid;
+  if (!g_stdio && !g_bridge_url.empty() && !g_bridge_token.empty()) host::set_before_restart(restore_bridge_for_restart);
   // The hybrid with the channel allowed; without it (no extension) it is the launcher's bridge alone.
   g_match_bridge = hybrid && !g_stdio && g_channel_allowed && !g_bridge_url.empty() && !g_bridge_token.empty();
   if (hybrid && !g_stdio && !g_match_bridge && !g_bridge_url.empty()) g_launcher = true;
@@ -3607,6 +3648,7 @@ bool coming_soon_build() {
 bool available() { return active() || launcher(); }
 bool session() { return active() || (launcher() && g_launcher_session.load()); }
 bool friends_flow() { return active() || (launcher() && g_channel_up.load()); }
+bool extension_waiting() { return kAppExpected && !kNoApp && g_match_bridge && g_channel_allowed.load() && !g_channel_up.load(); }
 std::string build_version() {
 #ifdef MELEE_PORT_VERSION
   return MELEE_PORT_VERSION;

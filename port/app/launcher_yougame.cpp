@@ -567,6 +567,12 @@ void warm() {
   }).detach();
 }
 
+bool app_expected() {
+  bool staging;
+  { std::lock_guard<std::mutex> lock(g_mutex); staging = g_env.id == "staging"; }
+  return app::running(staging) || app::installed(staging);
+}
+
 bool start_app_quietly(std::string* detail) {
   auto say = [&](const std::string& s) { if (detail) *detail = s; };
   if (std::getenv("MELEE_LAUNCHER_TEST") && !std::getenv("MELEE_LAUNCHER_TEST_YOUGAME_APP")) { say("test run: the YouGame app is not started"); return false; }
@@ -580,6 +586,29 @@ bool start_app_quietly(std::string* detail) {
   const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
   say("the " + name + " app was started quietly (tray); its channel " + (up ? "came up after " : "did not come up in ") + std::to_string(ms) + " ms");
   return up;
+}
+
+// This launcher's YouGame app is running (its channel's pipe is there); never the other environment's.
+bool app_running() {
+  bool staging;
+  { std::lock_guard<std::mutex> lock(g_mutex); staging = g_env.id == "staging"; }
+  return app::running(staging);
+}
+
+// The extension's app for this launcher's YouGame is neither installed nor running: what the launcher tells the
+// player (empty when the app is there). Player report 11-21: a computer with only the YouGame Staging app got no
+// extension and no word why; since 0.9.993 the launcher and game use YouGame (production) only, so the other
+// environment's app is never used for the extension.
+std::string extension_app_missing() {
+  bool staging;
+  { std::lock_guard<std::mutex> lock(g_mutex); staging = g_env.id == "staging"; }
+  if (app::installed(staging) || app::running(staging)) return {};
+  const std::string name = staging ? "YouGame Staging" : "YouGame";
+  const bool other = app::installed(!staging) || app::running(!staging);
+  return "Launch with YouGame extension needs the " + name + " app" +
+         (other ? std::string(". This computer has only ") + (staging ? "YouGame" : "YouGame Staging") + ", which this version does not use."
+                : ", which is not installed.") +
+         " YouGame matches work without it.\n\nOpen the page where the " + name + " app downloads?";
 }
 
 bool app_declined() { std::lock_guard<std::mutex> lock(g_mutex); return g_app_choice == 0; }

@@ -116,7 +116,7 @@ struct RenderOptions {
   // hidden (H shows it). For tournament VODs and clips. The game's own HUD and the chosen look stay.
   bool clean_replays = false;
   // Lab view: draw matches as Slippi Lab draws replays (flat silhouettes on a plain stage) over
-  // the game image. Display only, so it is safe online. F3 toggles it. See lab_view.h.
+  // the game image. Display only, so it is safe online. Ctrl+F3 toggles it. See lab_view.h.
   bool lab_view = false;
   // While the Lab view covers the window, skip replaying the game's own draws: the scene would be
   // drawn only to be painted over. Saves the GPU (and draw submission) its whole frame in a match.
@@ -421,6 +421,10 @@ struct RenderOptions {
   // The player never chose V-Sync (no "vsyncchoice 1" in the file): off once the display is found to
   // run G-Sync or FreeSync (frames are held under its refresh, so nothing tears), on otherwise.
   bool vsync_auto = false;
+  // The last session found G-Sync or FreeSync ("vrrfound 1" in the file). With vsync_auto this launch
+  // then starts with V-Sync off instead of on: finding it again takes several seconds of every launch,
+  // and those seconds ran with V-Sync's delay. A display found to be fixed turns it back on.
+  bool vrr_found = false;
   // The display's variable refresh as the frame pacer last detected it: 1 on, 0 off, -1 not known yet.
   static std::atomic<int>& live_variable_refresh() { static std::atomic<int> value{-1}; return value; }
   bool widescreen = false;    // Slippi Widescreen 16:9 code on (present at 16:9 and tell the game)

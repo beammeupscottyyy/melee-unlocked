@@ -124,6 +124,9 @@ void set_launcher_session(bool yougame);
 // in the app (active()); for a game started on its own, while the local channel to a running YouGame app
 // is up (launcher() with channel_connected()). The old launcher bridge keeps the code search.
 bool friends_flow();
+// "Launch with YouGame extension" with the YouGame app there but its channel not up yet (the launcher starts the
+// app in the background): the Friends row waits for it, then opens YouGame's friend flow.
+bool extension_waiting();
 // The online menu's page for the last pick (game: CMD_YOUGAME_MENU's 1-byte pick): 0 Slippi, 1 YouGame,
 // 2 Unranked on both (YouGame and Slippi); -1 before any pick. Read by the app's routing.
 void set_menu_service(int service);

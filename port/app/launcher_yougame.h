@@ -55,6 +55,13 @@ bool app_used_before();
 // tray link, no window) when it is not running, so the game can reach its channel for the extension's features.
 // Blocking up to ~25 s: never on the window thread. True when its channel is there; *detail says what happened.
 bool start_app_quietly(std::string* detail);
+// The extension's app is running or installed (so start_app_quietly can bring it up). Registry and pipe checks only.
+bool app_expected();
+// The extension's app is neither: the launcher's word to the player (it names the other environment's app when only
+// that one is there); empty when the app is there. Registry and pipe checks only.
+std::string extension_app_missing();
+// This launcher's YouGame app is running (never the other environment's). Pipe check only.
+bool app_running();
 // The launcher starting: its browser view's folder holds a session (a sign-in made before) that launcher.ini
 // does not name. Asks the site through the hidden view, as warm() does (never a window); true when it answered
 // signed in (account() is that account then). Blocking: never on the window thread. *why (when given) says

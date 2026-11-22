@@ -148,6 +148,9 @@ static int auto_slot = -1;
  * start hook (CMD_YOUGAME_MENU 0x20) and the menu confirms this row by itself once the rows open.
  * Menu-only, like auto_slot. -1: none. */
 static int yg_wait_slot = -1;
+/* The Friends row is waiting for YouGame's friend flow (the extension's app starting, EF 0x4B), not for the rows to
+ * open; yg_friends_waited: that wait ended (flow there, or 20 s, or the app gone), so the row goes on as it is. */
+static int yg_wait_friends, yg_friends_waited;
 /* A 0x20 asked for YouGame on this menu (YouGame's own small window may be up over it, Windows): leaving
  * the menu tells the host (0x21, yougame_ask_withdraw) so the window goes with it. */
 static int yg_asked;
@@ -180,6 +183,10 @@ static int pages(void);
 static int pages_start(void);
 static void pages_install(void);
 static void pages_flip(int to_start);
+/* YouGame's sign-in arrived while Slippi's page was up (pages_frame): the turn to YouGame's page waits for the
+ * menu's own think below. pages_frame runs from a drawing proc, and a page turn started there left the new page's
+ * rows undrawn. */
+static int pages_flip_pending;
 static int pages_player_flipped;   /* the player pressed Z since the menu opened (no automatic page turn after) */
 static void pages_unranked_step(int dir);
 static int pick_slippi(void);
@@ -1153,9 +1160,20 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         if (mn_804A04F0.cur_menu != MENU_KIND_8 || slippi_submenu != 0 ||
             mn_804A04F0.hovered_selection != yg_wait_slot || ++yg_wait_frames > 60u * 600u) {   /* the sign-in code's 10 minutes */
             yg_wait_slot = -1;
+            yg_wait_friends = 0;
         } else if (yg_wait_frames % 60u == 0) {
             int flags = yougame_query(-1, NULL, 0);
-            if (flags & YG_ROWS_OPEN) {
+            if (yg_wait_friends) {
+                if ((flags & YG_FRIENDS_FLOW) || yg_wait_frames >= 60u * 20u || yougame_query(0x4B, NULL, 0) != 1) {
+                    yg_flags = flags;
+                    auto_slot = yg_wait_slot;
+                    yg_wait_slot = -1;
+                    yg_wait_friends = 0;
+                    yg_friends_waited = 1;
+                    OSReport("online menu: Friends: %s; continuing into row %d\n", (flags & YG_FRIENDS_FLOW) ?
+                             "the YouGame app is connected (friend flow)" : "no YouGame app channel (code search)", auto_slot);
+                }
+            } else if (flags & YG_ROWS_OPEN) {
                 yg_flags = flags;
                 auto_slot = yg_wait_slot;
                 yg_wait_slot = -1;
@@ -1297,6 +1315,13 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         }
     }
 #endif
+    if (pages_flip_pending) {
+        pages_flip_pending = 0;
+        if (pages() && mn_804A04F0.cur_menu == MENU_KIND_8 && slippi_submenu && !pages_player_flipped) {
+            pages_flip(1);
+            return;
+        }
+    }
     if (pages() && accepts_input && mn_804A04F0.cur_menu == MENU_KIND_8 &&
         !(buttons & (MenuInput_Confirm | MenuInput_Back | MenuInput_Up | MenuInput_Down))) {
         u64 pressed = 0;
@@ -1339,6 +1364,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
          * picker returns; still apply the ordinary confirm cooldown. */
         mn_804D6BC8.cooldown = 5;
         friends_confirm_hold = 1;
+        yg_friends_waited = 0;
         if (split_layout()) {
             /* Over the local channel: a YouGame row (the host's launcher session), the cursor comes back
              * here, and the host is asked for the friend flow below, after this frame's publish. The app
@@ -1351,6 +1377,19 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
             sfxForward();
             OSReport("online menu: Friends (YouGame) confirmed; asking for YouGame's friend flow\n");
         }
+    } else if ((buttons & MenuInput_Confirm) && split_layout() && !pick_slippi() && !split_friends() &&
+               selected_option == MU_SLP_OPT_FRIENDS && (yg_flags & YG_ROWS_OPEN) && !yg_friends_waited &&
+               yougame_query(0x4B, NULL, 0) == 1) {
+        /* Owner 11-21: Friends with "Launch with YouGame extension" opens YouGame's friend flow, not the connect-code
+         * search, when the YouGame app is there. The launcher starts the app in the background; until its channel
+         * is up, the row waits (at most 20 s), then goes on into the flow (or the code search if it never came). */
+        yg_wait_slot = mn_804A04F0.hovered_selection;
+        yg_wait_frames = 0;
+        yg_wait_friends = 1;
+        mn_804D6BC8.cooldown = 30;
+        sfxForward();
+        pages_notice_show("Starting YouGame Friends...");
+        OSReport("online menu: row %d: Friends waits for the YouGame app's channel\n", yg_wait_slot);
     } else if ((buttons & MenuInput_Confirm) && ranked_supported &&
                mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SLIPPI) {
         slippi_submenu = 1;
@@ -1419,6 +1458,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxForward();
         OSReport("online menu: row %d picked before YouGame was connected; starting YouGame\n", yg_wait_slot);
     } else if (buttons & MenuInput_Confirm) {
+        yg_friends_waited = 0;   /* a Friends wait that ended is used by this confirm */
         mn_804D6BC8.cooldown = 5;
         mn_804A04F0.entering_menu = 1;
         friends_visible = 0;

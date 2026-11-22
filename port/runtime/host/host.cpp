@@ -10,6 +10,7 @@
 #include "squad_digest.h"
 #endif
 #include "session_logs.h"
+#include "sysgen.h"
 #include "sim_work.h"
 #include "audio.h"
 #include "cosmetic_mods.h"
@@ -155,9 +156,24 @@ static void open_log_file() {
   if (tried) return;
   tried = true;
   // Keep the previous session's log (a desync or crash report is often noticed only after relaunching).
-  const std::string path = options.log_file.empty() ? "melee_port.log" : options.log_file;
-  const bool rotated = rotate_session_logs(path);
+  std::string path = options.log_file.empty() ? "melee_port.log" : options.log_file;
+  bool rotated = rotate_session_logs(path);
   g_log_file = std::fopen(path.c_str(), rotated ? "w" : "a");
+  // A copy the YouGame app runs in its sandbox (AppContainer) cannot write beside the program, and a relative
+  // name lands there: the log goes to the player's own folder instead (in the sandbox, the sandbox's copy of it),
+  // so a run that goes wrong there still leaves its log.
+  if (!g_log_file && !std::filesystem::path(path).is_absolute()) {
+    const std::filesystem::path user = sysgen::user_data_dir();
+    std::error_code ec;
+    if (!user.empty()) std::filesystem::create_directories(user.parent_path(), ec);
+    if (!user.empty() && !ec) {
+      const std::string moved = (user.parent_path() / std::filesystem::path(path).filename()).string();
+      rotated = rotate_session_logs(moved);
+      g_log_file = std::fopen(moved.c_str(), rotated ? "w" : "a");
+      std::fprintf(stderr, "log: %s is not writable here; logging to %s\n", path.c_str(), g_log_file ? moved.c_str() : "nowhere");
+      if (g_log_file) path = moved;
+    }
+  }
   if (!rotated) {
     std::fprintf(stderr,"log: could not rotate %s; appending to preserve the previous session\n",path.c_str());
     if (g_log_file) std::fprintf(g_log_file,"log: could not rotate previous session; appending\n");
@@ -1347,6 +1363,8 @@ void request_exit(int code) { g_exit_code.store(code); g_exit.store(true); }
 static std::atomic<bool> g_replay_viewing{false};
 void set_replay_viewing(bool on) { g_replay_viewing.store(on); }
 void request_user_exit() { request_exit(g_replay_viewing.load() ? kViewerClosedExit : 0); }
+static void (*g_before_restart)() = nullptr;
+void set_before_restart(void (*hook)()) { g_before_restart = hook; }
 void request_restart() {
   // Start the replacement first and only then ask for a clean shutdown: if the launch fails there
   // is nothing to recover to, so the running game is left alone rather than closed into nothing.
@@ -1355,6 +1373,7 @@ void request_restart() {
   std::wstring cmd = GetCommandLineW();
   // The replacement reads the shader and pipeline caches as it starts: write them first.
   ::gx::cache_store::flush_all("relaunch", std::chrono::milliseconds(3000));
+  if (g_before_restart) g_before_restart();
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
   // The new process must not inherit the window or the adapter, so it waits for this one to go.
   if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -1381,6 +1400,7 @@ bool restart_after_device_loss(const char* why, bool (*switch_backend)()) {
   std::snprintf(env, sizeof env, "%d:%lld", restarts + 1, now);
   SetEnvironmentVariableA("MELEE_DEVICE_LOST", env);
   std::wstring cmd = GetCommandLineW();
+  if (g_before_restart) g_before_restart();
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
   if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
     log("device lost (%s): the game could not start again (error %lu)", why, (unsigned long)GetLastError());
@@ -1477,6 +1497,7 @@ bool restart_with_mod_looks() {
          L" --look-iso " + quote_argument(std::filesystem::u8path(options.iso).wstring());
   // The new copy reads the shader and pipeline caches as it starts: write them first (as request_restart).
   ::gx::cache_store::flush_all("relaunch", std::chrono::milliseconds(3000));
+  if (g_before_restart) g_before_restart();
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
   if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
     log("restart: CreateProcess failed, error %lu", (unsigned long)GetLastError());
@@ -3302,6 +3323,27 @@ bool latency_trace_enabled() {
 }
 static TickTiming g_tick_timing;
 TickTiming& tick_timing() { return g_tick_timing; }
+int lagtest_flash_mode() {
+  static const int mode = [] {
+    const char* v = std::getenv("MELEE_LAGTEST_FLASH");
+    const int m = !v ? 0 : !std::strcmp(v, "report") ? 1 : !std::strcmp(v, "tick") ? 2 : 0;
+    if (m) log("lag test ledger: the picture turns white on X and black on A %s", m == 1 ? "when the adapter's report arrives (past the game)" : "on the frame of the tick that read it");
+    return m;
+  }();
+  return mode;
+}
+static std::atomic<int> g_lagtest_fill{-1};
+static std::atomic<double> g_lagtest_since{0.0};
+void lagtest_flash_report(int fill) {
+  if (g_lagtest_fill.load(std::memory_order_relaxed) == fill) return;
+  g_lagtest_since.store(now_seconds(), std::memory_order_relaxed);
+  g_lagtest_fill.store(fill, std::memory_order_release);
+}
+int lagtest_flash_report_fill(double* since) {
+  const int fill = g_lagtest_fill.load(std::memory_order_acquire);
+  if (since) *since = g_lagtest_since.load(std::memory_order_relaxed);
+  return fill;
+}
 
 // Simulation-thread cost accounting: HLE entry points add their time to a slot; at the next
 // retrace the frame's wall time (including in-frame waits) is logged when it exceeds 20 ms, with the

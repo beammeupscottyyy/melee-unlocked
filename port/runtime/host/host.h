@@ -220,6 +220,10 @@ void publish_lobby_result(int winner_index, int end_method, int lras = -1, const
 // Used for settings a running device cannot adopt, the graphics backend being the one that
 // matters today.
 void request_restart();
+// Called right before this game starts its own replacement (request_restart, restart_after_device_loss,
+// restart_with_mod_looks), so values this process took out of its environment at start (the YouGame
+// launcher's bridge) are there again for the new process.
+void set_before_restart(void (*hook)());
 // The graphics device was lost (a driver reset, a display change): the game starts again in a new
 // process with the same command line and this one ends quietly, with no crash report. A loss again
 // within 10 minutes of such a restart calls `switch_backend` first (Direct3D 11 in the settings), so
@@ -309,6 +313,14 @@ double sleep_slack();
 void set_game_rate(double hz);
 double game_rate();
 bool latency_trace_enabled();
+// Lag test ledger (MELEE_LAGTEST_FLASH, tests): where the whole picture turns white (X) or black (A)
+// for a Lossless adapter lag test, to split its reading into parts. 0 off: the game's own path.
+// 1 "report": the moment the adapter's report with the button arrives, past the game entirely (the
+// floor of the adapter, the display and this renderer). 2 "tick": on the frame of the tick whose
+// pad read saw it (adds the wait for the tick, the game's frame and its drawing).
+int lagtest_flash_mode();
+void lagtest_flash_report(int fill);        // adapter reader thread: 1 white, 0 black
+int lagtest_flash_report_fill(double* since = nullptr);   // -1 none yet; *since: when it last changed (now_seconds)
 TickTiming& tick_timing();
 // Per-draw scopes run tens of thousands of times a frame, so they read the CPU time stamp counter
 // (one instruction) instead of QueryPerformanceCounter; tsc_seconds is calibrated once at startup.

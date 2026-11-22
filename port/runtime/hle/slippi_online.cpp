@@ -711,8 +711,12 @@ bool should_skip_online_frame(int32_t frame, int32_t finalized_frame) {
     g_stall_frame_counts[i]++;
     any_needs_inputs = true;
     if (behind < 0) behind = i;
-    if (g_stall_frame_counts[i] > 60 * 7) {
-      host::log("slippi: force-disconnecting player %u after 7 s stall (frame %d, latest %d)", pad->player_idx, frame, latest);
+    // 7 s without the other side's inputs means they are gone, except before their first frame (the frame-2
+    // hold above): they may still be loading the stage, which took 13.3 s on a slow GPU in one match, and the
+    // player waiting dropped them as "opponent left" before the match began. Until then they get 30 s.
+    const int stall_limit = latest < 1 ? 60 * 30 : 60 * 7;
+    if (g_stall_frame_counts[i] > stall_limit) {
+      host::log("slippi: force-disconnecting player %u after %d s stall (frame %d, latest %d)", pad->player_idx, stall_limit / 60, frame, latest);
       g_netplay->ForceDisconnectPlayer(pad->player_idx);
       g_stall_frame_counts[i] = 0;
       continue;
@@ -1289,6 +1293,16 @@ void start_find_match(const uint8_t* payload, const std::string& friend_room = {
   if (!enet_ready()) { g_forced_error = "Networking unavailable"; return; }
   host::cosmetics::freeze_for_online_session();
   g_search_started_ms = time_ms();
+  // A client that already searched (it found a match, failed or ended) still holds its search
+  // thread: starting another on it ends the process (std::thread assigned while joinable). The
+  // character select cleans up before every search, but other paths can reach here without that
+  // (an arena room's stage select locked in after its pair was dropped), so replace it here too.
+  if (g_matchmaking && g_matchmaking->GetMatchmakeState() != Matchmaking::IDLE) {
+    host::log("slippi: a new search on a used client (state %d): replaced first", (int)g_matchmaking->GetMatchmakeState());
+    std::lock_guard<std::mutex> lk(g_early_send_mutex);
+    std::thread([mm = std::move(g_matchmaking)]() mutable { mm.reset(); }).detach();
+    g_matchmaking = std::make_unique<Matchmaking>(g_user.get());
+  }
   g_matchmaking->FindMatch(search);
   update_discord_presence(true);
 }
@@ -1318,6 +1332,14 @@ bool start_lobby_search() {
   g_last_search = search;
   if (g_plain_opponent_handler) g_plain_opponent_handler(false, nullptr);
   host::cosmetics::freeze_for_online_session();
+  // A client whose last search ended (a refused ticket leaves it in the error state) still holds its
+  // finished search thread: starting another on it ended the process (std::terminate), which is how a
+  // refused Doubles home closed the game (player report 11-22). Replace it, as start_search does.
+  if (g_matchmaking && g_matchmaking->GetMatchmakeState() != Matchmaking::IDLE) {
+    host::log("friends lobby: a new search on a used client (state %d): replaced first", (int)g_matchmaking->GetMatchmakeState());
+    std::lock_guard<std::mutex> lk(g_early_send_mutex);
+    std::thread([mm = std::move(g_matchmaking)]() mutable { mm.reset(); }).detach();
+  }
   if (!g_matchmaking) g_matchmaking = std::make_unique<Matchmaking>(g_user.get());
   g_matchmaking->FindMatch(search);
   update_discord_presence(true);
@@ -3719,6 +3741,10 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
           if (yougame::restart_older(g_older_offer_mode == Matchmaking::DIRECT ? "direct" : "ranked", &why)) host::request_exit(0);
           else g_forced_error = why;
         }
+      } else if (payload_len == 1 && payload[0] == 0x4B) {
+        // The Friends row: 1 while the extension's YouGame app is coming up (its channel brings the friend flow).
+        q.assign(1, yougame::extension_waiting() ? 1 : 0);
+        return true;
       } else if (payload_len == 1 && payload[0] == 0x49) {
         // Which service the opponent came from (the character select's header after a Both search):
         // 0 not known, 1 Slippi, 2 YouGame. Only asks.

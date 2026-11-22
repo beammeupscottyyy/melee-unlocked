@@ -2464,6 +2464,9 @@ void Matchmaking::FindMatch(MatchSearchSettings settings) {
     host::log("slippi: matchmaking blocked: Slippi is on %s and this build speaks %s; update Melee Unlocked", latest.c_str(), SLIPPI_SEMVER);
     return;
   }
+  // A finished search's thread is still joinable: assigning a new one over it is std::terminate. Callers
+  // replace a used client, but never end the process for it here either.
+  if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) thread_.join();
   state_ = INITIALIZING;
   host::log("slippi: matchmaking started (mode %d, code '%s')", settings.mode, settings.connect_code.c_str());
   thread_ = std::thread(&Matchmaking::MatchmakeThread, this);
@@ -2683,6 +2686,16 @@ void Matchmaking::startMatchmaking() {
     // session(): the app, or a YouGame row picked under Melee Unlocked's launcher (the Doubles home runs here too).
     if (!yougame::session()) { fail("The Friends lobby needs a YouGame sign-in. Connect YouGame in the launcher."); return; }
     startYouGameMatchmaking();
+    return;
+  }
+  // A YouGame row (the menu's pick 1: YouGame's Ranked, Unranked, Friends, Squad Strike) searches YouGame only. With
+  // YouGame not connected at that moment (extension on with the app still starting or closed, no launcher bridge),
+  // it used to fall through to Slippi's own search of the same mode: Friends, a Direct code search under the
+  // launcher, opened a Slippi Direct match (11-21, Seimy). It stops here and says why; the row works again once
+  // YouGame is connected (the game finds a started app's channel by itself within seconds).
+  if (yougame::menu_service() == 1 && !yougame::session() && !yougame::active() && !local_peer.enabled) {
+    host::log("yougame: a YouGame row was picked while YouGame is not connected: not searched (never on Slippi)");
+    fail("YouGame is not connected yet. Try again, or Connect YouGame in the launcher.");
     return;
   }
   if (!yougame::session() && !local_peer.enabled) {

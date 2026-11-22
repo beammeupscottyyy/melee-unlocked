@@ -479,7 +479,7 @@ static const char* pages_row_words(int option)
     /* Over the local channel (split_friends) Friends is the app's friend flow, with the app's words. */
     case MU_SLP_OPT_FRIENDS: return split_friends() ? "Invite a friend to play." : "Play a friend by code.";
 #ifdef MELEE_DOUBLES
-    case MU_SLP_OPT_DOUBLES: return "Play 2v2 in the YouGame app.";
+    case MU_SLP_OPT_DOUBLES: return "Play 2v2 with a friend.";   /* the Doubles home opens through the launcher too */
 #endif
 #if MU_SQUAD
     case MU_SLP_OPT_SQUAD: return "Play with 4 fighters each.";
@@ -567,6 +567,7 @@ static void pages_frame(HSD_GObj* menu, int canvas, int idle)
          * (they hid their arrows on their own last frame, below). */
         since_entry = 0;
         pages_player_flipped = 0;
+        pages_flip_pending = 0;
         if (mn_804A04F0.cur_menu != MENU_KIND_8) {
             pages_hint_frame(canvas, 0);
             pages_turn = 0;
@@ -614,7 +615,7 @@ static void pages_frame(HSD_GObj* menu, int canvas, int idle)
         if (pages_yougame_open()) {
             OSReport("online menu: YouGame's sign-in arrived after the menu opened; YouGame page\n");
             since_entry = 300;
-            pages_flip(1);
+            pages_flip_pending = 1;   /* turned by mu_slippi_online_menu_think, not from this drawing proc */
             return;
         }
     }
