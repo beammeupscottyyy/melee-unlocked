@@ -107,7 +107,7 @@ class YouGame0962MergeTest(unittest.TestCase):
         loader = host.split("#ifdef __APPLE__\n  std::string mac_error;", 1)[1]
         loader = "#ifdef __APPLE__\n  std::string mac_error;" + loader.split("  if (!entry)", 1)[0]
         for defines, resolver in (({"__APPLE__"}, "g_mac_image.symbol(name)"),
-                                  ({"_WIN32"}, "sandboxed ? image_export(module, name)"),
+                                  ({"_WIN32"}, "mapped ? image_export(module, name)"),
                                   (set(), "GetProcAddress(module, name)")):
             with self.subTest(defines=defines):
                 active = conditional_source(loader, defines)

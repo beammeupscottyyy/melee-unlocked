@@ -1,8 +1,8 @@
 
 # Melee Unlocked 1.0
 
-A native Windows build of Super Smash Bros. Melee (NTSC 1.02) with **Slippi online play** and an
-**unlocked display frame rate.** It has two engines, and the launcher lets you pick.
+A native Windows and Linux build of Super Smash Bros. Melee (NTSC 1.02) with **Slippi and YouGame
+online play** and an **unlocked display frame rate.** It has two engines, and the launcher lets you pick.
 
 **Source Port (the main build).** The game is compiled for Windows from C source code, the
 decompilation of Melee, and built as a native library. No GameCube code is run, emulated or
@@ -77,6 +77,19 @@ are included with Melee Unlocked.
 
 - Unlocked frame rate (monitor rate, a fixed cap, or fully unlocked) with sub-frame animation
 - Slippi online against regular Slippi Dolphin players, using your Slippi Launcher login
+- YouGame online from the game's own menu: Ranked, Unranked, Friends, Doubles (2v2 with a friend) and
+  Squad Strike (four fighters, one stock each), with no YouGame app or browser needed. Unranked can
+  search YouGame, Slippi or both at once. See [YouGame online](#yougame-online)
+- Play while you search: keep training (or warm up in Training) while a YouGame search runs; a short
+  countdown takes you to the match when one is found
+- Arena rooms: Direct > Arena, with invites, on Slippi and on YouGame
+- Lower latency: with the frame rate uncapped a new game frame reaches the screen the moment it is
+  ready, and V-Sync is off unless you turn it on. Predict mode eases turns and stops back over a few
+  frames and moves falls, runs, dashes and wavedashes at the display's rate
+- A second controller without a GameCube adapter: Controls lists pads that are plugged in but not
+  playing, each with a Play as P2 (P3, P4) button
+- Box controllers: b0xx-ahk (through vJoy) and HayBox boxes in DInput mode get their layout automatically
+- Replay Viewer: pause, the progress bar, fast forward, jumps between tips and Take over a player
 - Subframe rollback (early inputs) between Melee Unlocked players: button presses and stick moves
   are sent the moment they happen, between frames, so the other game predicts them sooner. Based on
   Arte's subframe rollback work (see Credits)
@@ -119,8 +132,11 @@ For launchers exposing vanilla, ACE, and Akaneia as separate entries, see
 [separate YouGame listings](docs/yougame-listings.md). `--vanilla-only` forces vanilla gameplay
 for one session while preserving the engine's native mod support and saved mod choices.
 
-Download `MeleeUnlocked-<version>-Stable-Recomp-Legacy-win64.zip` from [Releases](https://github.com/hero88go/melee-unlocked/releases)
-and extract it anywhere. Then pick one of two ways to run it. **The launcher is optional**;
+Download `MeleeUnlocked-<version>-win64.zip` from [Releases](https://github.com/hero88go/melee-unlocked/releases)
+and extract it anywhere. On Linux, download `MeleeUnlocked-<version>-linux-x86_64.tar.gz`, extract it
+and run `./MeleeUnlocked` (its README covers GameCube adapter setup). Mac is experimental: build it
+from source with `port/mac/build_full.py`. The RTX Pack (NVIDIA RTX and RTX Remix) downloads from
+Video > Ray tracing in the game. Then pick one of two ways to run it. **The launcher is optional**;
 the game does not depend on it, and the manual way is complete on its own.
 
 ### Manual (no launcher)
@@ -294,6 +310,24 @@ Start opens the replay's practice settings.
 character. D-pad Up searches again, D-pad Down keeps training. Turn it off in PC settings > Game >
 Online.
 
+## Replays from the command line
+
+`melee_source.exe` plays a Slippi replay (.slp or .slpz) and closes when it ends:
+
+```powershell
+melee_source.exe --iso "C:/path/to/melee.iso" --replay "C:/path/to/Game.slp"
+```
+
+The Dolphin form that slp2mp4 and other Slippi tools use works too: `-e <iso>` for the disc, `-i <file>` for a
+[communication file](https://github.com/project-slippi/slippi-wiki/blob/master/COMM_SPEC.md) (its `replay`, or the
+first `path` in its `queue`), and `-b` (the game always exits when the replay ends):
+
+```powershell
+melee_source.exe -i comm.json -b -e "C:/path/to/melee.iso"
+```
+
+Add `--hidden` to play it without a window, and `--volume 0` for no sound.
+
 ## Slippi online
 
 Everything Slippi Dolphin does for netplay is built in: matchmaking, rollback netcode, the
@@ -319,6 +353,25 @@ accepted matches through Slippi Direct. Reachability depends on each player's
 network; this experimental mode has no relay or guaranteed global chat history.
 See the [lobby setup and limitations](lobby/README.md).
 
+
+## YouGame online
+
+Online Play has a YouGame page and a Slippi page; press Z to switch between them. The YouGame page
+has Ranked, Unranked, Friends, Doubles and Squad Strike, and all of them play straight from the game.
+
+- **Connect once** from the launcher's Play page; after that the launcher connects by itself. If the
+  YouGame app is running and signed in, the launcher uses that account.
+- **Unranked** searches YouGame, Slippi or both: left and right (or L and R) on the Unranked row
+  choose, and the game remembers it.
+- **Friends** opens YouGame's friend picker and lobby. **Doubles** is 2v2 with a friend.
+  **Squad Strike** (by Chris x9x9x9x9x9, idea by Tyler): pick four fighters and play them in order,
+  one stock each.
+- **Play while you search**: press B on the character select during a search and keep searching, or
+  hold L and R (or pick WARM UP) to go to Training. A banner shows the mode and the search time.
+  Game > Online sets whether you are asked and which banner you see.
+- **Launch with YouGame extension** (launcher) adds the YouGame button and its Shift+Tab menu in the
+  game, and starts the YouGame app in the background when it is installed.
+- After a new release, YouGame modes open once YouGame lists that version, usually within two hours.
 
 ## Bug reports
 
@@ -367,6 +420,8 @@ Hero88go - developer
 Johnny Brookes Aka Lainthewired for their major contribution of the last graphic error fix that took this project from alpha -> beta. Could not have done it without them 
 
 SSBM_Arte for subframe rollback: the idea and the original implementation of sending inputs between frames so the other game can predict and roll back sooner. Melee Unlocked's early inputs, early rollback and the check against faked early inputs are adapted from that work, and the exclusive audio timing draws on Arte's audio research.
+
+Chris (x9x9x9x9x9) for Squad Strike, and Tyler for its idea.
 
 Vlad Firoiu (x_pilot) for Phillip (slippi-ai), the AI behind Fight a pro: its trained policies and the way the game feeds and reads them.
 

@@ -276,6 +276,10 @@ struct RenderOptions {
   // gecko::option_offline_results (host.cpp); Source Port: MU_GAME_OPTION3_SKIP_RESULTS.
   bool results_screen = true;
   static bool& live_results_screen() { static bool value = true; return value; }
+  // "Show Training mode's HUD" (ini key training_hud, on unless the file says 0). Off, Training's own
+  // speed, enemy and damage panels are not drawn while its menu is closed (MU_DISPLAY_HIDE_TRAINING_HUD).
+  bool training_hud = true;
+  static bool& live_training_hud() { static bool value = true; return value; }
   // Faster sound effects (Audio): each new sound starts in the sound frame mixed now, 5 ms sooner.
   // Offline only (the host gives the game 0 online and in replays).
   static bool& live_audio_early_keyon() { static bool value = false; return value; }
@@ -283,10 +287,12 @@ struct RenderOptions {
   static bool& live_mute_voices() { static bool value = false; return value; }
   bool offline_delay = false;
   int offline_delay_frames = 2;  // independent of the online delay; enabled separately for old settings
-  // Early inputs (Online, ini key early_inputs, on unless the file says 0): controller changes go
+  // Early inputs (Online, ini key early_inputs2, off unless the file says 1): controller changes go
   // to the other player the moment they happen (host/early_input.h). Applied with
-  // host::early_input::set_enabled when the file is read and when the toggle changes.
-  bool early_inputs = true;
+  // host::early_input::set_enabled when the file is read and when the toggle changes. Off by default
+  // from 1.0.2: players felt eaten or late inputs with it on and none with it off (1.0.0 reports), so
+  // the old key (saved on by default) is not read.
+  bool early_inputs = false;
   // Slippi Dolphin's spectator server (Game tab, Online; ini keys slippi_spectator, on unless the
   // file says 0, and slippi_spectator_port, 51441): the game's recording events on a local ENet
   // port for the Slippi Launcher's Broadcast tab and stream overlays (hle/slippi_spectate.cpp).

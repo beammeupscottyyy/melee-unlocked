@@ -91,6 +91,12 @@ int main() {
   }
   CHECK(!friends::direct_code_from_game("\x81", &folded));
 
+  // update_required from a site that lists no newer version for this system: not an update.
+  CHECK(!update::listed_newer({{"code", "update_required"}, {"current", "103"}}, "1.0.1"));
+  CHECK(!update::listed_newer({{"code", "update_required"}, {"current", "1.0.0-test.71cbd81"}}, "1.0.1"));
+  CHECK(!update::listed_newer({{"code", "update_required"}}, "1.0.1"));
+  CHECK(update::listed_newer({{"code", "update_required"}, {"current", "1.0.2"}}, "1.0.1"));
+  CHECK(update::not_listed_text("1.0.1").find("does not list Melee Unlocked 1.0.1") != std::string::npos);
   int versions = 0;
   for (const char* v : {"0.9.81", "0.10.0", "1.0.0", "0.9.80.1", "000.009.081", "0.9.1000000000000000000000000000000"}) {
     CHECK(update::newer(v, "0.9.80"));

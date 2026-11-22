@@ -115,6 +115,10 @@ void itFy_Blade_Spawn(HSD_GObj* owner, Vec3* pos, s32 state, float facing)
     itFy_IV(ip)->owner = owner;
     ip->xCC_item_attr->destroy_gfx = 0;
     ip->xCC_item_attr->destroy_sfx = 0;
+    /* The state change below sets no command script (flags 0), so the item runs whatever its slot
+     * held: on the console a reused slot's finished script, NULL in the usual case. Natively the
+     * slot can hold anything, and her up, down and back airs stopped the game (1.0.0 reports). */
+    ip->x524_cmd.u = NULL;
     Item_80268E5C(gobj, state, 0);
     Item_8026AB54(gobj, owner, 0x43);
     db_80225DD8(gobj, owner);

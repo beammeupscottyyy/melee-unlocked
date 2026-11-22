@@ -2153,7 +2153,16 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
     mu_setup_ports(block.data(), block.size(), uint8_t(ordered.size() - 1), teams ? 1 : 0);
     block[0x8] = teams ? 1 : 0;
     block[0xE] = (uint8_t)(stage_id >> 8); block[0xF] = (uint8_t)stage_id;
-    bool pause_allowed = g_last_search.mode == Matchmaking::DIRECT;
+    // Direct pauses (Slippi's rule) unless a player turned it off and every build reads that (PauseOff).
+    const bool pause_off = g_last_search.mode == Matchmaking::DIRECT && g_netplay && g_netplay->PauseOff();
+    {
+      static int logged = -1;
+      if (g_last_search.mode == Matchmaking::DIRECT && logged != (pause_off ? 1 : 0)) {
+        logged = pause_off ? 1 : 0;
+        host::log("slippi: Direct pause %s", pause_off ? "off (a player turned it off)" : "on");
+      }
+    }
+    bool pause_allowed = g_last_search.mode == Matchmaking::DIRECT && !pause_off;
     block[2] = pause_allowed ? (block[2] & 0xF7) : (block[2] | 0x8);
     bool stage_selection_mode = g_last_search.mode == Matchmaking::DIRECT || g_last_search.mode == Matchmaking::TEAMS;
     if (!stage_selection_mode) alt_stage_mode = 0;
@@ -2592,6 +2601,38 @@ int ping_ms() { return p2p_session_up() ? host::netplay::ping_ms() : (g_netplay 
 // g_last_search keeps the mode of the last search for the whole session, so it only means anything
 // while an online session is actually up: searching, set up (the online character select screen),
 // or in the match. Everywhere else this is offline and the answer is -1.
+// Port colours (Game > Online, owner 11-22 from a player's request): in an online 1v1 each player shows in
+// their first choice; a colour both picked goes to one of them by the match's agreed seed and the other gets
+// their second choice; a player with no choice keeps their own port's colour. Both games know both choices
+// (the build message), so both draw the same. Display only (mu_port_colour in the game).
+uint32_t port_colour_bits() {
+  // Whole online session, not only once the match runs: the tags and damage displays take their colour as
+  // the match scene builds them, before is_online_match() turns true.
+  if (!g_netplay || session_mode() < 0 || bounded_remote_machine_count() != 1) return 0;
+  int8_t mine[2], theirs[2];
+  if (!g_netplay->PortColours(mine, theirs) || (mine[0] < 0 && theirs[0] < 0)) return 0;
+  const int me = local_player_index();
+  if (me < 0 || me > 1) return 0;
+  const int8_t* pref[2] = {me == 0 ? mine : theirs, me == 0 ? theirs : mine};
+  int colour[2] = {-1, -1};
+  bool taken[4] = {};
+  for (int p = 0; p < 2; ++p)
+    if (pref[p][0] < 0) { colour[p] = p; taken[p] = true; }
+  const int first = (int)((g_game_facts.rng >> 3) & 1u);
+  for (int k = 0; k < 2; ++k) {
+    const int p = k == 0 ? first : 1 - first;
+    if (colour[p] >= 0) continue;
+    for (const int c : {(int)pref[p][0], (int)pref[p][1], p})
+      if (c >= 0 && c < 4 && !taken[c]) { colour[p] = c; break; }
+    for (int c = 0; colour[p] < 0 && c < 4; ++c) if (!taken[c]) colour[p] = c;
+    taken[colour[p]] = true;
+  }
+  static uint32_t logged = 0xFFFFFFFFu;
+  const uint32_t bits = ((uint32_t)colour[0] | ((uint32_t)colour[1] << 2)) << 28;
+  if (bits != logged) { logged = bits; host::log("slippi: port colours P1 %d, P2 %d (0 red, 1 blue, 2 yellow, 3 green)", colour[0], colour[1]); }
+  return bits;
+}
+
 bool opponent_auto_lcancel() {
   if (!g_netplay || g_last_search.mode != Matchmaking::DIRECT) return false;
   if (g_netplay->GetSlippiConnectStatus() != NetplayClient::ConnectStatus::CONNECTED) return false;

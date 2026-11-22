@@ -2283,6 +2283,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   options.pro_ai_stronger = 0;   // a file without the key: ask
   options.unlock_all = true;   // a file without the key: on
   options.results_screen = true;
+  options.training_hud = true;
   options.offline_delay = false;
   options.offline_delay_frames = 2;
   bool offline_delay_frames_seen = false;
@@ -2291,7 +2292,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // off, so every later launch booted to an FFA character select that rumbled and turned the picture
   // black and white on X and A. That old key is read as off.
   options.lossless_lag_test = false;
-  options.early_inputs = true;   // a file without the key: on
+  options.early_inputs = false;   // a file without the key: off (1.0.2 on)
 #ifndef MELEE_NO_SLIPPI   // the spectator server is part of the Slippi layer
   options.slippi_spectator = true;   // a file without the key: on, as in Slippi Dolphin
   options.slippi_spectator_port = 51441;
@@ -2423,6 +2424,10 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "audio_early_keyon") gx::RenderOptions::live_audio_early_keyon() = kShowFasterSoundEffects && value == "1";
       else if (key == "mute_voices") gx::RenderOptions::live_mute_voices() = value == "1";
       else if (key == "quickchat") slippi::online::config().chat = std::clamp(std::atoi(value.c_str()), 0, 2);
+      else if (key == "directpause" || key == "portcolour1" || key == "portcolour2") {
+        if (key == "directpause") slippi::online::config().direct_pause = value != "0";
+        else slippi::online::config().port_colour[key.back() - '1'] = std::clamp(std::atoi(value.c_str()), -1, 3);
+      }
       else if (key == "blockcode1" || key == "blockcode2" || key == "blockcode3")
         slippi::online::config().blocked_codes[key.back() - '1'] = value.substr(0, 16);
       else if (key == "practicecpu") {
@@ -2440,7 +2445,8 @@ void load_pc_settings(RenderOptions& options, int& volume) {
         options.offline_delay_frames = std::clamp(std::stoi(value), 1, 9);
         offline_delay_frames_seen = true;
       }
-      else if (key == "early_inputs") options.early_inputs = value == "1";
+      // early_inputs, the old key saved on by default, is not read (render_options.h).
+      else if (key == "early_inputs2" || key == "early_inputs") { if (key == "early_inputs2") options.early_inputs = value == "1"; }
       else if (key == "performance") options.performance_overlay = value == "1";
       else if (key == "showfps") { options.show_fps = value == "1"; showfps_seen = true; }
       // showfps_yougame2: builds before 10-31 saved showfps_yougame 1 on every save (the old default),
@@ -2564,6 +2570,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "unlock_all") options.unlock_all = value != "0";
       else if (key == "zelda_as_sheik") options.zelda_as_sheik = value == "1";
       else if (key == "results_screen") options.results_screen = value != "0";
+      else if (key == "training_hud") options.training_hud = value != "0";
 #ifndef MELEE_NO_SLIPPI
       else if (key == "slippi_spectator") options.slippi_spectator = value != "0";
       else if (key == "online_return_training") options.online_return_training = value == "1";
@@ -2677,7 +2684,8 @@ void load_pc_settings(RenderOptions& options, int& volume) {
         if (us != std::string::npos) {
           int idx = std::stoi(key.substr(3, us - 3));
           std::string action = key.substr(us + 1);
-          if (idx >= 0 && idx < 4)
+          if (idx >= 0 && idx < 4 && action == "invert") host::g_hid_stick_invert[idx] = (uint8_t)(std::stoi(value) & 15);
+          else if (idx >= 0 && idx < 4)
             for (int i = 0; i < (int)host::BindAction::Count; ++i)
               if (action == kActionNames[i]) host::g_pad_bindings[idx].mask[i] = (unsigned short)std::stoi(value);
         }
@@ -2843,6 +2851,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   RenderOptions::live_unlock_all() = options.unlock_all;
   RenderOptions::live_zelda_as_sheik() = options.zelda_as_sheik;
   RenderOptions::live_results_screen() = options.results_screen;
+  RenderOptions::live_training_hud() = options.training_hud;
   RenderOptions::live_offline_delay() = options.offline_delay;
   // Old files used the online slider for offline play. Preserve that value once, independent
   // of key order, then save separate values so future online changes leave offline play alone.
@@ -5145,8 +5154,11 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nonlinedelayauto " << (slippi::online::config().auto_delay ? 1 : 0)
        << "\noffline_delay " << (options.offline_delay ? 1 : 0)
        << "\noffline_delay_frames " << options.offline_delay_frames
-       << "\nearly_inputs " << (options.early_inputs ? 1 : 0)
+       << "\nearly_inputs2 " << (options.early_inputs ? 1 : 0)
        << "\nquickchat " << slippi::online::config().chat
+       << "\ndirectpause " << (slippi::online::config().direct_pause ? 1 : 0)
+       << "\nportcolour1 " << slippi::online::config().port_colour[0]
+       << "\nportcolour2 " << slippi::online::config().port_colour[1]
        << "\nblockcode1 " << slippi::online::config().blocked_codes[0]
        << "\nblockcode2 " << slippi::online::config().blocked_codes[1]
        << "\nblockcode3 " << slippi::online::config().blocked_codes[2]
@@ -5250,6 +5262,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nunlock_all " << (options.unlock_all ? 1 : 0)
        << "\nzelda_as_sheik " << (options.zelda_as_sheik ? 1 : 0)
        << "\nresults_screen " << (options.results_screen ? 1 : 0)
+       << "\ntraining_hud " << (options.training_hud ? 1 : 0)
 #ifndef MELEE_NO_SLIPPI
        << "\nslippi_spectator " << (options.slippi_spectator ? 1 : 0)
        << "\nslippi_spectator_port " << options.slippi_spectator_port
@@ -5328,6 +5341,8 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
   for (int idx = 0; idx < 4; ++idx)
     for (int i = 0; i < (int)host::BindAction::Count; ++i)
       file << "\nhid" << idx << "_" << kActionNames[i] << " " << host::g_hid_bindings[idx].mask[i];
+  for (int idx = 0; idx < 4; ++idx)
+    if (host::g_hid_stick_invert[idx]) file << "\nhid" << idx << "_invert " << (int)host::g_hid_stick_invert[idx];
   file << binding_levels_text();
   for (int n = 0; n < 4; ++n)
     file << "\nport" << n << " " << port_source_to_combo(host::g_port_sources[n]);
@@ -10577,6 +10592,29 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::SameLine();
         settings_hint("(applies from the next match)");
       }
+      // Whether Start pauses Direct and Friends matches (Ranked and Unranked never pause).
+      if (settings_toggle("Pause in Direct and Friends", &slippi::online::config().direct_pause)) changed = true;
+      {
+        // Online port colour: first and second choice; "Any" leaves the port's own colour.
+        static const char* const colours[] = {"Any", "Red", "Blue", "Yellow", "Green"};
+        for (int k = 0; k < 2; ++k) {
+          int pick = std::clamp(slippi::online::config().port_colour[k], -1, 3) + 1;
+          ImGui::SetNextItemWidth(220.0f);
+          if (settings_combo(k == 0 ? "Port colour, first choice" : "Port colour, second choice", &pick, colours, 5)) {
+            slippi::online::config().port_colour[k] = pick - 1;
+            changed = true;
+          }
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Online 1v1: you show in your first choice (your tag and damage display). If the other player\n"
+                              "picked the same colour, a coin flip gives it to one of you and the other gets their second\n"
+                              "choice. Both players need Melee Unlocked 1.0.2 or newer. Applies from your next connection.");
+        }
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Off: Start does not pause Direct (Slippi) or Friends (YouGame) matches. Pausing goes off\n"
+                          "for everyone in the match when any player turns it off, as long as every player has\n"
+                          "Melee Unlocked 1.0.1 or newer. Against older builds or Slippi Dolphin, Start still pauses.\n"
+                          "Applies from your next connection.");
       // Up to three connect codes to skip in Unranked (a match with one is turned down and the
       // search goes on). Ranked, Direct, Teams and Party are not affected.
       {
@@ -11739,6 +11777,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::SameLine();
           if (settings_widgets::Button("Generic")) { host::g_hid_bindings[tab_index] = host::default_hid_bindings()[0]; changed = true; }
           settings_hint("vJoy and HayBox boxes in DInput mode get their layout automatically.");
+          // Sticks have no binding (they read the pad's own axes): a direction the pad reports reversed
+          // is turned round here. Watch "Axes" below while pressing the direction.
+          {
+            static const char* const names[4] = {"Invert stick left/right", "Invert stick up/down",
+                                                 "Invert C-stick left/right", "Invert C-stick up/down"};
+            for (int k = 0; k < 4; ++k) {
+              bool on = (host::g_hid_stick_invert[tab_index] >> k) & 1;
+              if (k % 2) ImGui::SameLine();
+              if (settings_toggle(names[k], &on)) {
+                host::g_hid_stick_invert[tab_index] = (uint8_t)((host::g_hid_stick_invert[tab_index] & ~(1u << k)) | (on ? 1u << k : 0u));
+                changed = true;
+              }
+            }
+          }
           const host::HidPadAxes axes = host::hidpad_axes(tab_index);
           if (axes.count) {
             std::string line = "Axes:";
@@ -11795,6 +11847,13 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("In an online mode, skins and stage mods that could change more than looks show as the\n"
                         "standard ones, and a note says so for 15 seconds. Off: no note (Settings > Mods still lists them).");
+    if (settings_toggle("Show Training mode's HUD", &options.training_hud)) {
+      RenderOptions::live_training_hud() = options.training_hud;
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Off: Training mode's Speed, Enemy and damage panels are not drawn, for sparring with nothing\n"
+                        "on screen. They still show while Training's menu is open. Source Port.");
 #ifndef MELEE_NO_SLIPPI   // no matchmaking panel in the build without that layer
     changed |= settings_toggle("Show the Practice menu hint in Training", &options.matchmaking_hint);
     if (ImGui::IsItemHovered())

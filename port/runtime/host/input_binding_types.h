@@ -47,5 +47,9 @@ extern std::array<GCBindings, 4> g_gc_bindings;
 extern std::array<PadBindings, 4> g_ds4_bindings;
 extern std::array<PadBindings, 4> g_swpro_bindings;
 extern std::array<HidBindings, 4> g_hid_bindings;
+// Per HID pad: its sticks read the other way round (HID_INVERT_*), set in Controls > Box layouts. A box
+// whose firmware reports a direction reversed is fixed there without a binding (sticks have none).
+enum : uint8_t { HID_INVERT_STICK_X = 1, HID_INVERT_STICK_Y = 2, HID_INVERT_CSTICK_X = 4, HID_INVERT_CSTICK_Y = 8 };
+inline std::array<uint8_t, 4> g_hid_stick_invert{};   // one definition for every target (tests link hid_pad alone)
 
 }  // namespace host

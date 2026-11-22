@@ -137,6 +137,8 @@ void mu_arcade_grid(void);
 /* Arcade look "2D camera" (MU_DISPLAY_OPTION_ARCADE_CAMERA): mu_arcade_camera() is nonzero when the
  * match camera runs mu_arcade_pack_camera, for the 2D-style build's disc or this setting, offline. */
 #define MU_DISPLAY_ARCADE_CAMERA 0x200u
+/* "Show Training mode's HUD" off (mu_host.h MU_DISPLAY_OPTION_NO_TRAINING_HUD): gm_1884.c skips its draw. */
+#define MU_DISPLAY_NO_TRAINING_HUD 0x08000000u
 int mu_arcade_camera(void);
 /* "Hide KO explosions" (MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS): the blast-zone explosion is spawned at
  * MU_KO_EXPLOSION_HIDDEN_Y, far below every camera (ft/ft_0D31.c spawnDeadEffect). It runs in full

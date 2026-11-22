@@ -1451,6 +1451,33 @@ static int melee_main(int argc, char** argv);
 // --replay with a .slpz (the slpz tool's compressed replays, port/app/replay_slpz.h): every reader
 // here takes a .slp, so it is decompressed once into a scratch file and that is played. The online
 // trace beside the original ("<replay>.trace", for "as experienced") is kept by naming it.
+// -i <file>: a Slippi communication file (Slippi's COMM_SPEC, as slp2mp4 and Dolphin take it): the replay
+// to play is its "replay", or the first "path" of its "queue". Read by hand (two string fields), so the
+// argument parser needs no JSON library. Empty when the file names none.
+static std::string comm_file_replay(const std::string& file) {
+  std::ifstream f(std::filesystem::u8path(file), std::ios::binary);
+  const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  auto field = [&](const char* key, size_t from) -> std::string {
+    const std::string k = std::string("\"") + key + "\"";
+    size_t at = text.find(k, from);
+    if (at == std::string::npos) return {};
+    at = text.find(':', at + k.size());
+    if (at == std::string::npos) return {};
+    at = text.find('"', at);
+    if (at == std::string::npos) return {};
+    std::string out;
+    for (size_t i = at + 1; i < text.size() && text[i] != '"'; ++i) {
+      if (text[i] == '\\' && i + 1 < text.size()) { ++i; out += text[i] == 'n' ? '\n' : text[i]; }
+      else out += text[i];
+    }
+    return out;
+  };
+  std::string replay = field("replay", 0);
+  if (replay.empty()) { const size_t queue = text.find("\"queue\""); if (queue != std::string::npos) replay = field("path", queue); }
+  if (replay.empty()) std::fprintf(stderr, "-i %s names no replay (\"replay\" or a \"queue\" entry's \"path\")\n", file.c_str());
+  return replay;
+}
+
 static std::string playable_replay(const std::string& path) {
   namespace fs = std::filesystem;
   std::vector<uint8_t> head(24);
@@ -2033,7 +2060,7 @@ static int melee_main(int argc, char** argv) {
     // Two chains, not one: MSVC stops at about 128 nested blocks (C1061, "blocks nested too deeply"),
     // and every else-if arm is one more level. An option the first chain knows ends this iteration.
     bool known = true;
-    if (a == "--iso") o.iso = next();
+    if (a == "--iso" || a == "-e") o.iso = next();   // -e: Dolphin's name for it (slp2mp4 and Slippi tools)
     else if (a == "--mod-base-iso") o.mod_base_iso = next();   // Static Recomp: --iso is a mod disc, this is the vanilla one
     else if (a == "--look-iso") o.look_iso = next();           // the standard game with this mod disc's looks
     else if (a == "--ram-translator") ram_translator = true;
@@ -2155,7 +2182,8 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--scan-mods") source_port::mods::set_auto_detect(true);
     else if (a == "--log-file") o.log_file = next();
 #ifdef MELEE_SOURCE_PORT
-    else if (a == "--replay") replay_arg = playable_replay(next());   // the native game plays this .slp (loaded after the flags)
+    // the native game plays this .slp (loaded after the flags); -i is Dolphin's form, a communication file naming it
+    else if (a == "--replay" || a == "-i") replay_arg = playable_replay(a == "-i" ? comm_file_replay(next()) : std::string(next()));
 #else
     else if (a == "--replay") slippi::playback::set_replay(playable_replay(next()));   // playback build: play this .slp
 #endif
@@ -2298,7 +2326,8 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--auto-lcancel") lcancel::set_automatic(true);
     else if (a == "--lcancel-indicator") lcancel::set_indicator(true);
     else if (a == "--lcancel-log") lcancel::set_log_path(next());
-    else if (a == "--load-settings" || a == "--lag-test") {}   // handled before this loop
+    // -b: Dolphin's "exit when the replay ends", which a replay here always does (h_replay_finished).
+    else if (a == "--load-settings" || a == "--lag-test" || a == "-b") {}   // handled before this loop
     else if (a == "--music-volume") slippi::jukebox::set_user_volume(std::atoi(next()));   // the Music slider, for scripted runs
     else if (a == "--profile-render") { g_profile = true; g_profiler.render_thread = true; }
     // Recognised in the pre-scan above; listed here so it is not rejected as unknown.
@@ -2655,7 +2684,17 @@ static int melee_main(int argc, char** argv) {
 #endif
   // No --user-dir (say, --iso alone), or one inside the game folder: prepare_sys_assets generates the two
   // managed Sys files into the player's own data folder (sysgen::user_data_dir), on every system.
-  host::prepare_sys_assets(sysgen_user_dir, sysgen_data_dir);
+  if (const std::string disc_problem = host::prepare_sys_assets(sysgen_user_dir, sysgen_data_dir); !disc_problem.empty()) {
+    // The player's disc, not a crash: say so and leave without a crash report (as --vanilla-only does).
+    std::fprintf(stderr, "%s\n", disc_problem.c_str());
+    host::log_flush();
+#ifdef _WIN32
+    if (!automated) MessageBoxA(nullptr, disc_problem.c_str(), "Melee Unlocked", MB_ICONINFORMATION | MB_OK);
+    ExitProcess(2);
+#else
+    std::_Exit(2);
+#endif
+  }
 #ifdef MELEE_SOURCE_PORT
   // The profile picked in the settings panel, unless the command line gave its own mod layers. A
   // profile that no longer loads starts the retail game rather than refusing to start.
@@ -2828,7 +2867,7 @@ static int melee_main(int argc, char** argv) {
   // Both engines: the Source Port starts its game in the branch just below.
   if (!explicit_replay_dir) apply_launcher_replay_choice(o.replay_dir);
   // Not while watching a replay (a short session of its own) or on a run that records nothing.
-  if (std::none_of(argv + 1, argv + argc, [](const char* v) { return std::strcmp(v, "--replay") == 0; }))
+  if (std::none_of(argv + 1, argv + argc, [](const char* v) { return std::strcmp(v, "--replay") == 0 || std::strcmp(v, "-i") == 0; }))
     compress_earlier_replays(o.replay_dir);
 #ifdef _WIN32
   g_crash_settings_path = gfx.settings_path;

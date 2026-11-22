@@ -914,7 +914,8 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
     const auto& refused = update::refusal(j);
     if (update::required(refused)) {
       g_bridge_refusal = "update_required";
-      g_bridge_update_text = update::error_text(j);
+      g_bridge_update_text = update::listed_newer(refused, build_version()) ? update::error_text(j)
+                                                                            : update::not_listed_text(build_version());
       if ((cancelled && cancelled()) || search_stopped()) throw std::runtime_error("Cancelled");
       if (!search_stopped()) {
         g_update_notice.refuse();
@@ -4049,6 +4050,11 @@ uint64_t g_update_deferred_epoch = 0;         // g_update_mutex
 // Opens the panel for this search's refusal, unless the player already closed it for this search.
 void update_open(const json& refusal, uint64_t epoch) {
   if (g_stdio || !g_channel_allowed || !g_channel_up.load()) return;
+  if (!update::listed_newer(refusal, build_version())) {
+    host::log("yougame update: YouGame lists no newer version than %s (it names %s): no Update offered",
+              build_version().c_str(), update::current(refusal).c_str());
+    return;
+  }
   {
     std::lock_guard<std::mutex> lock(g_update_mutex);
     if (epoch == g_update_closed_epoch) return;

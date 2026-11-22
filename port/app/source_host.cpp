@@ -969,9 +969,26 @@ void load_mod_overlay() {
     if (!scan.ok) host::log("mods: alternate stages of %s not listed: %s", stub_disc.filename().u8string().c_str(), scan.message.c_str());
     host::cosmetics::set_session_stage_pack(stub_disc.u8string());
   }
+  // A disc file in place of one of the game's archives (.dat/.usd) whose own header names another size
+  // can never be loaded: HSD_ArchiveParse stops the game (a rebuilt disc's zeroed NtMemAc.usd ended every
+  // boot that showed the memory card notice, 1.0.0 reports). The game's own file stays for it.
+  std::unordered_set<std::string> broken_archives;
+  for (const auto& file : g_mod_overlay.files()) {
+    const auto found = g_paths.find(file.path);
+    if (found == g_paths.end() || g_fst[found->second].dir || stage_stubs.count(file.path)) continue;
+    const std::string& path = file.path;
+    if (path.size() < 4 || (path.compare(path.size() - 4, 4, ".dat") != 0 && path.compare(path.size() - 4, 4, ".usd") != 0)) continue;
+    const FstFile& retail = g_fst[found->second];
+    uint8_t own[4] = {}, game[4] = {};
+    if (retail.length < 0x20 || !host::disc_read(retail.offset, game, 4) || be32(game) != retail.length) continue;
+    if (file.length >= 4 && g_mod_overlay.read(file.start, own, 4) == ModOverlay::Read::Success && be32(own) == file.length) continue;
+    broken_archives.insert(path);
+    host::log("mods: %s in the disc is not a whole archive (header %08X, file %u bytes): the game's own file stays",
+              path.c_str(), be32(own), file.length);
+  }
   uint32_t replaced = 0, added = 0, pack_kept = 0;
   for (const auto& file : g_mod_overlay.files()) {
-    if (stage_stubs.count(file.path)) continue;
+    if (stage_stubs.count(file.path) || broken_archives.count(file.path)) continue;
     if (pack_keeps(file)) { ++pack_kept; continue; }   // retail menus, and no file that carries code
     auto found = g_paths.find(file.path);
     int32_t entry;
@@ -990,7 +1007,7 @@ void load_mod_overlay() {
   // The retail view of every file the layers changed.
   g_view_alias.clear();
   for (const auto& file : g_mod_overlay.files()) {
-    if (pack_keeps(file) || stage_stubs.count(file.path)) continue;   // not served: the disc's own entry, the same in both views
+    if (pack_keeps(file) || stage_stubs.count(file.path) || broken_archives.count(file.path)) continue;   // not served: the disc's own entry, the same in both views
     const auto now = g_paths.find(file.path);
     if (now == g_paths.end()) continue;
     const auto base = base_paths.find(file.path);
@@ -1653,11 +1670,18 @@ static_assert(gx::kArcadeHitboxes == MU_DISPLAY_OPTION_HITBOXES &&
               gx::kArcadeProjectileHitboxes == MU_DISPLAY_OPTION_PROJECTILE_HITBOXES &&
               gx::kArcadeHitboxesBehind == MU_DISPLAY_OPTION_HITBOXES_BEHIND && gx::kArcadeGrid == MU_DISPLAY_OPTION_GRID,
               "Arcade look bits");
+// "Show Training mode's HUD" off. MELEE_TEST_TRAINING_HUD=0|1 (tests) overrides the setting.
+bool training_hud_hidden() {
+  static const int env = [] { const char* v = host::test_env::getenv("MELEE_TEST_TRAINING_HUD"); return v && *v ? (*v == '0' ? 0 : 1) : -1; }();
+  return env >= 0 ? env == 0 : !gx::RenderOptions::live_training_hud();
+}
 // Display-only options (MU_DISPLAY_OPTION_*), read live by the native game's draw code. Never part
 // of a replay or of the match the opponent plays: the viewer's own, as the HUD sizes are.
 uint32_t h_display_options() {
   if (yougame::console::console_active()) return 0;
   return (gx::low_poly_fighters_active() ? MU_DISPLAY_OPTION_LOW_POLY : 0u) |
+         (training_hud_hidden() ? MU_DISPLAY_OPTION_NO_TRAINING_HUD : 0u) |
+         (slippi::online::port_colour_bits() & MU_DISPLAY_OPTION_PORT_COLOURS) |   // online 1v1 port colours
          (gx::player_tags_always_active() ? MU_DISPLAY_OPTION_PLAYER_TAGS : 0u) |
          (gx::fod_reflections_active() ? MU_DISPLAY_OPTION_FOD_REFLECTIONS : 0u) |
          (gx::css_background_free_active() ? MU_DISPLAY_OPTION_CSS_BACKGROUND_FREE : 0u) |
@@ -6210,19 +6234,40 @@ int run(void (*shutdown)(int)) {
   // In the YouGame sandbox (an AppContainer) the host maps the image itself into the range held
   // since startup (g_game_image_reservation) and keeps the hold; elsewhere the loader needs it free.
   const bool sandboxed = in_app_container();
-  if (!sandboxed) g_game_image_reservation.release();
+  // MELEE_TEST_RELOCATED_GAME_IMAGE=1 (tests): the range stays held, so Windows places the library
+  // elsewhere, as a relocation policy does, and the mapping below is what loads it.
+  const bool test_relocated = host::test_env::getenv("MELEE_TEST_RELOCATED_GAME_IMAGE") != nullptr;
+  if (!sandboxed && !test_relocated) g_game_image_reservation.release();
   std::string map_error;
   HMODULE module = sandboxed ? map_game_image(g_dll, &map_error) : LoadLibraryA(g_dll.c_str());
   if (!module && sandboxed) host::die("cannot map %s: %s", g_dll.c_str(), map_error.c_str());
   if (!module) host::die("cannot load %s (error %lu)", g_dll.c_str(), GetLastError());
   if (sandboxed) host::log("source port: %s mapped at its base by the host (sandboxed)", g_dll.c_str());
+  // Windows can put the library somewhere else although its range is free: Exploit protection's
+  // "Force randomization for images" (Mandatory ASLR) relocates every image, and it landed at a new
+  // low address each start (1.0.2 reports: 0x70000, 0xE0000, 0x580000). Then the host maps it at its
+  // base itself, as it does in the YouGame sandbox, in the range taken back for it.
+  bool mapped = sandboxed;
+  if (!sandboxed && (uintptr_t)module != GAME_IMAGE_BASE) {
+    host::log("source port: Windows loaded %s at %p, not at its base (a relocation policy); mapping it there instead",
+              g_dll.c_str(), (void*)module);
+    FreeLibrary(module);
+    if (!g_game_image_reservation.base)
+      g_game_image_reservation.base = VirtualAlloc((void*)GAME_IMAGE_BASE, 0x04000000u, MEM_RESERVE, PAGE_NOACCESS);
+    module = g_game_image_reservation.base ? map_game_image(g_dll, &map_error) : nullptr;
+    if (!module)
+      host::die("%s could not be placed at %llX (%s)", g_dll.c_str(), (unsigned long long)GAME_IMAGE_BASE,
+                g_game_image_reservation.base ? map_error.c_str() : "its address range is in use");
+    mapped = true;
+    host::log("source port: %s mapped at its base by the host", g_dll.c_str());
+  }
   if ((uintptr_t)module != GAME_IMAGE_BASE) host::die("%s loaded at %p, not at %llX", g_dll.c_str(), (void*)module, (unsigned long long)GAME_IMAGE_BASE);
   const auto* nt = (const IMAGE_NT_HEADERS*)((const uint8_t*)module + ((const IMAGE_DOS_HEADER*)module)->e_lfanew);
   host::game_image = (uint8_t*)module;
   host::game_image_size = nt->OptionalHeader.SizeOfImage;
 #endif
 #ifdef _WIN32
-  auto game_proc = [&](const char* name) { return sandboxed ? image_export(module, name) : GetProcAddress(module, name); };
+  auto game_proc = [&](const char* name) { return mapped ? image_export(module, name) : GetProcAddress(module, name); };
 #else
   auto game_proc = [&](const char* name) { return GetProcAddress(module, name); };
 #endif

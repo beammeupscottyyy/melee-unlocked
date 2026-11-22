@@ -101,7 +101,9 @@ int main() {
       {"lobby", {{"version", 1}, {"minPlayers", 4}, {"maxLocalPlayers", 1}, {"compatibility", "mu-build"}}}
     };
     CHECK(team_ticket("mu-build", room) == expected_team);
-    for (const char* bad : {"", "AB", "ABCDEFGHIJ", "ABC-123", "ABC/123", "ABC 123", "###"})
+    CHECK(team_room_code("EC", &room) && room == "mutec0");
+    CHECK(team_room_code("ec#", &room) && room == "mutec0");
+    for (const char* bad : {"", "A", "ABCDEFGHIJ", "ABC-123", "ABC/123", "ABC 123", "###"})
       CHECK(!team_room_code(bad, &room));
     for (int length = 3; length <= 9; ++length) {
       for (char c : std::string("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")) {

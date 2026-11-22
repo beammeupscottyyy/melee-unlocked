@@ -983,6 +983,8 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       // setup hash, so the first byte keeps the meaning Melee Unlocked 0.9.200 to 0.9.211 give it.
       uint8_t caps3 = 0;
       const bool has_caps3 = caps2 && (packet >> caps3);
+      uint8_t colour1 = 0, colour2 = 0;
+      const bool has_colours = has_caps3 && (packet >> colour1) && (packet >> colour2);
       const uint8_t layout = !caps2 ? 0 : has_caps3 ? 2 : 1;
       // Melee Unlocked 0.9.200 to 0.9.211: 0x10 arena rooms, 0x20 automatic L-cancel, 0x40 Gecko codes.
       const bool upstream_arena = !caps2 && (caps & 0x10), upstream_lcancel = !caps2 && (caps & 0x20),
@@ -1021,6 +1023,10 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
         remote_build_[pidx].gecko = (caps2 & MU_BUILD_CAPS2_GECKO) != 0 || upstream_gecko;
         remote_build_[pidx].layout = layout;
         remote_build_[pidx].warmup = warmup;
+        remote_build_[pidx].pause_rule = has_caps3 && (caps3 & MU_BUILD_CAPS3_PAUSE_RULE) != 0;
+        remote_build_[pidx].no_pause = remote_build_[pidx].pause_rule && (caps3 & MU_BUILD_CAPS3_NO_PAUSE) != 0;
+        remote_build_[pidx].port_colour[0] = has_colours && colour1 >= 1 && colour1 <= 4 ? (int8_t)(colour1 - 1) : (int8_t)-1;
+        remote_build_[pidx].port_colour[1] = has_colours && colour2 >= 1 && colour2 <= 4 ? (int8_t)(colour2 - 1) : (int8_t)-1;
         if (warmup && remote_warmup_[pidx].load(std::memory_order_relaxed) < 0) remote_warmup_[pidx].store(0, std::memory_order_relaxed);
       }
       host::log("setup hash: opponent %u %s", port, (caps & MU_SETUP_HASH_CAP) ? "sends a setup hash" : "has no setup hash (not checked)");
@@ -1270,8 +1276,12 @@ void NetplayClient::SendBuild() {
   // reads 0x10/0x20/0x40/0x80 as Squad Strike, pick previews, the setup hash and Squad Strike friend rooms.
   const bool squad_cap = (caps & MU_SQUAD_CAP) != 0, squad_friend_cap = (caps & MU_SQUAD_FRIEND_CAP) != 0;
   // caps3 0x10: this side sends and takes warm-up messages (NP_MSG_MU_WARMUP, 0xE9).
+  // caps3 0x20/0x40: the Direct pause rule and this player's "Pause in Direct and Friends" (sent once a
+  // connection; a change applies from the next one, so both sides always decide from the same bytes).
+  const bool no_pause = !online::config().direct_pause;
+  sent_no_pause_.store(no_pause);
   const uint8_t caps3 = (uint8_t)((squad_cap ? 0x01 : 0) | (squad_friend_cap ? 0x02 : 0) | 0x04 | (setup_hash_on ? 0x08 : 0) |
-                                  MU_BUILD_CAPS3_WARMUP);
+                                  MU_BUILD_CAPS3_WARMUP | MU_BUILD_CAPS3_PAUSE_RULE | (no_pause ? MU_BUILD_CAPS3_NO_PAUSE : 0));
   // A YouGame match (owner 11-19): the peer may be one of YouGame's own builds, which reads the first byte
   // its own way, so there the byte keeps those meanings (Squad Strike, pick previews, setup hash, friend
   // rooms). A build with the third byte reads this build's flags from it either way.
@@ -1293,6 +1303,13 @@ void NetplayClient::SendBuild() {
                   MU_BUILD_CAPS2_ARENA | (lcancel::automatic_active_online() ? MU_BUILD_CAPS2_AUTO_LCANCEL : 0) |
                   MU_BUILD_CAPS2_GECKO | MU_BUILD_CAPS2_WARMUP);
   *p << caps3;   // builds before it stop reading at the second byte
+  // Then the port colour choices (1.0.2 on): first and second, each the colour + 1 (0 none). Older builds
+  // stop reading at the third capability byte.
+  {
+    const int c0 = std::clamp(online::config().port_colour[0], -1, 3), c1 = std::clamp(online::config().port_colour[1], -1, 3);
+    sent_port_colour_.store((c0 & 0xFF) | ((c1 & 0xFF) << 8));
+    *p << (uint8_t)(c0 + 1) << (uint8_t)(c1 + 1);
+  }
   host::log("slippi: sending build: %s%s%s", me.mod_view ? "mod " : "retail game", me.mod_view ? name.c_str() : "",
             early ? " (takes early inputs)" : "");
   SendAsync(std::move(p));
@@ -1314,6 +1331,26 @@ void NetplayClient::SendPrematchPing() {
   Packet p;
   p << (uint8_t)NP_MSG_MU_PING << (uint8_t)'M' << (uint8_t)'U' << (uint8_t)'P' << (uint8_t)1 << (uint8_t)0 << player_idx_ << (uint32_t)time_us();
   Send(p);
+}
+
+bool NetplayClient::PauseOff() {
+  std::lock_guard<std::mutex> lk(build_mutex_);
+  if (remote_player_count_ == 0) return false;
+  bool off = sent_no_pause_.load();
+  for (int i = 0; i < remote_player_count_ && i < REMOTE_PLAYER_MAX; ++i) {
+    if (!remote_build_[i].received || !remote_build_[i].pause_rule) return false;
+    off = off || remote_build_[i].no_pause;
+  }
+  return off;
+}
+
+bool NetplayClient::PortColours(int8_t mine[2], int8_t theirs[2]) {
+  std::lock_guard<std::mutex> lk(build_mutex_);
+  if (remote_player_count_ != 1 || !remote_build_[0].received) return false;
+  const int sent = sent_port_colour_.load();
+  mine[0] = (int8_t)(sent & 0xFF); mine[1] = (int8_t)((sent >> 8) & 0xFF);
+  theirs[0] = remote_build_[0].port_colour[0]; theirs[1] = remote_build_[0].port_colour[1];
+  return true;
 }
 
 bool NetplayClient::ArenaReady() {

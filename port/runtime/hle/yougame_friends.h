@@ -81,7 +81,7 @@ struct InviteEdge {
 };
 inline constexpr const char* kWaiting = "Waiting for your friend...";
 inline constexpr const char* kTeamWaiting = "Waiting for your team...";
-inline constexpr const char* kTeamCodeError = "Team codes need 3 to 9 letters or numbers";
+inline constexpr const char* kTeamCodeError = "Team codes need 2 to 9 letters or numbers";
 inline constexpr int kPickerTimeout = 600000;
 
 // The game's Direct code field is Shift-JIS: ASCII letters and digits with the # as the full-width
@@ -130,7 +130,9 @@ inline bool team_room_code(const std::string& folded, std::string* out) {
     if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return false;
     code += c;
   }
-  if (code.size() < 3 || code.size() > 9) return false;
+  if (code.size() < 2 || code.size() > 9) return false;
+  // A two-letter code ("EC") pads to the six-character room every longer code already makes.
+  if (code.size() == 2) code += '0';
   if (out) *out = "mut" + code;
   return true;
 }

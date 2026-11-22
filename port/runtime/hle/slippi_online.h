@@ -26,12 +26,21 @@ struct Config {
   int delay = 2;                 // Slippi Online input delay (frames)
   bool auto_delay = false;       // pick the delay from the measured ping each match (delay is the fallback)
   int chat = 0;                  // 0 enabled, 1 direct only, 2 disabled
+  // Start pauses Direct and Friends matches (Slippi's rule). Off: no pause when every player's build
+  // reads this rule (MU_BUILD_CAPS3_PAUSE_RULE); against any other build pausing stays as it was.
+  bool direct_pause = true;
+  // Online port colour, first and second choice (0 red, 1 blue, 2 yellow, 3 green; -1 none). In a 1v1 each
+  // player shows in their first choice; when both pick the same, the match's random seed gives it to one
+  // and the other gets their second choice. Only between players who both have it (MU_BUILD port colours).
+  int port_colour[2] = {-1, -1};
   std::string ranked_rules_path; // optional package rules; parsed once after the startup build is set
   // Up to three connect codes never to play in Unranked: a match with one is turned down and the
   // search goes on. Not in Ranked, Direct, Teams or Party.
   std::string blocked_codes[3];
 };
 Config& config();
+// This online 1v1's port colours as bits 28-31 of the display options (MU_DISPLAY_OPTION_PORT_COLOURS), 0 none.
+uint32_t port_colour_bits();
 
 void init();
 void load_ranked_rules();

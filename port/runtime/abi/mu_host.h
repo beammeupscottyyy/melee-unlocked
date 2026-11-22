@@ -497,6 +497,10 @@ typedef struct MuHostApi {
 #define MU_DISPLAY_OPTION_VCANCEL_SOUND      0x00200000u   /* the menu's confirm sound on a successful V-cancel */
 #define MU_DISPLAY_OPTION_NO_FIGHTER_SHADOWS 0x01000000u   /* No Character Shadows: fighters cast no shadow on the stage */
 #define MU_DISPLAY_OPTION_CENTER_2P_HUD      0x04000000u   /* Center Align 2P HUD: players 1 and 2 only, the HUD laid out for two */
+#define MU_DISPLAY_OPTION_NO_TRAINING_HUD    0x08000000u   /* Training's speed, enemy and damage panels are not drawn while its menu is closed */
+/* Online 1v1 port colours (bits 28-31: player 1's colour index, then player 2's; 0 for none): the tag and
+ * damage display of each player in that port colour (0 red, 1 blue, 2 yellow, 3 green). Display only. */
+#define MU_DISPLAY_OPTION_PORT_COLOURS       0xF0000000u
 #define MU_DISPLAY_OPTION_CODES_ALL 0x053FF000u
 /* Offline community codes: they change menu timing and the pause, so the host sends them only
  * outside network play (source_host.cpp h_display_options). Saved with the codes above. */

@@ -105,6 +105,11 @@ constexpr uint8_t NP_MSG_MU_WARMUP_UPSTREAM = 0xE5;
 // MU_BUILD third capability byte (this build on): 0x01 Squad Strike, 0x02 its friend rooms, 0x04 pick
 // previews, 0x08 setup hash, 0x10 warm-up messages (NP_MSG_MU_WARMUP, 0xE9).
 constexpr uint8_t MU_BUILD_CAPS3_WARMUP = 0x10;
+// 0x20: this side decides Direct pausing from every player's 0x40 (1.0.1 on); 0x40: this player turned
+// pausing off. A pause rule only one side applies would split the game at the first Start press, so
+// pausing goes off only when every peer sends 0x20 (and the setup hash covers the pause bit anyway).
+constexpr uint8_t MU_BUILD_CAPS3_PAUSE_RULE = 0x20;
+constexpr uint8_t MU_BUILD_CAPS3_NO_PAUSE = 0x40;
 // First capability byte bit Melee Unlocked 0.9.215 and 0.9.216 read as warm-up (their 0xE5 messages).
 constexpr uint8_t MU_BUILD_CAPS_UPSTREAM_WARMUP = 0x80;
 
@@ -366,7 +371,9 @@ class NetplayClient {
                        bool arena = false;         // takes arena room messages
                        bool auto_lcancel = false;     // presses for L-cancels this session (automatic L-cancel)
                        bool gecko = false;            // takes Gecko code messages (NP_MSG_MU_GECKO)
-                       bool warmup = false; };        // takes and sends warm-up messages (NP_MSG_MU_WARMUP)
+                       bool warmup = false;           // takes and sends warm-up messages (NP_MSG_MU_WARMUP)
+                       bool pause_rule = false, no_pause = false;   // MU_BUILD_CAPS3_PAUSE_RULE / _NO_PAUSE
+                       int8_t port_colour[2] = {-1, -1}; };   // their port colour choices (1.0.2 on), -1 none
   // Warm-up (slippi_warmup.h): tell every opponent whose build takes it that this player is warming up
   // in Training (true) or on the character select (false), and the character picked there (Slippi's
   // external id and costume, 0xFF none: Slippi itself sends a pick only at the lock-in). Any thread.
@@ -409,6 +416,10 @@ class NetplayClient {
   // when it does not, or before its build message arrived); `bulk` sends it on its own reliable
   // channel so the live feed never holds up room messages. PopArena takes the oldest received.
   bool ArenaReady();
+  // Direct pausing is off for this match: someone turned it off and every peer's build reads the rule.
+  bool PauseOff();
+  // The port colour choices this side sent and remote 0's (1v1), -1 none. False before both are known.
+  bool PortColours(int8_t mine[2], int8_t theirs[2]);
   bool SendArena(const uint8_t* data, size_t size, bool bulk);
   bool PopArena(std::vector<uint8_t>& out);
   // Gecko codes for the match (one remote): SendGecko queues one gecko_online message for a peer that
@@ -545,6 +556,8 @@ class NetplayClient {
   // game refused Squad Strike (SquadFriendRefuse).
   std::atomic<bool> squad_peer_build_{false}, squad_peer_friend_cap_{false}, squad_locked_seen_{false},
       squad_refused_{false};
+  std::atomic<bool> sent_no_pause_{false};   // this side's MU_BUILD_CAPS3_NO_PAUSE as last sent
+  std::atomic<int> sent_port_colour_{-1};     // this side's port colour choices as last sent (first | second << 8)
 #ifdef YOUGAME_AGENT_TEST_HOOK
   // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
   bool squad_test_late_lineup_ = false; // guarded by selection_mutex_

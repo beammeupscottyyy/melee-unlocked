@@ -170,22 +170,39 @@ static int mex_costume_safe(int kind)
     return kind < Ft_Kind_MasterH;
 }
 
+/* A pointer the loaded m-ex tables hold: relocated into MxDt.dat as it lies in mex_file. A disc whose
+ * table holds something else there (a file name's bytes: "PlNn" for Nana, 1.0.3 report) is read no
+ * further: dereferenced, it stopped the game at boot. */
+static int mex_ptr_ok(u32 raw)
+{
+    const mu_uptr base = (mu_uptr) mex_file;
+    return raw >= base && raw < base + sizeof mex_file;
+}
+
 /* How many of the first `count` m-ex costumes of `kind` are usable (their files are on the disc);
  * fills the name and parts tables for them. */
 static int mex_prepare_costumes(int kind, int count, int ext)
 {
     MexCostumeFiles* files = DP(DP(mex->fighter)->costume_files);
-    MexCostumeFile* list = DP(files[kind]);
+    MexCostumeFile* list;
     int c;
-    if (list == NULL) {
+    if (!mex_ptr_ok(files[kind].raw)) {
         return 0;
     }
+    list = DP(files[kind]);
     if (count > MEX_MAX_COSTUMES) {
         count = MEX_MAX_COSTUMES;
     }
     for (c = 0; c < count; c++) {
         const u32 vis = list[c].visibility;
-        char* file = DP(list[c].file);
+        char* file;
+        if (!mex_ptr_ok(list[c].file.raw) || (list[c].joint.raw && !mex_ptr_ok(list[c].joint.raw)) ||
+            (list[c].matanim.raw && !mex_ptr_ok(list[c].matanim.raw))) {
+            OSReport("[mex] %s costume %d: its table entry is not a costume (%08X); stopping at %d costumes\n",
+                     mex_name(ext), c, (unsigned) list[c].file.raw, c);
+            break;
+        }
+        file = DP(list[c].file);
         /* Resolved as the game opens it: a name ending in "." takes the language's extension. */
         if (file == NULL || DVDConvertPathToEntrynum(lbFileGetFullName(file)) < 0) {
             OSReport("[mex] %s costume %d: file %s is not on the disc; stopping at %d costumes\n",
@@ -265,13 +282,21 @@ int mu_mex_ak_costumes(int kind, int mex_internal)
     files = DP(ft->costume_files);
     info = DP(ft->costume_info);
     ext = mu_mex_external_of_internal(mex_internal);
-    if (files == NULL || info == NULL || ext < 0 || (list = DP(files[mex_internal])) == NULL) {
+    if (files == NULL || info == NULL || ext < 0 || !mex_ptr_ok(files[mex_internal].raw) ||
+        (list = DP(files[mex_internal])) == NULL) {
         return 0;
     }
     count = info[ext].count < MEX_MAX_COSTUMES ? info[ext].count : MEX_MAX_COSTUMES;
     for (c = 0; c < count; c++) {
         const u32 vis = list[c].visibility;
-        char* file = DP(list[c].file);
+        char* file;
+        if (!mex_ptr_ok(list[c].file.raw) || !mex_ptr_ok(list[c].joint.raw) ||
+            (list[c].matanim.raw && !mex_ptr_ok(list[c].matanim.raw))) {
+            OSReport("[mex] %s costume %d: its table entry is not a costume (%08X); stopping at %d costumes\n",
+                     mex_name(ext), c, (unsigned) list[c].file.raw, c);
+            break;
+        }
+        file = DP(list[c].file);
         if (file == NULL || DP(list[c].joint) == NULL ||
             DVDConvertPathToEntrynum(lbFileGetFullName(file)) < 0)
         {
