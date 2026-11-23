@@ -12,9 +12,21 @@ inline bool is_music_file(const std::string& path) {
   return path.rfind("/audio/", 0) == 0 && path.size() > 11 &&
          path.compare(path.size() - 4, 4, ".hps") == 0;
 }
+// A stage's file, the English twin (GrPs.usd, Pokemon Stadium) included: a pack's Stadium skin in
+// that file was never checked and stayed offline (11-23).
 inline bool is_stage_file(const std::string& path) {
-  return path.rfind("/gr", 0) == 0 && path.find('/', 1) == std::string::npos &&
-         path.size() > 7 && path.compare(path.size() - 4, 4, ".dat") == 0;
+  return path.rfind("/gr", 0) == 0 && path.find('/', 1) == std::string::npos && path.size() > 7 &&
+         (path.compare(path.size() - 4, 4, ".dat") == 0 || path.compare(path.size() - 4, 4, ".usd") == 0);
+}
+// Any other game archive (a fighter's own file, a menu): online only when its copy changes nothing
+// but texture and palette bytes (host::cosmetics::file_textures_only).
+// Menu files are not: online the Slippi menus replace them (source_host kSystemFileNames), on Slippi
+// Dolphin too.
+inline bool is_archive_file(const std::string& path) {
+  for (const char* menu : {"/mn", "/sd", "/slp", "/gamesetup", "/slippicss"})
+    if (path.rfind(menu, 0) == 0) return false;
+  return path.find('/', 1) == std::string::npos && path.size() > 5 &&
+         (path.compare(path.size() - 4, 4, ".dat") == 0 || path.compare(path.size() - 4, 4, ".usd") == 0);
 }
 inline bool music_is_valid(const std::vector<uint8_t>& bytes, std::string* reason) {
   auto fail = [&](const char* text) { if (reason) *reason = text; return false; };

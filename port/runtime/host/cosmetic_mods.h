@@ -430,6 +430,10 @@ std::string costume_thumbnail_path(const std::string& asset_id);
 // The same for one PNG (a portrait or stock icon).
 std::string choose_portrait_file();
 
+// A copy of any game file whose only changes are texture and palette bytes, in the same layout (a
+// pack's recoloured items or menu pictures): drawing only, so it is served online too.
+bool file_textures_only(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate, std::string* detail);
+
 namespace testing {
 struct DatInspection {
   bool ok = false;

@@ -832,7 +832,7 @@ std::string install_script(const std::string& batch_dir, unsigned long self, con
   // waited for a key nobody could press, and the player saw an update that never finished.
   const auto failed = [show_failure](const char* what) {
     if (!show_failure) return std::string("exit /b 1\r\n");   // the unit test: never a window
-    return std::string("start \"Melee Unlocked update\" cmd /k \"echo ") + what +
+    return std::string("start \"Melee Unlocked update\" %SystemRoot%\\System32\\cmd.exe /k \"echo ") + what +
            " & echo Close the game and any open Explorer window on this folder, then update again."
            " & echo Details: update.log in the game folder.\"\r\nexit /b 1\r\n";
   };
@@ -892,15 +892,17 @@ std::string install_script(const std::string& batch_dir, unsigned long self, con
     << "set TRIES=0\r\n"
     << ":copy\r\n"
     << "set /a TRIES+=1\r\n"
-    << "attrib -r \"*.*\" /s >nul 2>&1\r\n"
-    << "xcopy /e /y /q /r \"%SRC%\\*\" \".\\\" >> %LOG% 2>&1\r\n"
+    // Every Windows tool by its full path: a PATH without System32 (a player's, 11-23) answered
+    // "'xcopy' is not recognized" five times, then the same for robocopy, and the update never copied.
+    << "%SystemRoot%\\System32\\attrib.exe -r \"*.*\" /s >nul 2>&1\r\n"
+    << "%SystemRoot%\\System32\\xcopy.exe /e /y /q /r \"%SRC%\\*\" \".\\\" >> %LOG% 2>&1\r\n"
     << "if not errorlevel 1 goto copied\r\n"
-    << "if %TRIES% lss 5 (echo copy attempt %TRIES% failed, retrying>> %LOG% & timeout /t 2 /nobreak >nul & goto copy)\r\n"
+    << "if %TRIES% lss 5 (echo copy attempt %TRIES% failed, retrying>> %LOG% & (%SystemRoot%\\System32\\timeout.exe /t 2 /nobreak >nul 2>&1 || %SystemRoot%\\System32\\PING.EXE -n 3 127.0.0.1 >nul) & goto copy)\r\n"
     // xcopy stops at the first path of 255 characters or more (a deep game folder and a long file
     // name inside the release), leaving the folder half updated. robocopy copies those too; its exit
     // codes below 8 mean every file is in place.
     << "echo copy failed after %TRIES% attempts, trying robocopy>> %LOG%\r\n"
-    << "robocopy \"%SRC%\" \".\" /E /IS /IT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >> %LOG% 2>&1\r\n"
+    << "%SystemRoot%\\System32\\Robocopy.exe \"%SRC%\" \".\" /E /IS /IT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >> %LOG% 2>&1\r\n"
     << "if not errorlevel 8 goto copied\r\n"
     << "echo robocopy failed too>> %LOG%\r\n"
     << failed("Could not copy the update into place.")

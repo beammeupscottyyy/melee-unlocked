@@ -571,6 +571,24 @@ std::vector<uint8_t> audio_fst(const std::string& bank, uint32_t jp_start, uint3
 }
 
 int main(int argc, char** argv) {
+  // A probe for a stage file pair (an original and a pack's copy): the full online verdict, then exit.
+  // Usage: port_cosmetic_mods_test --stage <original> <skin> <disc file name>
+  // ... --textures <original> <copy>: whether only texture and palette bytes differ.
+  if (argc == 4 && std::string(argv[1]) == "--textures") {
+    const auto load = [](const char* path) { std::ifstream f(path, std::ios::binary); std::vector<uint8_t> v((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); return v; };
+    std::string detail;
+    const bool ok = host::cosmetics::file_textures_only(load(argv[2]), load(argv[3]), &detail);
+    std::printf("%s: %s\n", ok ? "textures only" : "more than textures", detail.c_str());
+    return ok ? 0 : 1;
+  }
+  if ((argc == 5 || argc == 6) && std::string(argv[1]) == "--stage") {   // a sixth argument: write the online form there
+    const auto load = [](const char* path) { std::ifstream f(path, std::ios::binary); std::vector<uint8_t> v((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()); return v; };
+    std::vector<uint8_t> online; std::string detail;
+    const bool ok = host::cosmetics::stage_online_form(load(argv[2]), load(argv[3]), &online, &detail, argv[4]);
+    std::printf("%s (%zu bytes online): %s\n", ok ? "online" : "offline", online.size(), detail.c_str());
+    if (ok && argc == 6 && !online.empty()) { std::ofstream(argv[5], std::ios::binary).write((const char*)online.data(), (std::streamsize)online.size()); }
+    return ok ? 0 : 1;
+  }
   test_fighter_sound_overlay();
   wchar_t temp_root[MAX_PATH]; GetTempPathW(MAX_PATH, temp_root);
   fs::path folder = fs::path(temp_root) /
@@ -838,6 +856,25 @@ int main(int argc, char** argv) {
     check(!host::cosmetics::testing::costume_skeleton_matches(vanilla, skeleton_dat(0x2, 5.5f, false), &why) &&
               online_reason_short(why) == "bone 1: rest pose differs (moved)",
           "costume skeleton: a moved bone is named and said to have moved");
+    {
+      // One rotation written two ways: (x, y, z) and (x - pi, -pi - y, z - pi) turn a bone the same, and
+      // model tools pick either (a Falco skin's bone 40, 11-23). A real turn still keeps it offline.
+      const auto turned = [&](float x, float y, float z) {
+        auto dat = skeleton_dat(0x2, 5.0f, false);
+        const float r[3] = {x, y, z};
+        for (int i = 0; i < 3; ++i) { uint32_t bits; std::memcpy(&bits, &r[i], 4); be32(dat, 0x20 + 0x40 + 0x14 + i * 4, bits); }
+        return dat;
+      };
+      const float pi = 3.14159265f;
+      const auto standard = turned(0.8203f, -2.4086f, 0.8203f);
+      check(host::cosmetics::testing::costume_skeleton_matches(standard, turned(0.8203f - pi, -pi + 2.4086f, 0.8203f - pi), &why),
+            "costume skeleton: the same rotation in other angles stays online");
+      check(host::cosmetics::testing::costume_skeleton_matches(turned(0.f, 0.f, pi), turned(0.f, 0.f, -pi), &why),
+            "costume skeleton: a half turn either way is the same");
+      check(!host::cosmetics::testing::costume_skeleton_matches(standard, turned(0.8203f, -2.4086f, 1.1f), &why) &&
+                online_reason_short(why) == "bone 1: rest pose differs (rotated)",
+            "costume skeleton: a really turned bone keeps the costume offline");
+    }
     check(!host::cosmetics::testing::costume_skeleton_matches(vanilla, skeleton_dat(0x2 | 0x20000, 5.0f, false), &why) &&
               online_reason_short(why) == "bone 0: settings differ",
           "costume skeleton: a transform flag change names the bone");

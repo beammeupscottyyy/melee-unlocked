@@ -8,6 +8,7 @@
 #include "stage_dat_safety.h"
 #include "stage_read_pin.h"
 #include "stage_graft.h"
+#include "stage_floor_fit.h"
 
 #include "host.h"
 #include "updater.h"
@@ -1550,19 +1551,47 @@ constexpr uint32_t kVisualFlags = 0x1u | 0x2u | 0x4u | 0x8u | 0x10u | 0x20u | 0x
 // are compared as numbers with a small tolerance; a real change of a joint is far larger.
 // Returns which parts of the rest pose differ (0 when none do), so the reason can say what changed.
 constexpr uint32_t kRestRotated = 1, kRestResized = 2, kRestMoved = 4;
+// The game builds a joint's rotation from its three angles as Rz * Ry * Rx (HSD_MtxSRT). One
+// rotation has more than one set of angles: (x+pi, pi-y, z+pi) and +-pi are the same turn, and model
+// tools pick either when they export. Comparing the angles called such a skin "rotated" (a Falco
+// skin, 11-23); the rotation matrices are what the bones get, so those are compared.
+inline void rest_rotation(float x, float y, float z, double m[9]) {
+  const double cx = std::cos(x), sx = std::sin(x), cy = std::cos(y), sy = std::sin(y), cz = std::cos(z), sz = std::sin(z);
+  m[0] = cy * cz; m[1] = cz * sx * sy - cx * sz; m[2] = cx * cz * sy + sx * sz;
+  m[3] = cy * sz; m[4] = cx * cz + sx * sy * sz; m[5] = cx * sy * sz - cz * sx;
+  m[6] = -sy;     m[7] = cy * sx;                m[8] = cx * cy;
+}
 inline uint32_t rest_pose_difference(const uint8_t* p, const uint8_t* q) {
   uint32_t differs = 0;
-  for (int i = 0; i < 9; ++i) {
+  {
+    float a[3], b[3];
+    bool finite = true, same = true;
+    for (int i = 0; i < 3; ++i) {
+      uint32_t ua = be32(p + i * 4), ub = be32(q + i * 4);
+      std::memcpy(&a[i], &ua, 4); std::memcpy(&b[i], &ub, 4);
+      finite = finite && std::isfinite(a[i]) && std::isfinite(b[i]);
+      same = same && ua == ub;
+    }
+    if (!same) {
+      if (!finite) differs |= kRestRotated;
+      else {
+        double ma[9], mb[9];
+        rest_rotation(a[0], a[1], a[2], ma);
+        rest_rotation(b[0], b[1], b[2], mb);
+        // The first three values are the rest rotation, which a fighter's animations replace on every
+        // frame, so an exporter's rounding there gets more room than in scale and translation.
+        for (int i = 0; i < 9; ++i) if (std::fabs(ma[i] - mb[i]) > 1e-2) { differs |= kRestRotated; break; }
+      }
+    }
+  }
+  for (int i = 3; i < 9; ++i) {
     uint32_t ua = be32(p + i * 4), ub = be32(q + i * 4);
     float fa, fb; std::memcpy(&fa, &ua, 4); std::memcpy(&fb, &ub, 4);
     if (ua == ub) continue;
     const uint32_t part = i < 3 ? kRestRotated : i < 6 ? kRestResized : kRestMoved;
     if (!std::isfinite(fa) || !std::isfinite(fb)) { differs |= part; continue; }
     const float scale = std::max(1.0f, std::max(std::fabs(fa), std::fabs(fb)));
-    // The first three values are the rest rotation, which a fighter's animations replace on every
-    // frame, so an exporter's rounding there gets more room than in scale and translation.
-    const float tolerance = i < 3 ? 1e-2f : 1e-3f;
-    if (std::fabs(fa - fb) > tolerance * scale) differs |= part;
+    if (std::fabs(fa - fb) > 1e-3f * scale) differs |= part;
   }
   return differs;
 }
@@ -6733,6 +6762,14 @@ RepublishResult republish_stage(uint8_t* fst, uint32_t fst_size, const std::stri
   return result;
 }
 
+bool file_textures_only(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate, std::string* detail) {
+  std::string local;
+  if (!detail) detail = &local;
+  if (!visual_dat_only(clean, candidate, detail)) return false;
+  *detail = "textures only";
+  return true;
+}
+
 bool stage_gameplay_matches(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate,
                             std::string* detail) {
   std::string local;
@@ -6745,7 +6782,16 @@ bool stage_online_form(const std::vector<uint8_t>& clean, const std::vector<uint
                        std::vector<uint8_t>* online, std::string* detail, const std::string& stage_file) {
   std::string local;
   if (!detail) detail = &local;
-  if (stage_gameplay_matches(clean, skin, detail)) { if (online) online->clear(); return true; }
+  // Every form served online also draws its floors where the collision is (stage_floor_fit.h): 20XX's
+  // tilting Battlefield drew sloped platforms over flat ones online (CHARA, 11-23). A form that does
+  // not is passed over; with none left the standard stage is served online, as for any refused skin.
+  std::string floor_note;
+  bool floor_refused = false;   // a form was passed over for its floors: that is the reason given
+  if (stage_gameplay_matches(clean, skin, detail)) {
+    if (stage_safety::floor_art_fits(clean, skin, &floor_note)) { if (online) online->clear(); return true; }
+    *detail = floor_note;
+    return false;
+  }
   const std::string as_is = *detail;
   std::string note;
   // The skin's gameplay values put back to the original's (stage_safety::restore_gameplay): a skin
@@ -6758,9 +6804,13 @@ bool stage_online_form(const std::vector<uint8_t>& clean, const std::vector<uint
   // skins that set the music table and rebuild the stage were all served as the original online).
   if (stage_safety::restore_gameplay(clean, skin, &restored, &note)) {
     if (stage_draw_safe(restored, &note)) {
-      *detail = "the skin with the original stage's gameplay values";
-      if (online) *online = std::move(restored);
-      return true;
+      if (stage_safety::floor_art_fits(clean, restored, &floor_note)) {
+        *detail = "the skin with the original stage's gameplay values";
+        if (online) *online = std::move(restored);
+        return true;
+      }
+      note = floor_note;
+      floor_refused = true;
     }
   }
   // A copy restore_gameplay could only partly repair is still tried first, as 0.9.13 did.
@@ -6772,15 +6822,19 @@ bool stage_online_form(const std::vector<uint8_t>& clean, const std::vector<uint
     if (base->empty()) continue;
     std::string try_note;
     std::vector<uint8_t> out;
-    if (!stage_safety::graft_visuals(clean, *base, &out, &try_note, stage_safety::visual_only_models(stage_file))) {
+    if (!stage_safety::graft_visuals(clean, *base, &out, &try_note, stage_safety::visual_only_models(stage_file),
+                                      stage_safety::same_motion_models(stage_file))) {
       if (!drawn) note = try_note;
       continue;
     }
     if (!stage_draw_safe(out, &try_note)) { note = "drawn over the original: " + try_note; continue; }
+    if (!stage_safety::floor_art_fits(clean, out, &floor_note)) {
+      note = "drawn over the original: " + floor_note; floor_refused = true; continue;
+    }
     grafted = std::move(out); note = try_note; drawn = true;
     break;
   }
-  if (!drawn) { *detail = as_is + "; " + note; return false; }
+  if (!drawn) { *detail = floor_refused ? floor_note : as_is + "; " + note; return false; }
   *detail = "drawn over the original stage's gameplay (" + note + ")";
   if (online) *online = std::move(grafted);
   return true;

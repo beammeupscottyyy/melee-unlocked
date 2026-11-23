@@ -2,6 +2,7 @@
  * these straight out of guest memory at the console's addresses; the native game keeps them in its
  * own structures with the host's layout, so it hands them over through MuGameApi.lcancel_view. */
 #include "mu_lcancel_view.h"
+#include "mu_native.h"
 
 #include <melee/ft/fighter.h>
 #include <melee/ft/types.h>
@@ -69,4 +70,35 @@ void mu_lcancel_view(MuLcancelView* out)
         out->port[port].frames_since_trigger = fp->x67F;
         out->port[port].anim_frame = fp->cur_anim_frame;
     }
+}
+
+/* What each CPU fighter is being fed, as a controller, for the input display. A CPU has no controller:
+ * the display drew its port's (empty) one, so a CPU's actions changed while its buttons and sticks
+ * never moved (Fight a pro, 11-23). Read from the fighter's own input, where every kind of CPU ends up.
+ * Per slot: present, stick x, y, C-stick x, y (80 = full), trigger (0-255), buttons (pad bits), unused.
+ * Found by name by the host, so a host without it and a game without it still load each other. */
+MU_EXPORT int mu_cpu_pads_v1(int out[4][8])
+{
+    int slot, shown = 0;
+    __builtin_memset(out, 0, sizeof(int) * 4 * 8);
+    for (slot = 0; slot < 4; ++slot) {
+        HSD_GObj* gobj;
+        Fighter* fp;
+        float t;
+        if (Player_GetPlayerSlotType(slot) == Gm_PKind_Human || Player_GetPlayerState(slot) == 0)
+            continue;
+        gobj = Player_GetEntityAtIndex(slot, 0);
+        if (gobj == NULL || !fighter_alive(gobj) || (fp = gobj->user_data) == NULL || fp->gobj != gobj)
+            continue;
+        out[slot][0] = 1;
+        out[slot][1] = (int) (fp->input.lstick[0].x * 80.0f);
+        out[slot][2] = (int) (fp->input.lstick[0].y * 80.0f);
+        out[slot][3] = (int) (fp->input.cstick[0].x * 80.0f);
+        out[slot][4] = (int) (fp->input.cstick[0].y * 80.0f);
+        t = fp->input.triggers[0] * 140.0f;
+        out[slot][5] = t < 0.0f ? 0 : t > 255.0f ? 255 : (int) t;
+        out[slot][6] = (int) (fp->input.held_buttons[0] & 0xFFFFu);
+        ++shown;
+    }
+    return shown;
 }

@@ -53,6 +53,15 @@ inline bool dualsense_pad(unsigned long vendor, unsigned long product) {
 constexpr int8_t kTriggerRestMin = 0, kTriggerRestCentre = 1, kTriggerRestMax = 2;
 int8_t hid_trigger_rest(long logical_min, long logical_max, long raw);
 uint8_t hid_trigger_value(long logical_min, long logical_max, long raw, int8_t rest);
+// The trigger's origin taken off, as the console's pad library does when it reads a controller (the
+// game's own clamp takes nothing off): the lowest value seen, at most 64 (a trigger held when the pad
+// appeared), starting from the first. `origin` is the pad's own, kTriggerOriginUnknown at first.
+constexpr uint8_t kTriggerOriginUnknown = 255, kTriggerOriginMax = 64;
+inline uint8_t hid_trigger_from_origin(uint8_t value, uint8_t* origin) {
+  if (*origin == kTriggerOriginUnknown) *origin = value < kTriggerOriginMax ? value : kTriggerOriginMax;
+  else if (value < *origin) *origin = value;
+  return value > *origin ? (uint8_t)(value - *origin) : 0;
+}
 // A stick axis as the reader turns it into the pad's signed value (floored, no deadzone), for tests.
 int8_t hid_axis_signed(long logical_min, long logical_max, long raw, bool flip = false);
 
@@ -168,6 +177,6 @@ int hidpad_axis_capture_poll(int slot);
 // expected to be held where the capture found it: right or up for a stick, which sets or clears that
 // direction's invert switch so the push reads the way it was made; a trigger rests where the capture began.
 void hidpad_assign_axis(int slot, int role, int axis);
-const char* hidpad_axis_name(int axis);
+const char* hidpad_axis_name(int slot, int axis);
 
 }  // namespace host

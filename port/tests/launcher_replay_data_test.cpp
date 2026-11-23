@@ -151,7 +151,11 @@ int main(int argc,char** argv) {
     const std::string packed=slpz::compress_file(path.u8string());
     if(packed.empty()) return 20;
     auto from_slpz=launcher::replay::inspect(std::filesystem::u8path(packed),true);
-    std::filesystem::remove(std::filesystem::u8path(packed));
+    // And back: the .slp it held, byte for byte, with the .slpz gone.
+    const std::string unpacked=slpz::decompress_file(packed);
+    std::vector<uint8_t> back;
+    if(unpacked.empty() || std::filesystem::exists(std::filesystem::u8path(packed)) ||
+       !slpz::read_replay(unpacked,back) || back.size()!=file.size() || !std::equal(back.begin(),back.end(),file.begin())) return 22;
     if(!from_slpz.valid || from_slpz.stage!=info.stage || from_slpz.players.size()!=info.players.size() ||
        from_slpz.players[0].name!=info.players[0].name || from_slpz.players[0].l_success!=info.players[0].l_success ||
        from_slpz.start_at!=info.start_at) return 21;

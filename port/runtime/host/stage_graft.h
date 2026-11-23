@@ -61,6 +61,27 @@ inline std::set<uint32_t> visual_only_models(std::string stage_file) {
   // their animations 0 to 8 and waits for each to end (animate_all) before the next step, which draws
   // random numbers. A skin's copy with other animations crashed the swap (0.9.991 crash report).
   if (stage_file == "grnla.dat" || stage_file == "grnla.usd") return {1, 2};
+  // Dream Land, groldpupupu.c: 3 (backdrop: animation 0 and a material flag, grOldPupupu_80211110),
+  // 4 (animation 0, grOldPupupu_80210B04) and 6 (the flowers along the front: animation 0 or 1 when
+  // Whispy blows, grOldPupupu_80211C1C) have empty or animation-only updates, no collision and no
+  // random draws; nothing else finds them by index. A skin that sank the flowers below the ground
+  // had them back on top online when its joints took the original's places (ImpX's disc, 11-23).
+  if (stage_file == "grop.dat" || stage_file == "grop.usd") return {3, 4, 6};
+  return {};
+}
+
+// Stage models whose code reads only the root joint's place and otherwise waits on the model's own
+// animations: taken whole only when the skin's root joint and every animation slot of the model entry
+// are the original's byte for byte, so the timing and the root stay the same. Then the joints under
+// the root may sit where the skin put them.
+// Dream Land, groldpupupu.c: 7 is Whispy. His update (grOldPupupu_802113E0) reads the root's
+// translation (the side he blows to) and waits for the model's animation to end (grAnime_801C83D0);
+// no collision. A skin that sank the flower patches in his model had them back online (ImpX, 11-23).
+inline std::set<uint32_t> same_motion_models(std::string stage_file) {
+  for (char& c : stage_file) c = (char)std::tolower((unsigned char)c);
+  const size_t slash = stage_file.find_last_of("/\\");
+  if (slash != std::string::npos) stage_file = stage_file.substr(slash + 1);
+  if (stage_file == "grop.dat" || stage_file == "grop.usd") return {7};
   return {};
 }
 
@@ -68,7 +89,8 @@ inline std::set<uint32_t> visual_only_models(std::string stage_file) {
 // empty: the caller serves the original stage, as before. `whole` (visual_only_models) are the
 // models taken from the skin whole instead of joint by joint.
 inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& skin,
-                          std::vector<uint8_t>* out, std::string* note, const std::set<uint32_t>& whole = {}) {
+                          std::vector<uint8_t>* out, std::string* note, const std::set<uint32_t>& whole_in = {},
+                          const std::set<uint32_t>& same_motion = {}) {
   using namespace graft_detail;
   out->clear();
   Archive a{clean}, b{skin};
@@ -120,6 +142,25 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
   const uint32_t ha = a.roots.at("map_head"), hb = b.roots.at("map_head");
   const uint32_t count = a.get(ha + 12);
   if (count != b.get(hb + 12)) { *note = "the skin has a different number of stage models"; return false; }
+  // same_motion_models: whole only with the original's root joint and animations, byte for byte.
+  std::set<uint32_t> whole = whole_in;
+  for (uint32_t i : same_motion) {
+    if (i >= count) continue;
+    const uint32_t pa = a.get(ha + 8) + i * 52, pb = b.get(hb + 8) + i * 52;
+    if (!a.pointers.count(pa) || !b.pointers.count(pb)) continue;
+    const uint32_t ra = a.get(pa), rb = b.get(pb);
+    bool same = a.bounds(ra, 56) && b.bounds(rb, 56) && a.get(ra + 4) == b.get(rb + 4) &&
+                !std::memcmp(a.bytes.data() + 32ull + ra + 20, b.bytes.data() + 32ull + rb + 20, 36);
+    for (uint32_t k = 4; same && k < 52; k += 4) {
+      const bool pointer_a = a.pointers.count(pa + k) != 0, pointer_b = b.pointers.count(pb + k) != 0;
+      if (pointer_a != pointer_b) { same = false; break; }
+      if (!pointer_a) { same = a.get(pa + k) == b.get(pb + k); continue; }
+      std::string why;
+      Compare motion{a, b, &why}; motion.allow_visual = false;
+      same = motion.object(a.get(pa + k), b.get(pb + k));
+    }
+    if (same) whole.insert(i);
+  }
 
   // 1. Pair the joints: each original joint with the skin joint at the same place, children matched by
   //    transform and flags so a removed sibling does not shift the rest. 0 = no counterpart.
@@ -163,7 +204,7 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
     };
     size_t next = 0;
     const bool child_tail = tail && !a.pointers.count(ja + 12);
-    for (uint32_t x : ca) {
+    for (const uint32_t& x : ca) {   // by reference: its index is used below
       uint32_t match = 0;
       // Prefer an exact flag match. Exporters also change transform/visibility
       // flags while retaining the same local transform; grafting never copies
@@ -173,6 +214,15 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
           if (!used[k] && (pass < 2 ? same(x, cb[k], pass == 0) : near(x, cb[k]))) {
             match = cb[k]; used[k] = true; next = k + 1; break;
           }
+      // The same place in a branch of the same shape: a skin that moved a joint further than `near`
+      // allows (a custom Onett lowered two groups by 7 units, 11-23) still sits on it. The grafted file
+      // keeps the original's transform, so its mesh is drawn where the original's is, over the
+      // original's gameplay; only the sibling counts and the non-drawing flags have to agree.
+      const size_t index = size_t(&x - ca.data());
+      if (!match && ca.size() == cb.size() && index >= next && !used[index] &&
+          ((a.get(x + 4) & ~kDrawFlags) == (b.get(cb[index] + 4) & ~kDrawFlags))) {
+        match = cb[index]; used[index] = true; next = index + 1;
+      }
       walk(x, match, depth + 1, child_tail);
     }
   };

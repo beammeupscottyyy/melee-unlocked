@@ -313,6 +313,8 @@ int css_join_tick();
 int32_t h_console_origin(int32_t operation);
 unsigned g_handoff_disc_depth = 0;
 unsigned (*g_handoff_callbacks_pending)() = nullptr;
+// The game's CPU fighters' inputs as controllers (shim/mu_lcancel.c mu_cpu_pads_v1), for the input display.
+int (*g_cpu_pads)(int out[4][8]) = nullptr;
 void friends_handoff_tick();
 struct FriendsHandoffRuntime {
   handoff_state::Identity identity;
@@ -667,7 +669,10 @@ void compute_pack_skin_verdicts(const std::unordered_map<std::string, int32_t>& 
     const bool costume = skins::is_costume_file(file.path);
     const bool stage = skins::is_stage_file(file.path);
     const bool music = skins::is_music_file(file.path);
-    if (!costume && !stage && !music) continue;
+    // Recoloured items, effects or menu pictures in any other archive (a pack's Peach and Sheik files,
+    // its stage select): served online when only their textures changed.
+    const bool textures = !costume && !stage && !music && skins::is_archive_file(file.path);
+    if (!costume && !stage && !music && !textures) continue;
     const auto now = g_paths.find(file.path);
     const auto base = base_paths.find(file.path);
     if (now == g_paths.end() || base == base_paths.end() || base_fst[base->second].dir) continue;
@@ -700,6 +705,7 @@ void compute_pack_skin_verdicts(const std::unordered_map<std::string, int32_t>& 
       std::string detail;
       verdict.served = costume ? host::cosmetics::costume_skeleton_matches(clean, pack, &detail)
                      : stage ? host::cosmetics::stage_safety::matches(clean, pack, &detail)
+                     : textures ? host::cosmetics::file_textures_only(clean, pack, &detail)
                              : skins::music_is_valid(pack, &detail);
       verdict.reason = host::cosmetics::online_reason_short(detail);
       // A stage that is not the same file may still be the same stage: the pack's look drawn over
@@ -3568,6 +3574,17 @@ void h_pad_read(MuPadStatus out[4]) {
     out[i].analog_a = pads[i].analog_a; out[i].analog_b = pads[i].analog_b;
     out[i].err = pads[i].err;
   }
+  // MELEE_TRACE_CPU_PADS=1: what the game says its CPU fighters are fed, once a second, for a hidden test.
+  static const bool trace_cpu_pads = [] { const char* v = std::getenv("MELEE_TRACE_CPU_PADS"); return v && *v == '1'; }();
+  if (trace_cpu_pads && g_cpu_pads) {
+    static unsigned calls = 0; static int moved[4] = {};
+    int cpu[4][8];
+    if (g_cpu_pads(cpu) > 0) {
+      for (int i = 0; i < 4; ++i) if (cpu[i][0] && (cpu[i][1] || cpu[i][2] || cpu[i][6])) ++moved[i];
+      if (++calls % 60 == 0)
+        for (int i = 0; i < 4; ++i) if (cpu[i][0]) host::log("cpu pad: slot %d stick %d,%d c %d,%d trigger %d buttons %04X (frames with input so far %d)", i + 1, cpu[i][1], cpu[i][2], cpu[i][3], cpu[i][4], cpu[i][5], (unsigned)cpu[i][6], moved[i]);
+    }
+  }
   // 20XX TE input display (offline matches and replays): the controllers the game read.
   training_overlay::set_input_display(te_host_feature(MU_GAME_OPTION2_TE_INPUT_DISPLAY));
   // Training Lab overlay: what the game read this frame, with the fighters' state.
@@ -3576,7 +3593,22 @@ void h_pad_read(MuPadStatus out[4]) {
       g_game.state_snapshot) {
     MuStatePod state{};
     g_game.state_snapshot(&state);
-    training_overlay::publish(state, out);
+    // A CPU has no controller: its slot shows what its fighter is being fed (last frame's, as the fighters'
+    // state beside it is).
+    MuPadStatus shown[4];
+    std::memcpy(shown, out, sizeof shown);
+    int cpu[4][8];
+    if (g_cpu_pads && g_cpu_pads(cpu) > 0)
+      for (int i = 0; i < 4; ++i) {
+        if (!cpu[i][0]) continue;
+        shown[i] = {};
+        shown[i].stick_x = (int8_t)cpu[i][1]; shown[i].stick_y = (int8_t)cpu[i][2];
+        shown[i].sub_x = (int8_t)cpu[i][3]; shown[i].sub_y = (int8_t)cpu[i][4];
+        shown[i].trigger_l = shown[i].trigger_r = 0;
+        shown[i].trigger_r = (uint8_t)cpu[i][5];
+        shown[i].button = (uint16_t)cpu[i][6];
+      }
+    training_overlay::publish(state, shown);
   }
   if (!host::options.input_log.empty()) {   // --input-log, same CSV as the recompiled build
     static FILE* input_log = std::fopen(host::options.input_log.c_str(), "w");
@@ -6355,6 +6387,7 @@ int run(void (*shutdown)(int)) {
 #endif
   auto entry = (MuGameEntry)game_proc("mu_game_entry");
   g_handoff_callbacks_pending = (unsigned (*)())game_proc("mu_handoff_callbacks_pending_v1");
+  g_cpu_pads = (int (*)(int[4][8]))game_proc("mu_cpu_pads_v1");
 #ifdef __APPLE__
   g_loaded_game_path = g_dll; // The custom ELF mapper owns this exact resources path.
 #else

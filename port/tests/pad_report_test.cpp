@@ -96,6 +96,28 @@ void check_triggers() {
   CHECK(host::hid_trigger_rest(0, 255, 0) == host::kTriggerRestMin);
   CHECK(host::hid_trigger_value(0, 255, 0, host::kTriggerRestMin) == 0);
   CHECK(host::hid_trigger_value(0, 255, 255, host::kTriggerRestMin) == 255);
+  CHECK(host::hid_trigger_value(0, 255, 49, host::kTriggerRestMin) == 49);
+  // A B0XX r2 in DInput (-32767..32767): rest, light shield, mid shield as the bytes Dolphin makes of them.
+  CHECK(host::hid_trigger_value(-32767, 32767, 40735 - 65536, host::kTriggerRestMin) == 30);
+  CHECK(host::hid_trigger_value(-32767, 32767, 53328 - 65536, host::kTriggerRestMin) == 79);
+  CHECK(host::hid_trigger_value(-32767, 32767, 64893 - 65536, host::kTriggerRestMin) == 124);
+  CHECK(host::hid_trigger_value(-32767, 32767, 32767, host::kTriggerRestMin) == 255);
+  // The origin, as the console's pad library takes it: the trigger's resting value comes off every
+  // reading (the game's own clamp takes nothing off). A B0XX r2 in DInput rests at 30, so light and
+  // mid shield reach the game as 49 and 94, Slippi's values; at rest the game sees 0 (11-23).
+  {
+    uint8_t origin = host::kTriggerOriginUnknown;
+    CHECK(host::hid_trigger_from_origin(30, &origin) == 0);
+    CHECK(host::hid_trigger_from_origin(79, &origin) == 49);
+    CHECK(host::hid_trigger_from_origin(124, &origin) == 94);
+    CHECK(host::hid_trigger_from_origin(255, &origin) == 225);
+    CHECK(host::hid_trigger_from_origin(30, &origin) == 0);
+    uint8_t zero = host::kTriggerOriginUnknown;   // a trigger resting at 0 is unchanged
+    CHECK(host::hid_trigger_from_origin(0, &zero) == 0 && host::hid_trigger_from_origin(140, &zero) == 140);
+    uint8_t held = host::kTriggerOriginUnknown;   // held down when the pad appeared: no origin past 64,
+    CHECK(host::hid_trigger_from_origin(255, &held) == 191);   // and the lower rest seen after takes over
+    CHECK(host::hid_trigger_from_origin(30, &held) == 0 && host::hid_trigger_from_origin(79, &held) == 49);
+  }
   // vJoy's Z with nothing writing it: 16384 of 0..32767. Released there, fully pressed at the top.
   const int8_t vjoy = host::hid_trigger_rest(0, 32767, 16384);
   CHECK(vjoy == host::kTriggerRestCentre);
@@ -740,6 +762,13 @@ static void check_signed_field_byte() {
     CHECK(hid_stick_value(-32768, 32767, 16, 0, kStickDeclared, flip) == 0);
     CHECK(hid_stick_value(-32768, 32767, 16, 127, kStickDeclared, flip) == 0);
   }
+  // Declared -32767..32767, resting on 127 (a B0XX, 11-23): scaled from the middle it read 0 on X and, flipped, -1 on Y.
+  for (const bool flip : {false, true}) {
+    CHECK(hid_stick_value(-32767, 32767, 16, 127, kStickDeclared, flip) == 0);
+    CHECK(hid_stick_value(-32767, 32767, 16, 48, kStickDeclared, flip) == 0);
+  }
+  CHECK(hid_stick_value(-32767, 32767, 16, 20688, kStickDeclared, true) == -80);
+  CHECK(hid_stick_value(-32767, 32767, 16, (unsigned long)(65536 - 20432), kStickDeclared, true) == 80);
   CHECK(hid_stick_value(-32768, 32767, 16, 20688, kStickDeclared) == 80);
   CHECK(hid_stick_value(-32768, 32767, 16, (unsigned long)(65536 - 20432), kStickDeclared) == -80);
   CHECK(hid_stick_value(-32768, 32767, 16, 20688, kStickDeclared, true) == -80);

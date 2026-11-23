@@ -193,8 +193,14 @@ static void open_log_file() {
                    startup_mark().c_str());
     std::fprintf(g_log_file, "%s\n", cpu_power_line("at start").c_str());
     // Started again by the last process after the graphics device was lost (restart_after_device_loss).
-    if (const char* lost = std::getenv("MELEE_DEVICE_LOST"))
-      std::fprintf(g_log_file, "started again after the graphics device was lost (restart %d)\n", std::atoi(lost));
+    // With what was lost: the lost process's own log is gone by the time a player sends logs from the
+    // new one (a Radeon 780M lost it twice at a Fountain of Dreams online start, 11-23, and the report
+    // said only "restart 2").
+    if (const char* lost = std::getenv("MELEE_DEVICE_LOST")) {
+      const char* why = std::getenv("MELEE_DEVICE_LOST_WHY");
+      std::fprintf(g_log_file, "started again after the graphics device was lost (restart %d)%s%s\n", std::atoi(lost),
+                   why && *why ? ": " : "", why ? why : "");
+    }
   }
 }
 
@@ -1399,6 +1405,11 @@ bool restart_after_device_loss(const char* why, bool (*switch_backend)()) {
   char env[64];
   std::snprintf(env, sizeof env, "%d:%lld", restarts + 1, now);
   SetEnvironmentVariableA("MELEE_DEVICE_LOST", env);
+  {   // what was lost, for the new process's log (bounded: a log line)
+    std::string why_text = why ? why : "";
+    if (why_text.size() > 200) why_text.resize(200);
+    SetEnvironmentVariableA("MELEE_DEVICE_LOST_WHY", why_text.c_str());
+  }
   std::wstring cmd = GetCommandLineW();
   if (g_before_restart) g_before_restart();
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};

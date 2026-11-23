@@ -169529,7 +169529,7 @@ index 8fd62df97..4f317c78a 100644
              if (dist_squared_12 > threshold_squared) {
                  return 1;
 diff --git a/src/melee/lb/lb_00F9.c b/src/melee/lb/lb_00F9.c
-index 80f2c5b55..6fa0e0943 100644
+index 80f2c5b55..fd8a08e65 100644
 --- a/src/melee/lb/lb_00F9.c
 +++ b/src/melee/lb/lb_00F9.c
 @@ -26,13 +26,30 @@
@@ -169600,7 +169600,52 @@ index 80f2c5b55..6fa0e0943 100644
  
  static inline bool approximatelyZeroVec3(Vec3 vec)
  {
-@@ -657,9 +668,9 @@ void lb_8001044C(DynamicsDesc* desc, void* colliders_raw, int num_colliders,
+@@ -450,10 +461,44 @@ void lb_8001044C(DynamicsDesc* desc, void* colliders_raw, int num_colliders,
+     {
+         s32 i;
+         for (i = 0; i < (s32) part; i++) {
++#ifdef MU_NATIVE
++            if (cur == NULL) {
++                return;
++            }
++#endif
+             cur = cur->next;
+             loop_index++;
+         }
+     }
++#ifdef MU_NATIVE
++    /* A chain with a bone missing (a node past the end of the list, a node with no joint, or a
++     * joint with no child where the loop reads the child's position) is left as it is this frame:
++     * those reads stopped the game (a Jigglypuff with a borrowed Build-A-Melee move, online, both
++     * players at the same frame, 11-23). */
++    {
++        extern const char* mu_test_getenv(const char* name);
++        /* MELEE_TEST_DYNAMICS_NO_BONE=1 (tests only): every chain's first joint reads as missing,
++         * the case above, so a hidden run can show the match goes on. */
++        static int no_bone = -1;
++        const struct DynamicsData* c = cur;
++        HSD_JObj* j;
++        if (no_bone < 0) {
++            no_bone = mu_test_getenv("MELEE_TEST_DYNAMICS_NO_BONE") != NULL;
++        }
++        if (no_bone) {
++            return;
++        }
++        if (c == NULL || (j = c->desc.lb_unk0.jobj) == NULL) {
++            return;
++        }
++        for (; c->next != NULL; c = c->next) {
++            if (j == NULL || j->child == NULL) {
++                return;
++            }
++            j = j->child;
++        }
++    }
++#endif
+ 
+     parent_jobj = cur->desc.lb_unk0.jobj->parent;
+     (void) parent_jobj;
+@@ -657,9 +702,9 @@ void lb_8001044C(DynamicsDesc* desc, void* colliders_raw, int num_colliders,
                              collider->position.z - cur->desc.lb_unk0.unk_2C.z;
  
                          {
@@ -169613,7 +169658,7 @@ index 80f2c5b55..6fa0e0943 100644
  
                              if (coll_dist > collider->radius &&
                                  lbColl_80005C44(
-@@ -806,8 +817,8 @@ void lb_8001044C(DynamicsDesc* desc, void* colliders_raw, int num_colliders,
+@@ -806,8 +851,8 @@ void lb_8001044C(DynamicsDesc* desc, void* colliders_raw, int num_colliders,
                                      groundHeight(cur, &floor_point2);
                                  f32 horiz_dist =
                                      sqrtf(-(height_diff * height_diff -
@@ -169624,7 +169669,7 @@ index 80f2c5b55..6fa0e0943 100644
                                  f32 ground_angle =
                                      ABS(atan2f(horiz_dist, height_diff));
                                  PSVECCrossProduct(&gnd_norm2, &link_dir,
-@@ -991,9 +1002,9 @@ void lb_800115F4(void)
+@@ -991,9 +1036,9 @@ void lb_800115F4(void)
      lb_804D63B4 = 0;
  }
  
@@ -169636,7 +169681,7 @@ index 80f2c5b55..6fa0e0943 100644
      struct DynamicsData* data1;
      int i;
  
-@@ -1001,17 +1012,17 @@ void lb_80011710(DynamicsDesc* arg0, DynamicsDesc* arg1)
+@@ -1001,17 +1046,17 @@ void lb_80011710(DynamicsDesc* arg0, DynamicsDesc* arg1)
      arg1->pos.y = arg0->pos.y;
      arg1->pos.z = arg0->pos.z;
      data1 = arg1->data;

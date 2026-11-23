@@ -5133,6 +5133,11 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     if (!cancelled()) host::log("yougame: ticket refused (%s)", g_bridge_refusal.empty() ? "no code" : g_bridge_refusal.c_str());
     // The player's own search was refused as out of date: offer the app's update (a blend: once it is over).
     if (!cancelled() && !g_ticket_out_of_date.is_null()) update_offer(g_ticket_out_of_date, epoch, blend);
+    // A connect code is the YouGame account's own (mpCode, made on first use), not the Slippi one: two
+    // players typed codes that work on Slippi and read only "No player has the code" (11-23). The game
+    // shows 120 characters (slippi_online convert_string_for_game): this fits after a code of 10.
+    if (g_bridge_refusal == "unknown_code")
+      return fail(std::string(e.what()) + " YouGame codes differ from Slippi codes: ask for their YouGame one.");
     return fail(e.what());
   }
   if (search.mode == 0 && !ranked::set_contract_matches(ticket))

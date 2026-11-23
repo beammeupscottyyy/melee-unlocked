@@ -13,7 +13,7 @@ HWND g_replays[16]{};            // list, browse, watch, refresh, back, prev, ne
                                  // "watch live", "replay folder"
 HWND g_replay_stats=nullptr;     // the scrolling stats page
 std::atomic<bool> g_replay_compressing{false};   // "Compress all replays now" is running
-void compress_replay_folder();
+void compress_replay_folder(bool uncompress=false);
 // Everything the scan found, newest first. A replay's place in these two is its index everywhere on
 // this page (the stats page, the loader's late results, playback). Only the list box counts in rows.
 std::vector<std::filesystem::path> g_replay_files;
@@ -144,6 +144,9 @@ void replay_context_menu(int x, int y) {
   AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
   AppendMenuW(menu,MF_STRING|(g_compress_replays?MF_CHECKED:MF_UNCHECKED),3,L"Keep replays compressed (.slpz)");
   AppendMenuW(menu,MF_STRING|(g_replay_compressing.load()?MF_GRAYED:0),4,L"Compress all replays now (.slpz)");
+  // Back to .slp, for tools that read only that (Project Clippi, Dolphin's replay viewer; player request 11-23).
+  if(file.extension()==L".slpz") AppendMenuW(menu,MF_STRING,5,L"Uncompress this replay (.slp)");
+  AppendMenuW(menu,MF_STRING|(g_replay_compressing.load()?MF_GRAYED:0),6,L"Uncompress all replays now (.slp)");
   const int pick=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,g_main,nullptr);
   DestroyMenu(menu);
   if(pick==1) {
@@ -156,15 +159,22 @@ void replay_context_menu(int x, int y) {
     save_ini();
   } else if(pick==4) {
     compress_replay_folder();
+  } else if(pick==5) {
+    slpz::decompress_file(file.u8string());
+    PostMessageW(g_main,WM_COMMAND,MAKEWPARAM(ID_REPLAY_REFRESH,0),0);
+  } else if(pick==6) {
+    // Or the game would compress them all again the next time it starts.
+    if(g_compress_replays) { g_compress_replays=false; save_ini(); }
+    compress_replay_folder(true);
   }
 }
 
 // "Compress all replays now": every finished .slp in the replay folder becomes a .slpz on one idle
 // thread, each checked to read back as the same replay before its .slp is removed. Unfinished
 // recordings and any written in the last minute (a game may still have it open) stay .slp.
-void compress_replay_folder() {
+void compress_replay_folder(bool uncompress) {
   if(g_replay_compressing.exchange(true)) return;
-  std::thread([folder=replay_folder()]{
+  std::thread([folder=replay_folder(),uncompress]{
     SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_IDLE);
     namespace fs=std::filesystem;
     const auto cutoff=fs::file_time_type::clock::now()-std::chrono::minutes(1);
@@ -172,6 +182,10 @@ void compress_replay_folder() {
     for(fs::recursive_directory_iterator it(fs::u8path(folder),fs::directory_options::skip_permission_denied,ec),end;!ec&&it!=end;it.increment(ec)) {
       if(it.depth()>3) { it.disable_recursion_pending(); continue; }
       std::error_code fe;
+      if(uncompress) {   // "Uncompress all replays now": every .slpz back to the .slp it holds
+        if(it->is_regular_file(fe)&&!fe&&it->path().extension()==L".slpz") slpz::decompress_file(it->path().u8string());
+        continue;
+      }
       if(!it->is_regular_file(fe)||fe||it->path().extension()!=L".slp"||it->last_write_time(fe)>=cutoff) continue;
       slpz::compress_file(it->path().u8string());
     }

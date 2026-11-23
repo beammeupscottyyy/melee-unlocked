@@ -25,5 +25,9 @@ bool read_replay(const std::string& utf8_path, std::vector<uint8_t>& slp);
 // Compresses a finished .slp beside itself as .slpz, checks that it decompresses to the same bytes,
 // then removes the .slp. Returns the new path, or empty (and leaves the .slp alone) on any failure.
 std::string compress_file(const std::string& utf8_slp_path, int level = 3);
+// The other way, for tools that read only .slp: writes the .slp a .slpz holds beside it, checks the
+// file reads back as those bytes, then removes the .slpz. Returns the new path, or empty (and leaves
+// the .slpz alone) on any failure, or when a .slp of that name is already there.
+std::string decompress_file(const std::string& utf8_slpz_path);
 
 }  // namespace slpz

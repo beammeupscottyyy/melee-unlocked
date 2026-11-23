@@ -236,17 +236,19 @@ int main(int argc, char** argv) {
     const auto present = [](const fs::path& p) {
       return GetFileAttributesW((L"\\\\?\\" + p.wstring()).c_str()) != INVALID_FILE_ATTRIBUTES;
     };
-    const fs::path folders[2] = {root / "play", root / "deep" / std::string(100, 'd') / "game"};
-    for (int i = 0; i < 2; ++i) {
+    // The third runs with a PATH that has no System32 (a player's did, 11-23: "'xcopy' is not recognized").
+    const fs::path folders[3] = {root / "play", root / "deep" / std::string(100, 'd') / "game", root / "nopath"};
+    for (int i = 0; i < 3; ++i) {
       const fs::path& folder = folders[i];
       fs::create_directories(folder, ec);
       { std::ofstream(folder / "melee_port.exe") << "old"; }
       fs::copy_file(package, folder / "update.zip", fs::copy_options::overwrite_existing, ec);
       // 999996 is no process: the script's waits fall straight through. The "relaunch" writes a file.
       const std::string script = host::updater::install_script(folder.u8string(), 999996ul, {999992ul},
-                                                               "/b cmd /c \"echo started> relaunched.txt\"", false);
+                                                               "/b %ComSpec% /c \"echo started> relaunched.txt\"", false);
       { std::ofstream b(folder / "update.bat", std::ios::binary); b << script; }
-      std::wstring cmd = L"cmd /c \"\"" + (folder / "update.bat").wstring() + L"\"\"";
+      std::wstring cmd = i == 2 ? L"cmd /c \"set PATH=C:\\nowhere&& \"" + (folder / "update.bat").wstring() + L"\"\""
+                              : L"cmd /c \"\"" + (folder / "update.bat").wstring() + L"\"\"";
       STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
       const bool started = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
                                           folder.wstring().c_str(), &si, &pi);
@@ -254,7 +256,7 @@ int main(int argc, char** argv) {
       for (int wait = 0; wait < 50 && !present(folder / "relaunched.txt"); ++wait) Sleep(100);
       std::string exe_text;
       { std::ifstream in(folder / "melee_port.exe"); in >> exe_text; }
-      const char* where = i ? "deep folder" : "short folder";
+      const char* where = i == 2 ? "folder updated without System32 on the PATH" : i ? "deep folder" : "short folder";
       std::printf("%s: path of the long file is %zu characters\n", where, (folder / "Shaders" / long_name).wstring().size());
       check(started && exe_text == "new", "install script replaces the program");
       check(present(folder / "Shaders" / long_name), "install script copies the file with the long name");

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "pack_skin_rule.h"
+#include "pack_audio_safety.h"
 #include <cstdio>
 
 namespace {
@@ -57,6 +58,15 @@ int main() {
     check(resolve_open(false, entry, alias, served) == entry, "offline every file is the pack's own");
   check(resolve_open(true, 10, alias, {}) == 39, "a costume that is not served opens the standard costume");
   check(resolve_open(true, 13, {}, {}) == 13, "with no pack nothing is redirected");
+
+  // Which other files get an online check (11-23): the English Stadium file is a stage, a fighter's
+  // own file an archive checked for texture-only changes, and menus neither (the Slippi menus own them).
+  using source_port::skins::is_stage_file; using source_port::skins::is_archive_file;
+  check(is_stage_file("/grps.usd") && is_stage_file("/grop.dat") && !is_stage_file("/plpe.dat"), "stage files, the English Stadium too");
+  check(is_archive_file("/plpe.dat") && is_archive_file("/plsk.dat") && is_archive_file("/efpedata.dat"), "fighter and effect files are archives");
+  check(!is_archive_file("/mnslmap.usd") && !is_archive_file("/mnslchr.usd") && !is_archive_file("/slpcss.dat") &&
+        !is_archive_file("/sdslchr.usd") && !is_archive_file("/audio/menu01.hps") && !is_archive_file("/opening.bnr"),
+        "menus, music and the banner are not");
 
   if (failures) std::fprintf(stderr, "%d pack skin rule test(s) failed\n", failures);
   else std::puts("pack skin rule tests passed");

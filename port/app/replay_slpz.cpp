@@ -202,4 +202,26 @@ std::string compress_file(const std::string& utf8_slp_path, int level) {
   return out.u8string();
 }
 
+std::string decompress_file(const std::string& utf8_slpz_path) {
+  namespace fs = std::filesystem;
+  std::vector<uint8_t> packed, slp;
+  if (!read_file(utf8_slpz_path, packed) || !is_slpz(packed.data(), packed.size()) || !decompress(packed, slp)) return {};
+  fs::path out = fs::u8path(utf8_slpz_path);
+  out.replace_extension(".slp");
+  std::error_code ec;
+  if (fs::exists(out, ec)) return {};
+  const fs::path part = fs::path(out).concat(".part");
+  {
+    std::ofstream f(part, std::ios::binary | std::ios::trunc);
+    f.write((const char*)slp.data(), (std::streamsize)slp.size());
+    if (!f) { fs::remove(part, ec); return {}; }
+  }
+  fs::rename(part, out, ec);
+  if (ec) { fs::remove(part, ec); return {}; }
+  std::vector<uint8_t> back;
+  if (!read_file(out.u8string(), back) || back != slp) { fs::remove(out, ec); return {}; }
+  fs::remove(fs::u8path(utf8_slpz_path), ec);
+  return out.u8string();
+}
+
 }  // namespace slpz
