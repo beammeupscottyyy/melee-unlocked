@@ -1812,6 +1812,7 @@ void init(HWND parent,const std::string& dir) {
   } else account_code=announced_code();   // until the launcher names the account (set_account)
   config["code"]=account_code;
   if(config.value("name",std::string()).empty()) config["name"]=account_name;
+  if(!kPageShown && !test_mode) return;   // set aside: nobody could see or answer it (launcher_lobby.h)
   worker=std::thread(work);
 }
 void open(const std::string& version,bool ready) {

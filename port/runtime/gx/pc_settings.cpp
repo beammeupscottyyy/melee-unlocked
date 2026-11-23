@@ -430,12 +430,18 @@ static void draw_combo_counter() {
   draw->PopClipRect();
 }
 
+// A player's local player tag Gecko code (user_gecko::hand_ports_of_codes), set by the game thread.
+std::atomic<bool> g_code_tag_on{false};
+std::mutex g_code_tag_mutex;
+std::string g_code_tag_text;
+bool g_code_tag_arrow = false;
 // Community codes drawn over the match (HUD tab), from what the native game reports each drawn frame
 // (host API 24), in the game's font. Nana's percent: under each Ice Climbers player's damage, while
 // Nana is in play. Ally markers (online, as the code has them): YOU over your own fighter, a heart
 // over your teammate in a teams match.
 static void draw_community_code_overlays() {
-  const uint32_t codes = host::g_community_codes.load(std::memory_order_relaxed);
+  const uint32_t codes = host::g_community_codes.load(std::memory_order_relaxed) |
+                         (g_code_tag_on.load(std::memory_order_relaxed) ? MU_DISPLAY_OPTION_ALLY_INDICATORS : 0u);
   if (!g_hud_match || !(codes & (MU_DISPLAY_OPTION_NANA_PERCENT | MU_DISPLAY_OPTION_ALLY_INDICATORS))) return;
   const OverlayBounds bounds = overlay_bounds();
   const float width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
@@ -470,11 +476,35 @@ static void draw_community_code_overlays() {
       const bool mine = slot == me, ally = !mine && p.team >= 0 && p.team == g_hud_players[me].team;
       if (!p.present || (!mine && !ally)) continue;
       if (!std::isfinite(p.tag_x) || !std::isfinite(p.tag_y) || p.tag_y <= 0.0f) continue;
-      const char* label = mine ? "YOU" : "\xE2\x99\xA5";
-      const float w = practice_menu::text_width(px, label);
-      const float x = at_x(p.tag_x) - w * 0.5f;
-      const float y = bounds.top + p.tag_y / 480.0f * height - px * 2.2f;
-      practice_menu::text(draw, x, y, px, mine ? colors[slot] : IM_COL32(255, 90, 140, 255), label, 0.0f, true);
+      const float cx = at_x(p.tag_x), y = bounds.top + p.tag_y / 480.0f * height - px * 2.2f;
+      const ImU32 heart_colour = IM_COL32(255, 90, 140, 255);
+      std::string own_text;
+      bool arrow = false;
+      {
+        std::lock_guard<std::mutex> lock(g_code_tag_mutex);
+        own_text = g_code_tag_text;
+        arrow = g_code_tag_arrow;
+      }
+      if (mine && arrow) {   // a pointer down at the fighter, with a dark edge like the letters
+        const float s = px * 0.55f, top = y + px * 0.15f;
+        draw->AddTriangleFilled(ImVec2(cx - s - 1.5f, top - 1.5f), ImVec2(cx + s + 1.5f, top - 1.5f),
+                                ImVec2(cx, top + s * 1.3f + 2.0f), IM_COL32(0, 0, 0, 200));
+        draw->AddTriangleFilled(ImVec2(cx - s, top), ImVec2(cx + s, top), ImVec2(cx, top + s * 1.3f), colors[slot]);
+      } else if (mine) {
+        const char* label = own_text.empty() ? "YOU" : own_text.c_str();
+        const float w = practice_menu::text_width(px, label);
+        practice_menu::text(draw, cx - w * 0.5f, y, px, colors[slot], label, 0.0f, true);
+      } else {   // a heart: two circles over a point
+        const float r = px * 0.26f, cy = y + px * 0.45f;
+        for (int pass = 0; pass < 2; ++pass) {
+          const float e = pass == 0 ? 1.5f : 0.0f;
+          const ImU32 col = pass == 0 ? IM_COL32(0, 0, 0, 200) : heart_colour;
+          draw->AddCircleFilled(ImVec2(cx - r * 0.95f, cy), r + e, col, 16);
+          draw->AddCircleFilled(ImVec2(cx + r * 0.95f, cy), r + e, col, 16);
+          draw->AddTriangleFilled(ImVec2(cx - r * 1.95f - e, cy + r * 0.2f), ImVec2(cx + r * 1.95f + e, cy + r * 0.2f),
+                                  ImVec2(cx, cy + r * 2.4f + e), col);
+        }
+      }
     }
   }
   draw->PopClipRect();
@@ -1067,6 +1097,10 @@ static std::string binding_source_label(host::CaptureDevice kind, int action, ui
 
 static std::string binding_label(host::CaptureDevice kind, int index, int action) {
   const uint32_t v = binding_get(kind, index, action);
+  // A HID pad's sticks are read from its own axes, not bound: these rows are only for a box that sends
+  // directions as buttons. "Not bound" there read as a broken stick (B0XX reports 11-22).
+  if (!v && kind == host::CaptureDevice::HidPad && (host::is_stick_action(action) || host::is_cstick_action(action)))
+    return host::is_stick_action(action) ? "Controller's stick" : "Controller's C-stick";
   if (!v && (host::is_trigger_action(action) || host::is_analog_action(action))) {
     // A box's own trigger axis has no source to bind: it always feeds the travel.
     if (kind == host::CaptureDevice::HidPad && host::is_analog_action(action)) return "Device axis";
@@ -2292,7 +2326,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // off, so every later launch booted to an FFA character select that rumbled and turned the picture
   // black and white on X and A. That old key is read as off.
   options.lossless_lag_test = false;
-  options.early_inputs = false;   // a file without the key: off (1.0.2 on)
+  options.early_inputs = true;   // a file without the key: on
 #ifndef MELEE_NO_SLIPPI   // the spectator server is part of the Slippi layer
   options.slippi_spectator = true;   // a file without the key: on, as in Slippi Dolphin
   options.slippi_spectator_port = 51441;
@@ -2445,8 +2479,8 @@ void load_pc_settings(RenderOptions& options, int& volume) {
         options.offline_delay_frames = std::clamp(std::stoi(value), 1, 9);
         offline_delay_frames_seen = true;
       }
-      // early_inputs, the old key saved on by default, is not read (render_options.h).
-      else if (key == "early_inputs2" || key == "early_inputs") { if (key == "early_inputs2") options.early_inputs = value == "1"; }
+      // early_inputs and early_inputs2, older keys (the second saved off for everyone), are not read.
+      else if (key == "early_inputs3" || key == "early_inputs2" || key == "early_inputs") { if (key == "early_inputs3") options.early_inputs = value != "0"; }
       else if (key == "performance") options.performance_overlay = value == "1";
       else if (key == "showfps") { options.show_fps = value == "1"; showfps_seen = true; }
       // showfps_yougame2: builds before 10-31 saved showfps_yougame 1 on every save (the old default),
@@ -2726,7 +2760,18 @@ void load_pc_settings(RenderOptions& options, int& volume) {
         if (us != std::string::npos) {
           int idx = std::stoi(key.substr(3, us - 3));
           std::string action = key.substr(us + 1);
-          if (idx >= 0 && idx < 4)
+          // The invert switches were written as "hid<n>_invert" and only ever read back as "pad<n>_invert":
+          // they came back off after every restart.
+          if (idx >= 0 && idx < 4 && action == "invert") host::g_hid_stick_invert[idx] = (uint8_t)(std::stoi(value) & 15);
+          else if (idx >= 0 && idx < 4 && action == "axes") {
+            std::istringstream list(value);
+            for (int r = 0; r < host::HID_ROLE_COUNT; ++r) {
+              int axis = -1;
+              if (!(list >> axis)) break;
+              host::g_hid_axis_role[idx][r] = axis >= 0 && axis < 7 ? (uint8_t)axis : host::kHidAxisAuto;
+            }
+          }
+          else if (idx >= 0 && idx < 4)
             for (int i = 0; i < (int)host::BindAction::Count; ++i)
               if (action == kActionNames[i]) host::g_hid_bindings[idx].mask[i] = (uint32_t)std::stoul(value);
         }
@@ -5154,7 +5199,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nonlinedelayauto " << (slippi::online::config().auto_delay ? 1 : 0)
        << "\noffline_delay " << (options.offline_delay ? 1 : 0)
        << "\noffline_delay_frames " << options.offline_delay_frames
-       << "\nearly_inputs2 " << (options.early_inputs ? 1 : 0)
+       << "\nearly_inputs3 " << (options.early_inputs ? 1 : 0)
        << "\nquickchat " << slippi::online::config().chat
        << "\ndirectpause " << (slippi::online::config().direct_pause ? 1 : 0)
        << "\nportcolour1 " << slippi::online::config().port_colour[0]
@@ -5343,6 +5388,13 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
       file << "\nhid" << idx << "_" << kActionNames[i] << " " << host::g_hid_bindings[idx].mask[i];
   for (int idx = 0; idx < 4; ++idx)
     if (host::g_hid_stick_invert[idx]) file << "\nhid" << idx << "_invert " << (int)host::g_hid_stick_invert[idx];
+  for (int idx = 0; idx < 4; ++idx) {
+    bool any = false;
+    for (const uint8_t axis : host::g_hid_axis_role[idx]) any = any || axis != host::kHidAxisAuto;
+    if (!any) continue;
+    file << "\nhid" << idx << "_axes";
+    for (const uint8_t axis : host::g_hid_axis_role[idx]) file << " " << (axis == host::kHidAxisAuto ? -1 : (int)axis);
+  }
   file << binding_levels_text();
   for (int n = 0; n < 4; ++n)
     file << "\nport" << n << " " << port_source_to_combo(host::g_port_sources[n]);
@@ -11791,6 +11843,39 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               }
             }
           }
+          // Which axis is which, chosen by moving it: a pad's own description does not say which axis is the
+          // C-stick and which a trigger, and a trigger on an axis nothing read could not be used at all.
+          if (!host::hidpad_frame1_dinput(tab_index)) {
+            static const char* const role_names[host::HID_ROLE_COUNT] = {"Stick left/right", "Stick up/down", "C-stick left/right",
+                                                                        "C-stick up/down", "L trigger", "R trigger"};
+            static const char* const role_asks[host::HID_ROLE_COUNT] = {"Push the stick right...", "Push the stick up...",
+                                                                       "Push the C-stick right...", "Push the C-stick up...",
+                                                                       "Press L or its light shield...", "Press R or its light shield..."};
+            static int wait_role = -1, wait_slot = -1;
+            static double wait_until = 0.0;
+            if (wait_role >= 0 && (wait_slot != tab_index || ImGui::GetTime() > wait_until)) wait_role = -1;
+            if (wait_role >= 0) {
+              const int axis = host::hidpad_axis_capture_poll(tab_index);
+              if (axis >= 0) { host::hidpad_assign_axis(tab_index, wait_role, axis); wait_role = -1; changed = true; }
+            }
+            ImGui::Spacing();
+            for (int r = 0; r < host::HID_ROLE_COUNT; ++r) {
+              const uint8_t axis = host::g_hid_axis_role[tab_index][r];
+              char label[96];
+              if (r == wait_role) std::snprintf(label, sizeof label, "%s##axisrole%d", role_asks[r], r);
+              else std::snprintf(label, sizeof label, "%s: %s##axisrole%d", role_names[r],
+                                 axis == host::kHidAxisAuto ? "Automatic" : host::hidpad_axis_name(axis), r);
+              if (r % 2) ImGui::SameLine();
+              if (settings_widgets::Button(label)) {
+                if (r == wait_role) wait_role = -1;
+                else { host::hidpad_axis_capture_begin(tab_index); wait_role = r; wait_slot = tab_index; wait_until = ImGui::GetTime() + 8.0; }
+              }
+              if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && axis != host::kHidAxisAuto) {
+                host::g_hid_axis_role[tab_index][r] = host::kHidAxisAuto; wait_role = -1; changed = true;
+              }
+            }
+            settings_hint("A stick or trigger that reads wrong: click it here, then move it. Right-click for Automatic.");
+          }
           const host::HidPadAxes axes = host::hidpad_axes(tab_index);
           if (axes.count) {
             std::string line = "Axes:";
@@ -11815,6 +11900,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               const float press_gap = press_w > 0.0f ? press_w + ImGui::GetStyle().ItemSpacing.x : 0.0f;
               if (settings_widgets::Selectable(row, i == waiting || i == hovered, ImGuiSelectableFlags_None, ImVec2(ImGui::GetContentRegionAvail().x - 58.0f - press_gap, 0))) begin_rebind(i);
               if (pressed_now) ImGui::PopStyleColor();
+              if (tab_kind == host::CaptureDevice::HidPad && (host::is_stick_action(i) || host::is_cstick_action(i)) && ImGui::IsItemHovered())
+                ImGui::SetTooltip("This controller's stick is read directly, with no binding needed. Bind this only for a box that\n"
+                                  "sends its directions as buttons. A direction the wrong way round: Box layouts > Invert.");
               if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) unbind(i);
               if (press_w > 0.0f) {
                 ImGui::SameLine();
@@ -11981,6 +12069,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         const char* built_in = user_gecko::native_equivalent(c);
         // The always-display hitbox code keeps its switch: on, it turns on the Arcade look's hitboxes.
         const bool arcade_code = built_in == user_gecko::kArcadeHitboxCodeLabel;
+        // A hand-ported code (user_gecko::hand_port) keeps its switch too: on, the native feature is on.
+        const char* hand = user_gecko::hand_port(c);
+        if (hand) {
+          if (settings_toggle(c.name.c_str(), &c.wanted)) { changed = true; g_gecko_chosen = true; }
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Coded natively: while it is on, \"%s\" is on.\n"
+                              "Picture only, drawn by your game alone, so it also works online.", hand);
+          ImGui::PopID();
+          continue;
+        }
         const bool runs_here = (c.supported && !built_in) || arcade_code;
         ImGui::BeginDisabled(!runs_here);
         if (settings_toggle(c.name.c_str(), &c.enabled) && runs_here) { c.wanted = c.enabled; changed = true; g_gecko_chosen = true; }
@@ -12018,6 +12116,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         // the rest keep the rule above.
         // The always-display hitbox code keeps its switch: on, it turns on the Arcade look's hitboxes.
         const bool arcade_code = built_in == user_gecko::kArcadeHitboxCodeLabel;
+        // A hand-ported code (user_gecko::hand_port) keeps its switch too: on, the native feature is on.
+        const char* hand = user_gecko::hand_port(c);
+        if (hand) {
+          if (settings_toggle(c.name.c_str(), &c.wanted)) { changed = true; g_gecko_chosen = true; }
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Coded natively: while it is on, \"%s\" is on.\n"
+                              "Picture only, drawn by your game alone, so it also works online.", hand);
+          ImGui::PopID();
+          continue;
+        }
         const bool runs_here = (c.supported && !built_in) || arcade_code;
         ImGui::BeginDisabled(!runs_here);
         // A code that cannot run here shows the switch it keeps for the Static Recomp.
@@ -12910,3 +13018,13 @@ std::string rtx_renderer_status(int) { return {}; }
 bool hdr_display_available() { return false; }
 #endif
 }
+
+// The local player tag code (user_gecko::hand_ports_of_codes), from the game thread.
+namespace gx {
+void set_code_ally_tag(bool on, const std::string& text, bool arrow) {
+  g_code_tag_on.store(on, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(g_code_tag_mutex);
+  g_code_tag_text = text;
+  g_code_tag_arrow = arrow;
+}
+}  // namespace gx

@@ -45,6 +45,8 @@ inline constexpr Part kParts[] = {
   // connection did at start and on Connect, with why it failed.
   {"launcher.log", true, 256 * 1024},
   {"launcher-yougame.log", true, 256 * 1024},
+  // What the last update did (update.bat writes it beside the launcher): where an update stopped.
+  {"update.log", true, 256 * 1024},
 };
 
 using File = std::pair<std::string, std::vector<uint8_t>>;   // name in the zip, contents
@@ -173,6 +175,28 @@ inline std::vector<File> collect_logs(const std::string& game_dir, const std::st
     if (!include_crash && std::string(part.name) == "melee_port_crash.txt") continue;
     auto data = read_tail((part.launcher_folder ? launcher_dir : game_dir) + kPathSep + part.name, part.max_bytes);
     if (!data.empty()) files.emplace_back(part.name, private_report_text(part.name, data, data.size() >= part.max_bytes));
+  }
+  // The newest older session that played online, when neither of the two above did. A player reports an
+  // online problem ("ranked games not counting", 11-22) after a few more starts: the two newest logs were
+  // then Training sessions, and the session with the ranked sets was not in the report. The game keeps
+  // four sessions before the last (session_logs.h).
+  {
+    auto played_online = [](const std::vector<uint8_t>& d) {
+      static const std::string marks[] = {"slippi: online frame ", "yougame: ranked set"};
+      for (const auto& m : marks)
+        if (std::search(d.begin(), d.end(), m.begin(), m.end()) != d.end()) return true;
+      return false;
+    };
+    bool online = false;
+    for (const auto& f : files)
+      if ((f.first == "melee_port.log" || f.first == "melee_port.prev.log") && played_online(f.second)) online = true;
+    for (int age = 2; age <= 4 && !online; ++age) {
+      const std::string name = "melee_port.prev." + std::to_string(age) + ".log";
+      auto data = read_tail(game_dir + kPathSep + name, 1u * 1024 * 1024);
+      if (data.empty() || !played_online(data)) continue;
+      files.emplace_back(name, private_report_text(name, data, data.size() >= 1u * 1024 * 1024));
+      online = true;
+    }
   }
   // Every retained session trace from the last day, oldest first. Player marks and automatically
   // detected problems keep a match's trace. They travel as one

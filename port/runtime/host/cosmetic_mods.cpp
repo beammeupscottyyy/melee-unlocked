@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -6030,6 +6031,27 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
           runtime_errors.push_back(asset->info.name + ": malformed stage tables; using the standard stage.");
           continue;
         }
+        // Fewer collision lines or groups than the original: the stage's own code finds its lines and
+        // groups by number (Pokemon Stadium's transformations, moving platforms), and one that is not
+        // there stops the game ("mplib.c: not found lineID=140", a Stadium skin with its own collision
+        // on the Melee 3D disc). Offline too, that skin gives way to the standard stage.
+        if (clean_read) {
+          stage_safety::Archive o{clean}, k{served};
+          if (o.parse() && k.parse() && o.roots.count("coll_data") && k.roots.count("coll_data")) {
+            const uint32_t co = o.roots.at("coll_data"), ck = k.roots.at("coll_data");
+            if (o.bounds(co, 0x30) && k.bounds(ck, 0x30)) {
+              const uint32_t lines_o = o.get(co + 0x0C), lines_k = k.get(ck + 0x0C);
+              const uint32_t groups_o = o.get(co + 0x28), groups_k = k.get(ck + 0x28);
+              if (lines_k < lines_o || groups_k < groups_o) {
+                host::log("cosmetics: stage %s rejected: the skin's collision has %u lines and %u groups, the stage's "
+                          "own code needs the original's %u and %u; using the standard stage",
+                          disc_file.path.c_str(), lines_k, groups_k, lines_o, groups_o);
+                runtime_errors.push_back(asset->info.name + ": its collision is missing parts the stage needs; using the standard stage.");
+                continue;
+              }
+            }
+          }
+        }
         std::string validation_error;
         // A skin that does not match the original as it is: offline it is served as it is, and
         // online (and in replays) its meshes drawn over the original stage (stage_online_form). The
@@ -7283,7 +7305,15 @@ std::string retail_disc_problem(const fs::path& path) {
   const uint64_t size = fs::file_size(path, ec);
   char head[8]{};
   std::ifstream file(path, std::ios::binary);
-  if (ec || !file || !file.read(head, sizeof head)) return "The game disc file could not be read.";
+  if (ec || !file || !file.read(head, sizeof head)) {
+    // Which file and why (a report said only "could not be read", 11-22): the path the game was given and
+    // Windows' own reason, so the next report names the cause.
+    const std::string why = ec ? ec.message() : std::generic_category().message(errno);
+    host::log("cosmetics: the game disc %s could not be read for the looks (%s)", path.u8string().c_str(), why.c_str());
+    if (path.empty()) return "The game disc file could not be read: this game was started without one.";
+    return "The game disc file could not be read (" + path.filename().u8string() + ": " + why + "). Check that it is still "
+           "there, then choose it again on the launcher's Play page.";
+  }
   if (std::memcmp(head, "GALE01", 6) != 0) {
     if (size != kRetailSize)
       return "The game disc is a compressed or trimmed copy. These looks need the full 1.36 GB .iso: convert it to a "

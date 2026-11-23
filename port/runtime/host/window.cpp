@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <memory>
 #include "yougame_link.h"
 #include "yougame_friends.h"
 #include "yougame_console_entry.h"
@@ -168,6 +169,49 @@ void hidraw_stop();
 #endif
 void input_device_removed(HANDLE device);
 void ds4_init_defaults();
+#ifdef _WIN32
+// HID pads (a B0XX and other boxes, Frame1, DualShock, DualSense, Switch Pro, third-party pads) on a
+// thread of their own. Their reports come as WM_INPUT messages, and on the game window those waited
+// for its message pump, which runs once a rendered frame: a box polled at 1000 Hz was seen at the frame
+// rate (240 Hz at 240 fps, 60 at a 60 cap), so a press could reach the game's poll up to a frame late.
+// Here a message-only window takes every gamepad and joystick report and the thread sleeps in
+// GetMessage, so each report is decoded the moment Windows has it. The readers lock their own state.
+// MELEE_PAD_THREAD=0 puts them back on the window's thread (for comparing).
+LRESULT CALLBACK pad_input_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_INPUT) { raw_input((HRAWINPUT)l); return 0; }
+  if (m == WM_INPUT_DEVICE_CHANGE) { if (w == GIDC_REMOVAL) input_device_removed((HANDLE)l); return 0; }
+  return DefWindowProcW(h, m, w, l);
+}
+bool pad_input_thread_start() {
+  static std::atomic<int> state{0};   // 0 not tried, 1 running, 2 failed
+  if (const int now = state.load()) return now == 1;
+  if (const char* v = std::getenv("MELEE_PAD_THREAD"); v && *v == '0') { state = 2; return false; }
+  struct Start { std::mutex m; std::condition_variable cv; int result = 0; };
+  auto start = std::make_shared<Start>();
+  std::thread([start] {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    WNDCLASSEXW wc{}; wc.cbSize = sizeof wc; wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpfnWndProc = pad_input_proc; wc.lpszClassName = L"MeleePadInput";
+    RegisterClassExW(&wc);
+    HWND hwnd = CreateWindowExW(0, L"MeleePadInput", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    RAWINPUTDEVICE rid[2]{};
+    rid[0].usUsagePage = 0x01; rid[0].usUsage = 0x05; rid[0].dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY; rid[0].hwndTarget = hwnd;
+    rid[1].usUsagePage = 0x01; rid[1].usUsage = 0x04; rid[1].dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY; rid[1].hwndTarget = hwnd;
+    const bool ok = hwnd && RegisterRawInputDevices(rid, 2, sizeof rid[0]);
+    { std::lock_guard<std::mutex> lock(start->m); start->result = ok ? 1 : 2; }
+    start->cv.notify_all();
+    if (!ok) { if (hwnd) DestroyWindow(hwnd); return; }
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
+  }).detach();
+  std::unique_lock<std::mutex> lock(start->m);
+  start->cv.wait_for(lock, std::chrono::seconds(5), [&] { return start->result != 0; });
+  const bool ok = start->result == 1;
+  state = ok ? 1 : 2;
+  if (ok) log("input: HID pads read on their own thread, as each report arrives");
+  return ok;
+}
+#endif
 
 // The pointer also goes away after it has rested over the game for a few seconds in the two cases
 // the rule below leaves it up: a menu or panel is open (a player driving it with a controller does
@@ -791,8 +835,11 @@ void* window_create(int w, int h, const wchar_t* title, bool visible, bool flip)
     else if (!boxAdopted()) log("window: the YouGame app did not take the window into its player box; showing it on its own");
     else { raise_embed(g_hwnd); log("window: in the YouGame player box"); }
   }
-  rid[0].hwndTarget = g_hwnd; rid[1].hwndTarget = g_hwnd;
-  RegisterRawInputDevices(rid, 2, sizeof rid[0]);
+  if (!pad_input_thread_start()) {
+    rid[0].hwndTarget = g_hwnd; rid[1].hwndTarget = g_hwnd;
+    RegisterRawInputDevices(rid, 2, sizeof rid[0]);
+    log("input: HID pads read on the window's thread (their own thread did not start)");
+  }
   g_closed = false;
   if (yougame::embed_toplevel()) {
     if (!g_toplevel_rect) { g_client_w = w; g_client_h = h; }
@@ -1407,7 +1454,9 @@ void ds4_report(RAWINPUT* input, bool dualsense) {
   if (slot < 0 || !input->data.hid.dwSizeHid || !input->data.hid.dwCount) return;
   PadState pad{};
   uint16_t buttons = 0;
-  if (!playstation_parse(input->data.hid.bRawData, input->data.hid.dwSizeHid, dualsense, pad, buttons)) return;
+  // The newest of the reports Raw Input packed into this message (oldest first) is the pad's state now.
+  const uint8_t* newest = input->data.hid.bRawData + (size_t)(input->data.hid.dwCount - 1) * input->data.hid.dwSizeHid;
+  if (!playstation_parse(newest, input->data.hid.dwSizeHid, dualsense, pad, buttons)) return;
   std::lock_guard<std::mutex> lock(g_ds4_mutex); g_ds4_buttons[slot] = buttons; g_ds4_pads[slot] = pad;
 }
 

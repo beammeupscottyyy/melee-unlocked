@@ -702,6 +702,45 @@ void test_function_patches() {
   codes().clear();
 }
 
+
+// Hand ports (owner 11-22): a player's local player tag codes and PAL Stock Icons keep their switch
+// and drive the game's own features while they are wanted, whatever they are called.
+void test_hand_ports() {
+  fresh();
+  // Slippi's "Optional: Show Friendly Player Indicators" (GALE01r2.ini), its first two injections.
+  const Lines force_tag = {{0xC20355B4u, 8u}, {0x3C608048u, 0x80639D30u}, {0x5463443Eu, 0x2C030208u},
+                           {0x40820028u, 0x806DB61Cu}, {0x88630000u, 0x7C03F800u}, {0x40820018u, 0x38600000u},
+                           {0x3D808003u, 0x618C55CCu}, {0x7D8903A6u, 0x4E800420u}, {0x1C9F0E90u, 0x00000000u}};
+  auto set_tag = [](uint32_t a, uint32_t b) {
+    return Lines{{0xC22FD1ECu, 3u}, {0x48000010u, 0x4E800021u}, {a, b}, {0x60000000u, 0x00000000u}};
+  };
+  auto joined = [](Lines a, const Lines& b) { a.insert(a.end(), b.begin(), b.end()); return a; };
+  Code you; you.name = "Optional: Show Friendly Player Indicators"; you.lines = joined(force_tag, set_tag(0x8278826Eu, 0x82740000u));
+  CHECK(hand_port(you) == kLocalTagCodeLabel);
+  bool arrow = true;
+  CHECK(local_tag_text_of(you, &arrow) == "YOU" && !arrow);
+  Code name; name.name = "Force Nametag \"ImpX\""; name.lines = joined(force_tag, set_tag(0x8268828Du, 0x82908277u));
+  CHECK(local_tag_text_of(name, &arrow) == "ImpX" && !arrow);
+  Code pointer; pointer.name = "Force Nametag Arrow"; pointer.lines = joined(force_tag, set_tag(0x81AB0000u, 0u));
+  CHECK(local_tag_text_of(pointer, &arrow).empty() && arrow);
+  Code pal; pal.name = "anything";
+  pal.lines = {{0xC22F9A3Cu, 7u}, {0x48000021u, 0x7C8802A6u}, {0x80640000u, 0x907D002Cu}, {0x907D0030u, 0x80640004u},
+               {0x907D003Cu, 0x48000010u}, {0x4E800021u, 0x3F59999Au}, {0xC1A80000u, 0x801D0014u}, {0x60000000u, 0u}};
+  CHECK(hand_port(pal) == kPalStockCodeLabel);
+  Code other; other.name = "Optional: Show Friendly Player Indicators"; other.lines = {{0xC2100010u, 1u}, {0x60000000u, 0u}};
+  CHECK(hand_port(other) == nullptr);   // the name alone is nothing
+  codes() = {you, name, pal};
+  HandPorts h = hand_ports_of_codes();
+  CHECK(!h.local_tag && !h.pal_stock_icons);   // nothing wanted
+  codes()[0].wanted = true;
+  h = hand_ports_of_codes();
+  CHECK(h.local_tag && h.local_tag_text.empty() && !h.local_tag_arrow);
+  codes()[1].wanted = true; codes()[2].wanted = true;
+  h = hand_ports_of_codes();
+  CHECK(h.local_tag && h.local_tag_text == "ImpX" && h.pal_stock_icons);
+  codes().clear();
+}
+
 int run_all() {
   set_code_patches_allowed(false);   // the Source Port
   set_native_writer(fake_write);
@@ -715,6 +754,7 @@ int run_all() {
   test_built_in();
   test_slippi_required();
   test_arcade_code();
+  test_hand_ports();
   test_wanted_kept();
   test_function_patches();
   // A vanilla listing suspends execution without changing the saved enabled code.

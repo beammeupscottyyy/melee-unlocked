@@ -395,6 +395,9 @@ static MuGhostAct ghost_applied[4];
  * (Jigglypuff's slot 2 has no player) takes the picked pro; MU_PC_PRESET_AI has none for it. */
 static int ghost_pro(const Fighter* fp, const MuPcConfig* c)
 {
+    /* Only a pro preset (Fight a pro, or the replay takeover) is a pro at all: a ready-made preset or the player's own
+     * setup is the practice CPU, whatever the character. A Falco on any preset was driven by the Falco pro (11-22). */
+    if (!(c->preset & 0x80u)) return -1;
     switch (fp->kind) {
     case Ft_Kind_Falco: return 0;   /* Mang0 */
     case Ft_Kind_Mars: return 1;    /* Zain */

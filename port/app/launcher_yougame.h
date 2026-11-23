@@ -60,6 +60,10 @@ bool app_expected();
 // The extension's app is neither: the launcher's word to the player (it names the other environment's app when only
 // that one is there); empty when the app is there. Registry and pipe checks only.
 std::string extension_app_missing();
+// Only the YouGame Staging app on this computer and launcher.ini names no YouGame site: the launcher (and
+// the game, which reads launcher.ini) use YouGame Staging, as a tester with only that app wants (owner
+// 2026-11-22). True when it switched; the caller saves launcher.ini. A yougame_env line always wins.
+bool adopt_staging_app();
 // This launcher's YouGame app is running (never the other environment's). Pipe check only.
 bool app_running();
 // The launcher starting: its browser view's folder holds a session (a sign-in made before) that launcher.ini

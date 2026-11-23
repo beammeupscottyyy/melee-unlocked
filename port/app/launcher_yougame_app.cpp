@@ -34,12 +34,25 @@ Answer read_hello(const json& answer, bool* pending) {
 
 }  // namespace launcher::yougame::app
 
+// Windows (its named pipe) and Linux (its socket in the session's runtime folder): the app's channel is
+// yougame_channel.h's either way; only finding and starting the app differ.
+#if (defined(_WIN32) && defined(_MSC_VER)) || defined(MELEE_LINUX)
 #if defined(_WIN32) && defined(_MSC_VER)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
 #include <shellapi.h>
+#else
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstring>
+extern char** environ;
+#endif
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -49,8 +62,10 @@ Answer read_hello(const json& answer, bool* pending) {
 #include <thread>
 #include "yougame_channel.h"
 
+#if defined(_WIN32) && defined(_MSC_VER)
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
+#endif
 
 namespace launcher::yougame::app {
 namespace {
@@ -73,6 +88,7 @@ struct Inbox {
 
 }  // namespace
 
+#if defined(_WIN32) && defined(_MSC_VER)
 bool installed(bool staging) {
   const std::string scheme = staging ? "yougame-staging" : "yougame";
   const std::string user = "Software\\Classes\\" + scheme + "\\shell\\open\\command", root = scheme + "\\shell\\open\\command";
@@ -108,6 +124,62 @@ bool start(bool staging, int wait_ms) {
   }
   return false;
 }
+#else
+// Linux: the app registers its link type with the desktop (x-scheme-handler/yougame, as xdg-open uses).
+std::string run_text(const std::vector<std::string>& argv) {
+  int out[2];
+  if (pipe(out) != 0) return {};
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, out[1], 1);
+  posix_spawn_file_actions_addclose(&fa, out[0]);
+  std::vector<char*> args;
+  for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+  args.push_back(nullptr);
+  pid_t pid = 0;
+  const int rc = posix_spawnp(&pid, args[0], &fa, nullptr, args.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(out[1]);
+  std::string text;
+  if (rc == 0) {
+    char buf[512];
+    for (ssize_t n; (n = read(out[0], buf, sizeof buf)) > 0;) text.append(buf, (size_t)n);
+    int status = 0;
+    waitpid(pid, &status, 0);
+  }
+  close(out[0]);
+  return text;
+}
+bool installed(bool staging) {
+  const std::string handler = run_text({"xdg-mime", "query", "default", std::string("x-scheme-handler/") + (staging ? "yougame-staging" : "yougame")});
+  return handler.find(".desktop") != std::string::npos;
+}
+bool running(bool staging) {
+  channel::Candidate c;
+  if (!find(staging, &c, nullptr)) return false;
+  // Only whether the app listens there: connect and close at once (the app sees a client that left).
+  const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return false;
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  if (c.path.size() >= sizeof address.sun_path) { close(fd); return false; }
+  std::memcpy(address.sun_path, c.path.c_str(), c.path.size() + 1);
+  const bool up = connect(fd, reinterpret_cast<const sockaddr*>(&address), sizeof address) == 0;
+  close(fd);
+  return up;
+}
+bool start(bool staging, int wait_ms) {
+  if (running(staging)) return true;
+  if (!installed(staging)) return false;
+  // The app's own quiet-start link, through the desktop's link handler (tray only, no window).
+  run_text({"xdg-open", staging ? "yougame-staging://tray" : "yougame://tray"});
+  for (int waited = 0; waited < wait_ms; waited += 500) {
+    usleep(500 * 1000);
+    if (running(staging)) return true;
+  }
+  return false;
+}
+#endif
 
 Answer ask(bool staging, const std::string& version, int timeout_ms) {
   Answer out;

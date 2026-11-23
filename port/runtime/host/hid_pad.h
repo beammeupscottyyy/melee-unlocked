@@ -137,4 +137,37 @@ std::string hidpad_name(int slot);
 struct HidPadAxes { int32_t value[8]; const char* name[8]; int count; };
 HidPadAxes hidpad_axes(int slot);
 
+// Choosing an axis by moving it (g_hid_axis_role). `base` and `now` are every axis as a stick value
+// (-128..127 over its range), `present` a bit per axis. The axis that moved furthest, when that is at
+// least kHidAxisMoved (a light shield button moves a trigger axis about a fifth of its range, and a
+// resting stick's jitter is far below that), or -1. The hat (index 7) is never an answer.
+constexpr int kHidAxisMoved = 32;
+inline int hid_moved_axis(const int8_t base[8], const int8_t now[8], unsigned present) {
+  int best = -1, most = 0;   // not "far": windows.h defines that away
+  for (int i = 0; i < 7; ++i) {
+    if (!((present >> i) & 1u)) continue;
+    const int d = (int)now[i] - (int)base[i], a = d < 0 ? -d : d;
+    if (a > most) { most = a; best = i; }
+  }
+  return most >= kHidAxisMoved ? best : -1;
+}
+// Which axis a role reads: the player's choice when that axis exists, otherwise the reader's own
+// (`automatic`, -1 for none) unless the player gave that axis to another role.
+inline int hid_role_axis(const uint8_t roles[6], int role, int automatic, unsigned present) {
+  const uint8_t chosen = roles[role];
+  if (chosen < 7 && ((present >> chosen) & 1u)) return chosen;
+  for (int r = 0; r < 6; ++r)
+    if (r != role && automatic >= 0 && roles[r] == automatic) return -1;
+  return automatic;
+}
+// Remembers where every axis of the pad is now; the poll then answers with the axis moved since
+// (hid_moved_axis), -1 while none has. Not offered for a Frame1, which has a reader of its own.
+void hidpad_axis_capture_begin(int slot);
+int hidpad_axis_capture_poll(int slot);
+// Gives `axis` to `role` (HID_ROLE_*) for this pad, taking it from any role that had it. The pad is
+// expected to be held where the capture found it: right or up for a stick, which sets or clears that
+// direction's invert switch so the push reads the way it was made; a trigger rests where the capture began.
+void hidpad_assign_axis(int slot, int role, int axis);
+const char* hidpad_axis_name(int axis);
+
 }  // namespace host

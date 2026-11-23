@@ -878,8 +878,8 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
       if (std::memcmp(tag, "NKIT", 4) == 0) {
         d.kind = Kind::Unsupported;
         set_support(d, Engine::Either, Support::NotSupportedYet, false);
-        d.message = "This is an NKit image, not a full ISO. Restore it to a full Melee NTSC 1.02 ISO "
-                    "with NKit's Recover to ISO, then select that ISO.";
+        d.message = "This is an NKit image, not a full ISO. Pick it in the launcher (Browse on the Play page): "
+                    "the launcher restores the full Melee NTSC 1.02 disc from it.";
         return d;
       }
     }

@@ -51,5 +51,14 @@ extern std::array<HidBindings, 4> g_hid_bindings;
 // whose firmware reports a direction reversed is fixed there without a binding (sticks have none).
 enum : uint8_t { HID_INVERT_STICK_X = 1, HID_INVERT_STICK_Y = 2, HID_INVERT_CSTICK_X = 4, HID_INVERT_CSTICK_Y = 8 };
 inline std::array<uint8_t, 4> g_hid_stick_invert{};   // one definition for every target (tests link hid_pad alone)
+// Per HID pad: which of its axes carries each stick direction and each trigger, set in Controls by moving it.
+// The value is the reader's axis index (X, Y, Z, Rx, Ry, Rz, Slider); kHidAxisAuto leaves the reader's own
+// choice. A pad's descriptor does not say which axis is the C-stick and which a trigger, and the reader's
+// guess is wrong for some: a trigger on an axis it never read could not be used at all (1.0.9 report).
+enum : uint8_t { HID_ROLE_STICK_X, HID_ROLE_STICK_Y, HID_ROLE_CSTICK_X, HID_ROLE_CSTICK_Y, HID_ROLE_TRIGGER_L, HID_ROLE_TRIGGER_R, HID_ROLE_COUNT };
+constexpr uint8_t kHidAxisAuto = 0xFF;
+using HidAxisRoles = std::array<uint8_t, HID_ROLE_COUNT>;
+inline std::array<HidAxisRoles, 4> g_hid_axis_role{{{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+                                                    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}, {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}}};
 
 }  // namespace host

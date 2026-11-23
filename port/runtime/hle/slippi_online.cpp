@@ -732,8 +732,11 @@ bool should_skip_online_frame(int32_t frame, int32_t finalized_frame) {
       g_input_wait_player = behind < 0 ? 0 : behind;
       auto pad = g_netplay->GetSlippiRemotePad(g_input_wait_player, ROLLBACK_MAX_FRAMES);
       g_input_wait_latest = pad->latest_frame;
-      host::log("slippi: waiting for the other player's inputs on frame %d (player %d of %u others, their latest frame %d, ping %u ms)",
-                frame, g_input_wait_player + 1, (unsigned)remote_count, pad->latest_frame, (unsigned)g_netplay->LastPingMs());
+      // That player's own ping: the first player's was printed here whoever the wait was for, so a doubles
+      // match held up by one far player read as a 36 ms connection stalling.
+      host::log("slippi: waiting for the other player's inputs on frame %d (player %d of %u others, their latest frame %d, their ping %u ms)",
+                frame, g_input_wait_player + 1, (unsigned)remote_count, pad->latest_frame,
+                (unsigned)g_netplay->RemotePingMs(g_input_wait_player));
     }
     return true;
   }

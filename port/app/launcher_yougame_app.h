@@ -28,7 +28,7 @@ struct Answer {
 // fetch_identity, yougame_signin.h hello_signed_out). *pending: signed in, the player not ready yet.
 Answer read_hello(const nlohmann::json& answer, bool* pending);
 
-#if defined(_WIN32) && defined(_MSC_VER)
+#if (defined(_WIN32) && defined(_MSC_VER)) || defined(MELEE_LINUX)
 // The YouGame app for this environment is installed (its link type is registered for this user or machine).
 bool installed(bool staging);
 // Its local channel is there for this Windows user (the app is running). Never connects.

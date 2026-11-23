@@ -145,6 +145,14 @@ void lines_and_pushes() {
     CHECK(!channel::to_launcher_bridge(t, true, true));
     CHECK(channel::to_launcher_bridge(t, false, true));
   }
+  // Invites into a held room and the room report: the app's, only with its channel up and the same player there.
+  CHECK(channel::invite_to_app("mpRoom", false, false, true, true));
+  CHECK(channel::invite_to_app("mpFriend", true, false, true, true));
+  CHECK(!channel::invite_to_app("mpFriend", true, true, true, true));    // holding a room stays with the launcher
+  CHECK(!channel::invite_to_app("mpFriend", false, false, true, true));  // no room yet: the launcher answers
+  CHECK(!channel::invite_to_app("mpTicket", true, false, true, true));
+  CHECK(!channel::invite_to_app("mpFriend", true, false, false, true));  // no channel
+  CHECK(!channel::invite_to_app("mpFriend", true, false, true, false));  // another player in the app
   // The launcher not signed in, the app's channel naming a player (app_sign_in): matches go over the app's channel.
   // Its own questions stay with the launcher (its sign-in is asked first every time), and with the channel down
   // everything is the launcher's again.

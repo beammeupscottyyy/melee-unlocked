@@ -605,7 +605,9 @@ void install_file_job(std::wstring file, std::string id, const std::string& iso,
     if (!disc_rvz::probe(fs::path(file), &info, &error)) { set_status(key, error); return; }
     if (!enough_space(info.iso_size + 256 * kMiB, &error)) { set_status(key, error); return; }
     const fs::path staged = mods / ".downloads" / ("rvz-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".iso");
-    set_status(key, std::string("Unpacking the ") + (info.format == disc_rvz::Format::Rvz ? "RVZ" : "WIA") + " disc image to a full ISO...");
+    set_status(key, info.format == disc_rvz::Format::NKit
+                        ? std::string("Restoring the full Melee 1.02 disc from the NKit image...")
+                        : std::string("Unpacking the ") + (info.format == disc_rvz::Format::Rvz ? "RVZ" : "WIA") + " disc image to a full ISO...");
     int shown = -1;
     const bool converted = disc_rvz::convert(fs::path(file), staged, [&](uint64_t done, uint64_t total) {
       const int percent = total ? (int)(done * 100 / total) : 0;
@@ -615,7 +617,10 @@ void install_file_job(std::wstring file, std::string id, const std::string& iso,
     set_percent(key, -1);
     if (!converted) { set_status(key, cancelled(cancel) ? "Cancelled. Nothing was installed." : error); return; }
     struct Drop { fs::path p; ~Drop() { std::error_code e; fs::remove(p, e); } } drop{staged};   // nothing once placed
-    const fs::path name = fs::path(file).stem().concat(L".iso");
+    // "Melee.nkit.iso" restored is the plain disc: "Melee.iso".
+    fs::path name = fs::path(file).stem();
+    if (info.format == disc_rvz::Format::NKit && name.extension() == L".nkit") name = name.stem();
+    name.concat(L".iso");
     if (hash_file(staged.wstring(), BCRYPT_MD5_ALGORITHM) == kVanillaMd5) {
       const fs::path target = fs::u8path(work_dir()) / "Disc" / name;
       if (!place(staged, target, &error)) { set_status(key, error); return; }

@@ -15,7 +15,7 @@ the audio DMA at once) also shaped the port's input and audio paths. Thanks, Art
 ## Trust
 
 Early pads are optional data a peer volunteers. A remote whose early guesses are mostly wrong (over
-60% after 64 guesses; honest play measured under 26% in every such run) has its early pads ignored
+half wrong after 24 scored guesses; honest play measured at most 3.3% wrong) has its early pads ignored
 for the rest of the match, logged once. Test switch: `MELEE_TEST_EARLY_LIE=1` makes a game send
 made-up early pads.
 
@@ -69,7 +69,7 @@ Per remote player at most 8 entries, oldest target first. A second message for t
 
 At the end of an online match the Source Port's game logs `online: N predictions compared, M wrong; K frames predicted from early pads` and `online: early pad predictions right R, wrong W`; the host logs `slippi: early inputs on: C changes, P packets, G guarded, K resent after a skip, F follow-ups, T received, ...` (or `p2p: early inputs ...`). `changes` are the pads handed to the transport, `packets` the ones that went on the wire (a peer takes them). Rollback counts are on the line before them, as they always were.
 
-Early rollback (`MELEE_EARLY_ROLLBACK=1`, off by default): an early pad that contradicts a frame already run starts the rollback at once instead of when the confirmed pad comes. It adds rollbacks of its own, so it stays off unless measurement shows otherwise.
+Early rollback (on by default; `MELEE_EARLY_ROLLBACK=0` turns it off for tests): an early pad that contradicts, at the game's action lines, a frame already run on a guess starts the rollback at once instead of when the confirmed pad comes. Above about 41 ms one way the early pad arrives after its frame ran, so prediction alone never uses it; this is how it still counts there: the correction comes sooner and goes back fewer frames.
 
 ## Tests
 

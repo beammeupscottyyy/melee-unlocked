@@ -2051,25 +2051,11 @@ void set_iso(const std::string& path) {
   invalidate(drop_sub_rect());
 }
 
-// An NKit image is the retail disc trimmed and repacked: not the 1.02 ISO and not a mod. Said
-// plainly instead of filing it under Mods, where Play then needed a retail disc the player lacks.
-bool nkit_image(const std::wstring& path) {
-  std::ifstream in(path, std::ios::binary);
-  char tag[4] = {};
-  if (!in.seekg(0x200) || !in.read(tag, 4)) return false;
-  return std::memcmp(tag, "NKIT", 4) == 0;
-}
-void explain_nkit() {
-  MessageBoxW(g_main, L"This is an NKit image, not a full disc image. Melee Unlocked needs the full Melee NTSC 1.02 ISO.\n\n"
-              L"Restore it with NKit's \"Recover to ISO\" and select the restored .iso.", L"NKit image", MB_ICONINFORMATION);
-}
-
 void browse() {
   wchar_t file[MAX_PATH]{};
   OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof ofn; ofn.hwndOwner = g_main; ofn.lpstrFilter = L"GameCube disc image (*.iso;*.gcm;*.rvz;*.wia)\0*.iso;*.gcm;*.rvz;*.wia\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
   if (GetOpenFileNameW(&ofn)) {
-    if (nkit_image(file)) { explain_nkit(); return; }
-    // Dolphin's compressed images are unpacked to a full ISO first (the Mods page shows progress);
+    // Dolphin's compressed images, and an NKit image of Melee 1.02, are unpacked to a full ISO first (the Mods page shows progress);
     // the 1.02 disc then becomes the game disc and a modded one goes into Mods.
     if (disc_rvz::detect(std::filesystem::path(file)) != disc_rvz::Format::NotCompressed) {
       mod_manager::open(); std::thread(mod_manager::install_file, std::wstring(file), std::string(), g_iso).detach(); return;
@@ -2367,6 +2353,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       create_replay_controls();
       select_tab(0);
       load_ini();
+      if (launcher::yougame::adopt_staging_app()) {
+        log_line("yougame: only the YouGame Staging app is installed: using YouGame Staging (launcher.ini yougame_env=staging)");
+        save_ini();
+      }
 #ifdef MELEE_NO_SLIPPI
       // An older version kept in Versions is the other Game Build, and nothing here could switch
       // back from one: the current install always.
@@ -2557,6 +2547,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (i == 1) { open_settings(); return 0; }
         if (i == 4) { select_tab(3); refresh_replays(); return 0; }
         if (i == 5) { mod_manager::open(); return 0; }
+        if (i == 3 && !launcher::lobby::kPageShown) {
+          // The page is set aside (launcher_lobby.h): the button offers YouGame, the app when it is
+          // installed, otherwise the site's page for getting it.
+          if (MessageBoxW(g_main, L"Open YouGame?", L"Multiplayer Lobby", MB_YESNO | MB_ICONQUESTION) == IDYES)
+            ShellExecuteW(nullptr, L"open", widen(launcher::yougame::open_target()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          return 0;
+        }
         if (i == 3) {
           refresh_account_line();
           select_tab(2);
@@ -2657,7 +2654,6 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           vanilla = mod_manager::hash_file(file, BCRYPT_MD5_ALGORITHM) == mod_manager::kVanillaMd5;
           SetCursor(old);
         }
-        if (nkit_image(file)) { explain_nkit(); continue; }
         const bool compressed_disc = disc_rvz::detect(std::filesystem::path(file)) != disc_rvz::Format::NotCompressed;
         if (compressed_disc || mod_manager::is_mod_file(file) || (disc && !vanilla)) {
           mod_manager::open();

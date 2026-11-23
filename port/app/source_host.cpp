@@ -492,6 +492,32 @@ bool stage_file_is_stub(const std::vector<uint8_t>& b) {
   }
   return map && !collision;
 }
+// The map parts of a stage file (map_head's table of 0x34-byte entries): for each, whether its model
+// joint is there (a pointer is there when the archive relocates it). False when the file has no
+// readable map_head.
+bool stage_map_parts(const std::vector<uint8_t>& b, std::vector<bool>* parts) {
+  auto word = [&](uint64_t at) { return (uint32_t)b[at] << 24 | (uint32_t)b[at + 1] << 16 | (uint32_t)b[at + 2] << 8 | b[at + 3]; };
+  parts->clear();
+  if (b.size() < 0x20 || word(0) != b.size()) return false;
+  const uint64_t data = word(4), relocations = word(8), roots = word(12), references = word(16);
+  const uint64_t table = 0x20 + data + relocations * 4, strings = table + (roots + references) * 8;
+  if (!roots || roots > 1024 || references > 1024 || strings > b.size()) return false;
+  uint64_t head = UINT64_MAX;
+  for (uint64_t i = 0; i < roots; ++i) {
+    const uint64_t name = strings + word(table + i * 8 + 4);
+    if (name >= b.size()) return false;
+    const char* text = (const char*)b.data() + name;
+    if (std::string(text, strnlen(text, b.size() - (size_t)name)) == "map_head") head = word(table + i * 8);
+  }
+  if (head == UINT64_MAX || 0x20 + head + 0x10 > 0x20 + data) return false;
+  const uint64_t entries = word(0x20 + head + 8), count = word(0x20 + head + 0x0C);
+  if (count > 256 || 0x20 + entries + count * 0x34 > 0x20 + data) return false;
+  std::unordered_set<uint32_t> relocated;
+  relocated.reserve((size_t)relocations);
+  for (uint64_t i = 0; i < relocations; ++i) relocated.insert(word(0x20 + data + i * 4));
+  for (uint64_t i = 0; i < count; ++i) parts->push_back(relocated.count((uint32_t)(entries + i * 0x34)) != 0);
+  return true;
+}
 slippi::online::NativeGameplayProfile g_mod_gameplay_profile = slippi::online::NativeGameplayProfile::Vanilla;
 std::string g_mod_display_name;
 
@@ -986,9 +1012,42 @@ void load_mod_overlay() {
     host::log("mods: %s in the disc is not a whole archive (header %08X, file %u bytes): the game's own file stays",
               path.c_str(), be32(own), file.length);
   }
+  // A disc stage file in place of one of the game's stages that lacks a map part the game's own file
+  // has: the stage's code makes an object for each of its parts by number, and one that is not there
+  // was a read through a null archive (a custom disc's Pokemon Stadium ended the match as it started,
+  // 1.0.7 report B-1192). The game's own stage stays for it.
+  std::unordered_set<std::string> stages_missing_parts;
+  for (const auto& file : g_mod_overlay.files()) {
+    const auto found = g_paths.find(file.path);
+    // The .dat and its English twin (.usd), which English games load in its place.
+    const std::string& path = file.path;
+    const bool stage_file = path.rfind("/gr", 0) == 0 && path.find('/', 1) == std::string::npos && path.size() > 7 &&
+                            (path.compare(path.size() - 4, 4, ".dat") == 0 || path.compare(path.size() - 4, 4, ".usd") == 0);
+    if (found == g_paths.end() || g_fst[found->second].dir || stage_stubs.count(file.path) ||
+        broken_archives.count(file.path) || !stage_file)
+      continue;
+    const FstFile& retail = g_fst[found->second];
+    if (retail.length < 0x20 || retail.length > 64u * 1024u * 1024u || file.length < 0x20 ||
+        file.length > 64u * 1024u * 1024u)
+      continue;
+    std::vector<uint8_t> game(retail.length), own(file.length);
+    if (!host::disc_read(retail.offset, game.data(), retail.length) ||
+        g_mod_overlay.read(file.start, own.data(), file.length) != ModOverlay::Read::Success)
+      continue;
+    std::vector<bool> game_parts, own_parts;
+    if (!stage_map_parts(game, &game_parts)) continue;
+    const bool own_readable = stage_map_parts(own, &own_parts);
+    size_t missing = 0;
+    for (size_t i = 0; i < game_parts.size(); ++i)
+      if (game_parts[i] && (!own_readable || i >= own_parts.size() || !own_parts[i])) ++missing;
+    if (!missing) continue;
+    stages_missing_parts.insert(file.path);
+    host::log("mods: %s in the disc lacks %zu of the %zu map parts the game's own stage has: the game's own stage stays",
+              file.path.c_str(), missing, game_parts.size());
+  }
   uint32_t replaced = 0, added = 0, pack_kept = 0;
   for (const auto& file : g_mod_overlay.files()) {
-    if (stage_stubs.count(file.path) || broken_archives.count(file.path)) continue;
+    if (stage_stubs.count(file.path) || broken_archives.count(file.path) || stages_missing_parts.count(file.path)) continue;
     if (pack_keeps(file)) { ++pack_kept; continue; }   // retail menus, and no file that carries code
     auto found = g_paths.find(file.path);
     int32_t entry;
@@ -1784,10 +1843,12 @@ uint32_t h_game_options3() {
          (gx::RenderOptions::live_unlock_all() ? 0u : MU_GAME_OPTION3_LOCKED_CONTENT) |
          (gx::RenderOptions::live_results_screen() ? 0u : MU_GAME_OPTION3_SKIP_RESULTS);
 }
+// A switched-on PAL Stock Icons Gecko code (user_gecko::hand_ports_of_codes), set each frame.
+std::atomic<bool> g_code_pal_stock{false};
 uint32_t h_game_options() {
   if (yougame::console::console_active()) return 0; // canonical normal menus and language
   return (gecko::option_no_screen_shake ? MU_GAME_OPTION_NO_SCREEN_SHAKE : 0u) |
-         (gecko::option_pal_stock_icons ? MU_GAME_OPTION_PAL_STOCK_ICONS : 0u) |
+         (gecko::option_pal_stock_icons || g_code_pal_stock.load(std::memory_order_relaxed) ? MU_GAME_OPTION_PAL_STOCK_ICONS : 0u) |
          (gecko::option_widescreen ? MU_GAME_OPTION_WIDESCREEN : 0u) |   // the viewer's own, also in replays
          (gx::true_widescreen_active() ? MU_GAME_OPTION_TRUE_WIDESCREEN : 0u) |   // likewise: display only
          (((uint32_t)host::g_game_language.load(std::memory_order_relaxed) << MU_GAME_OPTION_LANGUAGE_SHIFT) &
@@ -3470,6 +3531,14 @@ void h_pad_read(MuPadStatus out[4]) {
   }
   // A pasted always-display hitbox code turns on the Arcade look switches its lines stand for.
   gx::set_arcade_display(gx::ArcadeSource::Codes, user_gecko::arcade_bits_of_codes());
+  // Hand-ported codes (user_gecko.h): a local player tag code and PAL Stock Icons run as the game's own
+  // features while the player has them on. Picture only, so online too.
+  {
+    const user_gecko::HandPorts hand = user_gecko::hand_ports_of_codes();
+    gx::set_code_ally_tag(hand.local_tag, hand.local_tag_text, hand.local_tag_arrow);
+    gx::set_code_pal_stock(hand.pal_stock_icons);
+    g_code_pal_stock.store(hand.pal_stock_icons, std::memory_order_relaxed);
+  }
   // Hidden test hook: MELEE_TEST_INSTALL_LOOK=<0 Diet, 1 Animelee, 2 Animelee x DBZ> starts that one-click install once.
   {
     static const int test_install = [] { const char* v = host::test_env::getenv("MELEE_TEST_INSTALL_LOOK"); return v && *v ? std::atoi(v) : -1; }();
@@ -6179,7 +6248,19 @@ int run(void (*shutdown)(int)) {
   // DOL, m-ex) is refused here with a message instead of failing somewhere inside the game.
   if (!host::disc_has_vanilla_dol()) {
     yougame::notify_mod_refused(!g_explicit_mod_layers.empty(), yougame::mode_policy::ModRefusal::ModdedDol);
-    host::die("ISO DOL does not match vanilla Melee NTSC 1.02; the Source engine runs only the retail game (modded discs are not supported)");
+    // The player's disc, not a crash: said once, no crash report (main.cpp does the same for a disc problem).
+    static const char* kModdedDisc =
+        "This ISO is a modded Melee disc. The Source Port plays only the retail Super Smash Bros. Melee NTSC 1.02 disc.\n\n"
+        "Choose your retail ISO in the launcher, or put the modded disc in the Mods folder and play it from launcher > Mods.";
+    host::log("ISO DOL does not match vanilla Melee NTSC 1.02; the Source engine runs only the retail game (modded discs are not supported)");
+    std::fprintf(stderr, "%s\n", kModdedDisc);
+    host::log_flush();
+#ifdef _WIN32
+    if (!host::options.no_gc_adapter) MessageBoxA(nullptr, kModdedDisc, "Melee Unlocked", MB_ICONINFORMATION | MB_OK);
+    ExitProcess(2);
+#else
+    std::_Exit(2);
+#endif
   }
   // Diagnostic builds of the game (for example the M0 maths audit) without replacing the shipped DLL.
   if (yougame::mode_policy::mod_sources(yougame::active()).folders)

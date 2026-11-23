@@ -672,7 +672,7 @@ void check_frame1_xinput() {
 static void check_stick_encodings() {
   using namespace host;
   // Signed range declared, offset-binary data (0x80 at rest): the declared reading is a corner.
-  CHECK(hid_stick_value(-127, 127, 8, 0x80, kStickDeclared) == 127);
+  CHECK(hid_stick_value(-127, 127, 8, 0x80, kStickDeclared) <= -127);
   CHECK(hid_stick_encoding(-127, 127, 8, 0x80) == kStickOffset);
   CHECK(hid_stick_value(-127, 127, 8, 0x80, kStickOffset) == 0);
   CHECK(hid_stick_value(-127, 127, 8, 0xFF, kStickOffset) == 127);   // full right
@@ -685,6 +685,14 @@ static void check_stick_encodings() {
   CHECK(hid_stick_value(0, 255, 8, 0x81, kStickTwos) <= -126);
   // 16-bit signed declared range with two's-complement data reads as declared once sign-extended.
   CHECK(hid_stick_value(-32768, 32767, 16, 0xFFFF, kStickTwos) == 0 || hid_stick_value(-32768, 32767, 16, 0xFFFF, kStickTwos) == -1);
+  // A signed range declared, and signed data: left is left (it was read as a large positive number, so
+  // left and right both read right; B0XX r2 DInput, 11-22).
+  CHECK(hid_stick_value(-32768, 32767, 16, 0x0000, kStickDeclared) == 0);
+  CHECK(hid_stick_value(-32768, 32767, 16, 0x50D0, kStickDeclared) >= 79);                 // +20688: right
+  CHECK(hid_stick_value(-32768, 32767, 16, 0xB030, kStickDeclared) <= -79);                // -20432: left
+  CHECK(hid_stick_value(-32768, 32767, 16, 0xB030, kStickDeclared, true) >= 79);           // Y: down -> flipped
+  CHECK(hid_stick_value(-127, 127, 8, 0xFF, kStickDeclared) == -1);                         // -1, not full right
+  CHECK(hid_stick_encoding(-32768, 32767, 16, 0) == kStickDeclared);
   // Normal pads at rest: as declared.
   CHECK(hid_stick_encoding(0, 255, 8, 128) == kStickDeclared);
   CHECK(hid_stick_encoding(0, 65535, 16, 32768) == kStickDeclared);
@@ -695,7 +703,56 @@ static void check_stick_encodings() {
   CHECK(hid_stick_encoding(0, 255, 8, 200) == kStickDeclared);   // part-way: no other reading is centred
 }
 
+// Choosing an axis by moving it, and which axis each role then reads.
+static void check_axis_roles() {
+  using namespace host;
+  int8_t base[8] = {0, 0, -128, 0, 0, -128, 0, 0}, now[8];
+  std::memcpy(now, base, sizeof base);
+  const unsigned all = 0x7F;
+  CHECK(hid_moved_axis(base, now, all) == -1);
+  now[0] = 6; now[1] = -9;                       // a resting stick's jitter
+  CHECK(hid_moved_axis(base, now, all) == -1);
+  now[5] = -128 + 49;                            // a light shield button on the Rz trigger axis
+  CHECK(hid_moved_axis(base, now, all) == 5);
+  now[3] = 127;                                  // the furthest mover wins
+  CHECK(hid_moved_axis(base, now, all) == 3);
+  CHECK(hid_moved_axis(base, now, all & ~(1u << 3)) == 5);   // an axis the pad does not have is never chosen
+  now[7] = 100;                                  // the hat is not an axis to choose
+  now[3] = 0; now[5] = -128;
+  CHECK(hid_moved_axis(base, now, 0xFF) == -1);
+
+  uint8_t roles[6] = {kHidAxisAuto, kHidAxisAuto, kHidAxisAuto, kHidAxisAuto, kHidAxisAuto, kHidAxisAuto};
+  CHECK(hid_role_axis(roles, HID_ROLE_CSTICK_X, 3, all) == 3);        // nothing chosen: the reader's own
+  CHECK(hid_role_axis(roles, HID_ROLE_TRIGGER_L, -1, all) == -1);
+  roles[HID_ROLE_TRIGGER_L] = 2; roles[HID_ROLE_TRIGGER_R] = 5;       // triggers on Z and Rz
+  CHECK(hid_role_axis(roles, HID_ROLE_TRIGGER_L, 6, all) == 2);
+  CHECK(hid_role_axis(roles, HID_ROLE_TRIGGER_R, 2, all) == 5);
+  CHECK(hid_role_axis(roles, HID_ROLE_CSTICK_X, 2, all) == -1);       // Z was given away: not also the C-stick
+  CHECK(hid_role_axis(roles, HID_ROLE_CSTICK_X, 3, all) == 3);
+  roles[HID_ROLE_TRIGGER_L] = 6;                                      // chosen on another pad: this one has no slider
+  CHECK(hid_role_axis(roles, HID_ROLE_TRIGGER_L, -1, 0x3F) == -1);
+}
+
+// A signed 16-bit field carries the GameCube byte in its top bits: rest is exactly 0 either way up.
+static void check_signed_field_byte() {
+  using namespace host;
+  for (const bool flip : {false, true}) {
+    CHECK(hid_stick_value(-32768, 32767, 16, 0, kStickDeclared, flip) == 0);
+    CHECK(hid_stick_value(-32768, 32767, 16, 127, kStickDeclared, flip) == 0);
+  }
+  CHECK(hid_stick_value(-32768, 32767, 16, 20688, kStickDeclared) == 80);
+  CHECK(hid_stick_value(-32768, 32767, 16, (unsigned long)(65536 - 20432), kStickDeclared) == -80);
+  CHECK(hid_stick_value(-32768, 32767, 16, 20688, kStickDeclared, true) == -80);
+  CHECK(hid_stick_value(-32768, 32767, 16, (unsigned long)(65536 - 20432), kStickDeclared, true) == 80);
+  CHECK(hid_stick_value(0, 65535, 16, 20688, kStickTwos) == 80);                       // the same data in a field declared unsigned
+  CHECK(hid_stick_value(0, 65535, 16, (unsigned long)(65536 - 20432), kStickTwos) == -80);
+  CHECK(hid_stick_value(-128, 127, 8, 0x80, kStickDeclared) == -128);
+  CHECK(hid_stick_value(-128, 127, 8, 0x80, kStickDeclared, true) == 127);
+}
+
 int main() {
+  check_signed_field_byte();
+  check_axis_roles();
   check_stick_encodings();
   check_frame1_dinput_axes();
   check_frame1_own_dinput();

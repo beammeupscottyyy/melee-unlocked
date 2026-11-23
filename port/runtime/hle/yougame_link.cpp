@@ -332,7 +332,12 @@ void restore_bridge_for_restart() {
   _putenv_s("YOUGAME_TOKEN", g_bridge_token.c_str());
   _putenv_s(g_hybrid_env ? "MELEE_YOUGAME_MATCH_BRIDGE" : "MELEE_YOUGAME_LAUNCHER", "1");
 }
+std::atomic<bool> g_app_same_player{false};   // hybrid: the app's channel names the launcher's own player (identity())
 bool routed_to_bridge(const json& body) {
+  if (g_match_bridge && body.is_object() &&
+      channel::invite_to_app(body.value("type", std::string()), body.count("room") && body["room"].is_string(),
+                             body.value("hold", json()) == true, g_channel_up.load(), g_app_same_player.load()))
+    return false;
   return g_match_bridge && channel::to_launcher_bridge(body.is_object() ? body.value("type", std::string()) : std::string(),
                                                        g_channel_up.load(), g_app_sign_in.load());
 }
@@ -2203,6 +2208,8 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
       // else the app's, over its channel.
       std::string app_player;
       { std::lock_guard<std::mutex> lock(g_app_player_mutex); app_player = g_app_player_id; }
+      g_app_same_player = !g_app_sign_in.load() && g_channel_up.load() && !app_player.empty() && app_player == id.player_id;
+      if (g_app_same_player.load()) host::log("yougame: invites and the room report go to the YouGame app (the same player is signed in there)");
       host::log("yougame: matches go through %s with %s; the YouGame app's channel is %s%s",
                 g_app_sign_in.load() ? "the YouGame app's channel" : "the launcher's bridge", sign_in_used.c_str(),
                 g_channel_up.load() ? "up" : "not up",
@@ -2229,6 +2236,19 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
         host::log("yougame: no connect code: %s", channel::log_text(e.what()).c_str());
       }
       break;
+    }
+    // Hybrid, the launcher's sign-in: the app's player id can be the game's own id for that player, not the site's,
+    // so two ids that differ do not prove two accounts. The connect code is the account's: ask the app's and compare.
+    if (g_match_bridge && !g_app_sign_in.load() && g_channel_up.load() && !g_app_same_player.load() && !id.code.empty()) {
+      try {
+        const json a = bridge_channel({{"type", "mpCode"}}, 4000, cancelled);
+        const json r = a.is_object() && a.count("result") && a["result"].is_object() ? a["result"] : a;
+        const std::string app_code = r.is_object() ? r.value("code", std::string()) : std::string();
+        g_app_same_player = !app_code.empty() && app_code == id.code;
+        host::log("yougame: the YouGame app's connect code %s the launcher's%s", app_code.empty() ? "was not given, so it is not known to be"
+                  : g_app_same_player.load() ? "is" : "is not",
+                  g_app_same_player.load() ? ": invites and the room report go to the YouGame app" : "");
+      } catch (const std::exception&) {}
     }
     id.ok = !id.player_id.empty();
     if (!id.ok) id.error = "Sign in to YouGame to play online";
@@ -3363,6 +3383,13 @@ void start_channel(bool automated) {
     if (host::test_env::getenv("MELEE_NO_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
     if (automated && !host::test_env::getenv("MELEE_TEST_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
     start_channel_probe(true);
+    // Hidden test runs only: MELEE_TEST_YG_MENU_KEY_MS=N presses Shift+Tab N ms from now (a hidden window gets no keys).
+    if (const char* ms = host::test_env::getenv("MELEE_TEST_YG_MENU_KEY_MS"))
+      std::thread([wait = std::atoi(ms)] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(wait));
+        const bool taken = channel_menu_key("keys");
+        host::log("yougame: test Shift+Tab: %s, channel %s", taken ? "taken" : "left to the game", g_channel_up.load() ? "up" : "down");
+      }).detach();
     // A YouGame app started after the game (Get YouGame in the start window, or opened by hand) is found
     // without a restart: look again every 4 s while no channel is up. A look is a loopback connect that
     // fails at once when nothing listens; start_channel_probe refuses overlap and keeps its 5 s gate.

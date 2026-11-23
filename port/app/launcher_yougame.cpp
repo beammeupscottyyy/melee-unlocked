@@ -65,6 +65,7 @@ std::mutex g_mutex;
 // Production (owner 11-20: YouGame moved Melee Unlocked to production; staging had no test build of a new
 // release, so its searches said "Test build not available"). launcher.ini yougame_env=staging switches back.
 Env g_env = kProduction;
+bool g_env_named = false;   // launcher.ini has a yougame_env line: the player's choice stands
 Session g_session;
 std::string g_build_json = "{}";
 // The first GitHub release whose YouGame rows play in YouGame's pools: none older can be restarted into.
@@ -449,6 +450,7 @@ bool load_line(const std::string& line) {
   if (line.rfind("yougame_env=", 0) == 0) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_env = line.substr(12) == "staging" ? kStaging : kProduction;
+    g_env_named = true;
     return true;
   }
   if (line.rfind("yougame_app=", 0) == 0) {
@@ -477,7 +479,7 @@ bool load_line(const std::string& line) {
 std::string ini_lines() {
   std::lock_guard<std::mutex> lock(g_mutex);
   std::string out;
-  if (g_env.id != "production") out += "yougame_env=" + g_env.id + "\n";
+  if (g_env.id != "production" || g_env_named) out += "yougame_env=" + g_env.id + "\n";   // a named site stays named
   if (g_extension) out += "yougame_extension=1\n";
   if (g_app_choice >= 0) out += "yougame_app=" + std::to_string(g_app_choice) + "\n";
   // An account the YouGame app gave is not kept: the launcher asks the app again when it starts.
@@ -609,6 +611,24 @@ std::string extension_app_missing() {
          (other ? std::string(". This computer has only ") + (staging ? "YouGame" : "YouGame Staging") + ", which this version does not use."
                 : ", which is not installed.") +
          " YouGame matches work without it.\n\nOpen the page where the " + name + " app downloads?";
+}
+
+bool adopt_staging_app() {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_env_named || g_env.id != "production") return false;
+  }
+  // Test runs only (MELEE_LAUNCHER_TEST): MELEE_LAUNCHER_TEST_YG_APPS=staging|production|both|none says which
+  // YouGame apps this computer has, instead of the registry.
+  const char* apps = std::getenv("MELEE_LAUNCHER_TEST") ? std::getenv("MELEE_LAUNCHER_TEST_YG_APPS") : nullptr;
+  const std::string a = apps ? apps : "";
+  const bool production = apps ? (a == "production" || a == "both") : (app::installed(false) || app::running(false));
+  const bool staging = apps ? (a == "staging" || a == "both") : (app::installed(true) || app::running(true));
+  if (production || !staging) return false;
+  set_env("staging");
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_env_named = true;
+  return true;
 }
 
 bool app_declined() { std::lock_guard<std::mutex> lock(g_mutex); return g_app_choice == 0; }

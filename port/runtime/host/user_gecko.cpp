@@ -949,6 +949,98 @@ uint32_t arcade_bits_of_codes() {
   return bits;
 }
 
+namespace {
+// Each assembly injection (C2/C3) of a code: its console address and its payload words, in order.
+std::vector<std::pair<uint32_t, std::vector<uint32_t>>> injections(const Code& c) {
+  std::vector<std::pair<uint32_t, std::vector<uint32_t>>> out;
+  const size_t n = c.lines.size();
+  for (size_t i = 0; i < n;) {
+    const uint32_t w = c.lines[i].first, v = c.lines[i].second, kind = (w >> 24) & 0xEEu;
+    size_t count = 1;
+    if (kind == 0xC0 || kind == 0xC2) count = 1 + (size_t)v;
+    else if (kind == 0x06) count = 1 + ((size_t)v + 7) / 8;
+    else if (kind == 0x08) count = 2;
+    if (count > n - i) count = n - i;
+    if (kind == 0xC2) {
+      std::vector<uint32_t> words;
+      for (size_t k = 1; k < count; ++k) { words.push_back(c.lines[i + k].first); words.push_back(c.lines[i + k].second); }
+      out.push_back({0x80000000u | (w & 0x01FFFFFFu), std::move(words)});
+    }
+    i += count;
+  }
+  return out;
+}
+bool is_local_tag_hook(uint32_t addr) { return addr == 0x800355B4u || addr == 0x802FD1ECu || addr == 0x802FC9E4u; }
+bool is_pal_stock(uint32_t addr, const std::vector<uint32_t>& words) {
+  return addr == 0x802F9A3Cu && std::find(words.begin(), words.end(), 0x3F59999Au) != words.end();   // 0.85f
+}
+}  // namespace
+
+std::string local_tag_text_of(const Code& c, bool* arrow) {
+  if (arrow) *arrow = false;
+  for (const auto& inj : injections(c)) {
+    if (inj.first != 0x802FD1ECu) continue;
+    const auto& w = inj.second;
+    // "b past; blrl" then the tag's bytes (SetLocalPlayerTag.asm): the branch says how long the data is.
+    if (w.size() < 3 || (w[0] & 0xFC000003u) != 0x48000000u || w[1] != 0x4E800021u) continue;
+    const size_t data_words = std::min<size_t>(((w[0] & 0x03FFFFFCu) / 4) - 2, w.size() - 2);
+    std::vector<uint8_t> b;
+    for (size_t k = 0; k < data_words && k < 8; ++k)
+      for (int s = 24; s >= 0; s -= 8) b.push_back((uint8_t)(w[2 + k] >> s));
+    std::string text;
+    for (size_t k = 0; k < b.size() && b[k];) {
+      const uint8_t hi = b[k];
+      if (hi < 0x80) { if (hi >= 0x20 && hi < 0x7F) text += (char)hi; ++k; continue; }
+      if (k + 1 >= b.size()) break;
+      const uint16_t ch = (uint16_t)(hi << 8 | b[k + 1]);
+      k += 2;
+      if (ch >= 0x824F && ch <= 0x8258) text += (char)('0' + ch - 0x824F);        // fullwidth digits
+      else if (ch >= 0x8260 && ch <= 0x8279) text += (char)('A' + ch - 0x8260);   // fullwidth capitals
+      else if (ch >= 0x8281 && ch <= 0x829A) text += (char)('a' + ch - 0x8281);   // fullwidth small letters
+      else if (ch == 0x8140) text += ' ';
+      else if (ch == 0x8148) text += '?';
+      else if (ch == 0x8149) text += '!';
+      else if (ch == 0x8144) text += '.';
+      else if (ch == 0x8146) text += ':';
+      else if (ch == 0x815B || ch == 0x817C || ch == 0x815D) text += '-';
+      else if (ch == 0x817B) text += '+';
+      else if (ch == 0x8195) text += '&';
+      else if (ch == 0x8194) text += '#';
+      else if (ch == 0x8197) text += '@';
+      else if (ch >= 0x81A8 && ch <= 0x81AB) { if (arrow) *arrow = true; }   // arrows: drawn as one
+      else if (ch >= 0x819A && ch <= 0x81A5) { if (arrow) *arrow = true; }   // stars, circles, triangles: a marker
+    }
+    while (!text.empty() && text.back() == ' ') text.pop_back();
+    return text;
+  }
+  return "";
+}
+
+const char* hand_port(const Code& c) {
+  for (const auto& inj : injections(c)) {
+    if (is_local_tag_hook(inj.first)) return kLocalTagCodeLabel;
+    if (is_pal_stock(inj.first, inj.second)) return kPalStockCodeLabel;
+  }
+  return nullptr;
+}
+
+HandPorts hand_ports_of_codes() {
+  HandPorts h;
+  for (const Code& c : g_codes) {
+    if (!c.wanted) continue;   // the player's own switch: these never "run" as PowerPC here
+    const char* port = hand_port(c);
+    if (port == kPalStockCodeLabel) h.pal_stock_icons = true;
+    if (port != kLocalTagCodeLabel) continue;
+    h.local_tag = true;
+    bool arrow = false;
+    const std::string text = local_tag_text_of(c, &arrow);
+    // Slippi's own code says YOU: that is the usual tag. A code with its own (a name, an arrow) wins.
+    if (arrow && h.local_tag_text.empty()) h.local_tag_arrow = true;
+    if (!text.empty() && text != "YOU") { h.local_tag_text = text; h.local_tag_arrow = false; }
+  }
+  return h;
+}
+
 const char* native_equivalent(const Code& c) {
   // Slippi's optional codes (GALE01r2.ini) that the Source Port carries as C, by the code's first
   // line. Never by its name: a code is what its lines do, and one that only shares a name with a

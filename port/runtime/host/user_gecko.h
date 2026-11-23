@@ -147,6 +147,32 @@ const char* native_equivalent(const Code& c);
 constexpr const char kArcadeHitboxCodeLabel[] = "Show attack hitboxes (VIDEO, Arcade look)";
 uint32_t arcade_bits_of_codes();
 
+// Hand ports (owner 11-22: popular codes coded natively, no translator). A player's code that the
+// Source Port carries as its own C keeps its switch: while the player has it on, the native feature
+// is on. Recognised by where the code hooks the game and what it puts there, never by its name, so
+// players' copies that differ by a word or two still count.
+//  - A local player tag (Slippi's "Optional: Show Friendly Player Indicators" and the "Force Nametag
+//    ... for Local Player" codes built on it: they hook 800355B4, 802FD1EC or 802FC9E4): the online
+//    ally indicators (Community codes). When the code carries its own tag text (a name, an arrow),
+//    that text is the one drawn over the player's fighter.
+//  - PAL Stock Icons (an injection at 802F9A3C that sets PAL's 0.85 scale): the PAL stock row.
+// Both are picture only, drawn by this game alone, so they are allowed online too.
+constexpr const char kLocalTagCodeLabel[] = "Ally indicators online (Community codes)";
+constexpr const char kPalStockCodeLabel[] = "PAL Stock Icons";
+const char* hand_port(const Code& c);
+// What the switched-on hand-ported codes ask for, recomputed by the caller as often as it likes
+// (game thread only: the codes list changes there).
+struct HandPorts {
+  bool local_tag = false;        // ally indicators online
+  std::string local_tag_text;    // the code's own tag as printable ASCII ("" = the usual YOU)
+  bool local_tag_arrow = false;  // the code's tag is an arrow: an arrow is drawn instead of text
+  bool pal_stock_icons = false;
+};
+HandPorts hand_ports_of_codes();
+// The tag text a local player tag code carries, as printable ASCII, from the Shift JIS words after its
+// "b over; blrl" data stub (empty when it carries none). `*arrow` is set when it is an arrow symbol.
+std::string local_tag_text_of(const Code& c, bool* arrow);
+
 // Parses a pasted or typed code and appends it, so a player can bring in a code without editing
 // GeckoCodes.ini by hand. `body` is the code's hex lines, one "XXXXXXXX YYYYYYYY" pair per line
 // (blank lines and "*" note lines are fine and kept); if its first line is "$Name", that name is

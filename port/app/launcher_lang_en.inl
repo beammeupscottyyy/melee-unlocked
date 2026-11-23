@@ -61,6 +61,7 @@
 {"lobby.friend.self", "That is your own code."},
 {"lobby.friend.looking", "Looking for {code}. They need to be online in the launcher."},
 {"lobby.friend.not_found", "Could not find {code}. They need to be online with launcher {version} or newer."},
+{"lobby.friend.unreachable", "{code} is online, but their launcher did not answer: one of your two networks blocks direct connections between launchers. Play them through Slippi Direct with their code instead."},
 {"lobby.friend.legacy", "{name} is on an older launcher and can only be added from the public lobby."},
 {"lobby.error.bootstrap", "The peer address must be a reachable host:port."},
 {"lobby.error.no_dht", "Cannot reach the lobby network. Check your internet connection."},

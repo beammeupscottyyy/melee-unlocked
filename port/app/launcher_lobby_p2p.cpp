@@ -574,7 +574,7 @@ struct PeerLobby::Impl {
   };
   struct Candidate { sockaddr_in address{}; ULONGLONG hello_sent=0,seen=0; };
   // announce: search and also list ourselves under the topic (not for a friend code we look up).
-  struct Topic { Bytes20 hash{}; ULONGLONG searched=0; int attempts=0; bool done=true,public_topic=false,announce=true; };
+  struct Topic { Bytes20 hash{}; ULONGLONG searched=0; int attempts=0,found=0; bool done=true,public_topic=false,announce=true; };   // found: addresses the DHT gave for it
   struct Outbound { std::string target; Json data; ULONGLONG sent=0,expires=0; };
   struct Tracking { ULONGLONG sent=0; bool warned=false; };   // a request or an accept not yet acknowledged
   std::string directory,id,bootstrap;
@@ -970,6 +970,7 @@ struct PeerLobby::Impl {
       for(auto& topic:self->topics) if(std::equal(topic.hash.begin(),topic.hash.end(),hash)) topic.done=true;
     }
     if(event!=DHT_EVENT_VALUES || !data) return;
+    if(hash) for(auto& topic:self->topics) if(std::equal(topic.hash.begin(),topic.hash.end(),hash)) topic.found+=static_cast<int>(length/6);
     auto compact=static_cast<const uint8_t*>(data);
     for(size_t i=0;i+6<=length;i+=6) {
       sockaddr_in peer{}; peer.sin_family=AF_INET;
@@ -2219,8 +2220,19 @@ struct PeerLobby::Impl {
     }
     bool lookups_done=false;
     for(auto it=code_lookups.begin();it!=code_lookups.end();) if(now>=it->second) {
-      say("lobby.friend.not_found",{{"code",it->first},{"version",build_version(profile.value("build",std::string()))}},"warn");
-      log("friend lookup ended without an answer");
+      // Listed under their code but never answered: the DHT knows them, a direct connection between the
+      // two launchers did not get through (a network that refuses unasked-for connections from outside,
+      // on either side). That is not the same as nobody being there, and the player is told which.
+      const auto hash=topic_hash(code_topic(it->first));
+      int found=0;
+      for(const auto& topic:topics) if(topic.hash==hash) found=topic.found;
+      if(found>0) {
+        say("lobby.friend.unreachable",{{"code",it->first}},"warn");
+        log("friend lookup ended: "+std::to_string(found)+" addresses listed for the code, none answered (no direct connection)");
+      } else {
+        say("lobby.friend.not_found",{{"code",it->first},{"version",build_version(profile.value("build",std::string()))}},"warn");
+        log("friend lookup ended: nothing listed for the code");
+      }
       it=code_lookups.erase(it); lookups_done=true;
     } else ++it;
     if(lookups_done) refresh_topics();

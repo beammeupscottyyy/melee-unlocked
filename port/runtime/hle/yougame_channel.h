@@ -140,6 +140,15 @@ inline bool to_launcher_bridge(const std::string& type, bool channel_up, bool ap
     if (type == t) return !app_sign_in;
   return false;
 }
+// The hybrid's invites. The launcher has no friends list, so an invite into a room the game already holds (the
+// Doubles partner, a seat of the 4-player Friends lobby, an arena seat: mpFriend with `room` and no `hold`) and the
+// room report the app's invite controls follow (mpRoom) go to the YouGame app's channel instead, when that channel
+// is up and the app is signed in as the same player as the launcher. Holding the room and its tickets stay with
+// the launcher. Another player in the app, or no channel: the launcher answers as before ("Enter a connect code").
+inline bool invite_to_app(const std::string& type, bool has_room, bool hold, bool channel_up, bool same_player) {
+  if (!channel_up || !same_player) return false;
+  return type == "mpRoom" || (type == "mpFriend" && has_room && !hold);
+}
 // Whose YouGame sign-in the hybrid plays with: the launcher's whenever it names a player (play never depends on the
 // app); with none, the app's while its channel is up and names a player; else nobody (the rows stay closed, and an
 // app that is up but signed out offers its sign-in: sign_in_needed()).

@@ -120,6 +120,13 @@ std::atomic<bool> g_gameplay{false};                            // a match is ru
 HANDLE g_push_event = nullptr;                                  // set by audio_push after each block
 HANDLE g_take_timer = nullptr;                                  // fires just before the engine's next take
 std::atomic<uint32_t> g_margin_grows{0};
+// Auto's queue for matches, kept apart from what the menus grew it to (the output thread, and the save at
+// the end). 0 until the output thread has seen the starting target.
+uint32_t g_match_target_ms = 0;
+std::atomic<uint32_t> g_menu_grows{0};
+// A match just started (output thread only): the queue the menus grew is cut to the match's level once,
+// at the next check, instead of draining at the clock loop's gentle pace for seconds into the match.
+bool g_match_start_cut = false;
 std::atomic<int> g_requested_mode{0}, g_requested_buffer_ms{40};
 std::atomic<bool> g_buffering_changed{false};
 std::atomic<uint32_t> g_target_ms{40}, g_device_queue_ms{0}, g_engine_period_us{0};
@@ -399,11 +406,17 @@ void wasapi_thread() {
       // Exclusive: the device drains and refills a whole period too; without it the normal swing
       // was cut about 45 times a second (heard as stutter).
       const uint64_t swing = (g_direct || g_exclusive) ? (uint64_t)g_period_frames * SAMPLE_RATE / g_device_rate : 0;
-      const uint64_t margin = std::max<uint64_t>(SAMPLE_RATE * 8 / 1000 + swing, g_target_frames / 2);
+      uint64_t margin = std::max<uint64_t>(SAMPLE_RATE * 8 / 1000 + swing, g_target_frames / 2);
+      // The first check of a match: everything past the match's level and the device's own swing goes, so
+      // the match starts with the same delay as one that followed no menu growth (1.0.8 grew the queue in
+      // menus; the target came back at the match start but the queued audio drained for seconds).
+      const bool match_start_cut = g_match_start_cut;
+      g_match_start_cut = false;
+      if (match_start_cut) margin = swing + SAMPLE_RATE * 2 / 1000;
       // Two-stage exclusive: the ring takes a whole frame of audio at once and gives a whole period
       // at once, so a single reading swings far past the target; only a level that stays high on
       // the one-second average is surplus (a stall), or every frame's burst was cut (heard as stutter).
-      const bool sustained = g_direct || g_fill_average > (double)(g_target_frames + margin);
+      const bool sustained = g_direct || match_start_cut || g_fill_average > (double)(g_target_frames + margin);
       if (sustained && buffered > g_target_frames + margin) {
         // Only the ring can be cut; the direct path keeps any surplus there (see device_cap).
         const uint64_t cut = std::min<uint64_t>(buffered - g_target_frames, ring_buffered);
@@ -424,6 +437,7 @@ void wasapi_thread() {
           held_level = (double)(buffered - cut);
           trim_now = true;
           g_trims.fetch_add(1);
+          if (match_start_cut) log("audio: match start: cut %.1f ms the menus had queued", cut * 1000.0 / SAMPLE_RATE);
         }
       }
     }
@@ -521,18 +535,35 @@ void wasapi_thread() {
     // its pace means the buffer is too small for this PC.
     const bool game_stalled = (qpc_now() - g_last_push_qpc.load(std::memory_order_relaxed)) * 1000 / qpc_hz() >
                               (int64_t)(10 + g_period_frames * 1000 / std::max<uint32_t>(1, g_device_rate));
+    // A match keeps its own queue. What the menus grew the queue to (below) is put back to the match's
+    // value the moment a match starts, and the match's value is noted when it ends, so a menu that needed
+    // more never costs a match any delay.
+    const bool gameplay = g_gameplay.load(std::memory_order_relaxed);
+    {
+      static bool was_gameplay = false;
+      if (!g_match_target_ms) g_match_target_ms = g_buffer_policy.target_ms;
+      if (gameplay != was_gameplay) {
+        if (gameplay) {
+          g_buffer_policy.target_ms = std::max(g_buffer_policy.floor_ms, g_match_target_ms);
+          g_buffer_policy.clean_frames = 0;
+          g_target_frames = SAMPLE_RATE * g_buffer_policy.target_ms / 1000;
+          g_match_start_cut = true;
+        } else g_match_target_ms = g_buffer_policy.target_ms;
+        was_gameplay = gameplay;
+      } else if (gameplay) g_match_target_ms = g_buffer_policy.target_ms;
+    }
     if (starved) {
       g_underruns.fetch_add(1); g_underrun_frames.fetch_add(starved);
       gap_frames += starved;
-      // Only gaps during a match grow Auto's buffer: in menus and while a scene loads the game
-      // hitches for 15 to 45 ms at times, which says nothing about what a match needs, and growing
-      // for them cost the next match 10 to 15 ms of delay that took minutes to settle (09-29).
-      const bool gameplay = g_gameplay.load(std::memory_order_relaxed);
+      // Gaps in menus grow the queue too, for the menus only (see above). They used to be left alone on
+      // the direct path, because growing for a menu hitch cost the next match 10 to 15 ms of delay
+      // (09-29); a device whose menus kept running dry at the floor then crackled for as long as the
+      // player stayed in them (271 gaps in two minutes on a 96 kHz 7.1 output, 11-22).
       if (game_stalled) {
         g_priming = true;   // the game stopped: refill to the target, then play on at the same latency
         gap_frames = 0;
-      } else if (g_buffer_policy.adaptive && !priming_at_start && (gameplay || !g_direct)) {
-        if (g_buffer_policy.gap(gap_frames, g_device_rate)) g_margin_grows.fetch_add(1);
+      } else if (g_buffer_policy.adaptive && !priming_at_start) {
+        if (g_buffer_policy.gap(gap_frames, g_device_rate)) (gameplay ? g_margin_grows : g_menu_grows).fetch_add(1);
         g_target_frames = SAMPLE_RATE * g_buffer_policy.target_ms / 1000;
         // The direct path plays on and the clock loop brings the level up to the new target. A
         // refill first turned a shortfall of a fraction of a millisecond (a block landing in the
@@ -1004,9 +1035,11 @@ void wasapi_close() {
   g_running.store(false);
   if (g_thread.joinable()) g_thread.join();
   if (g_remember && g_requested_mode.load() == 0 && !g_exclusive && !g_device_dump && !g_open_device_id.empty())
-    auto_memory_save(g_auto_key.empty() ? g_open_device_id : g_auto_key, (int)g_buffer_policy.target_ms);
-  log("audio: ring ended at %.1f ms (floor %u ms, %u surplus trims, %u increases after gaps)", g_target_frames * 1000.0 / SAMPLE_RATE, g_floor_ms, g_trims.load(),
-      g_margin_grows.load());
+    auto_memory_save(g_auto_key.empty() ? g_open_device_id : g_auto_key,
+                     (int)(g_match_target_ms ? g_match_target_ms : g_buffer_policy.target_ms));   // the match's queue, not a menu's
+  log("audio: ring ended at %.1f ms (floor %u ms, %u surplus trims, %u increases after gaps, %u more in menus; matches at %u ms)",
+      g_target_frames * 1000.0 / SAMPLE_RATE, g_floor_ms, g_trims.load(), g_margin_grows.load(), g_menu_grows.load(),
+      g_match_target_ms ? g_match_target_ms : g_buffer_policy.target_ms);
   if (g_device_dump) {
     std::fseek(g_device_dump, 0, SEEK_SET);
     wav_header(g_device_dump, g_device_dump_bytes, g_device_rate, true);

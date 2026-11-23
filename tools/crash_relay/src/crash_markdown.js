@@ -8,6 +8,10 @@ const TEXT_FILES = new Map([
   ["melee_port.log", 512 * 1024],
   // The session before the last one: a problem is often reported after the game was started again.
   ["melee_port.prev.log", 384 * 1024],
+  // An older session that played online, sent when neither of the two newest did (launcher_crash_zip.h).
+  ["melee_port.prev.2.log", 384 * 1024],
+  ["melee_port.prev.3.log", 384 * 1024],
+  ["melee_port.prev.4.log", 384 * 1024],
   ["lobby.log", 128 * 1024],
   // The launcher's own lines: why a Play started no game, and what the YouGame connection did and why it failed.
   ["launcher.log", 64 * 1024],

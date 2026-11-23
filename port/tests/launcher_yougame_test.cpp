@@ -187,20 +187,21 @@ int main(int argc, char** argv) {
     CHECK(!account().signed_in && ini_lines().find("yougame_session") == std::string::npos);
   }
   // The YouGame site: production by default; launcher.ini yougame_env=staging is the only way to staging, and
-  // production writes no yougame_env line.
+  // production writes no yougame_env line until launcher.ini names a site.
   {
     CHECK(env().id == "production");
     CHECK(ini_lines().find("yougame_env") == std::string::npos);
     CHECK(load_line("yougame_env=staging") && env().id == "staging");
     CHECK(ini_lines().find("yougame_env=staging\n") != std::string::npos);
     CHECK(load_line("yougame_env=production") && env().id == "production");
-    CHECK(ini_lines().find("yougame_env") == std::string::npos);
+    // A site named in launcher.ini stays named, so a computer with only the Staging app does not switch a player who chose production.
+    CHECK(ini_lines().find("yougame_env=production\n") != std::string::npos);
     CHECK(load_line("yougame_env=staging") && load_line("yougame_env=Staging") && env().id == "production");
     CHECK(load_line("yougame_env=") && env().id == "production");
     set_env("staging");
     CHECK(env().id == "staging" && ini_lines().find("yougame_env=staging\n") != std::string::npos);
     set_env("anything else");
-    CHECK(env().id == "production" && ini_lines().find("yougame_env") == std::string::npos);
+    CHECK(env().id == "production" && ini_lines().find("yougame_env=production\n") != std::string::npos);
   }
   // Parsing: incomplete, complete, oversize, chunked refused.
   {

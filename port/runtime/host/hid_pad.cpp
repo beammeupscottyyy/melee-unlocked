@@ -65,6 +65,10 @@ struct Slot {
   uint32_t buttons = 0;
   int log_reports = 0;   // first few reports after a device appears, for diagnosing a pad that will not bind
   int32_t raw[8]{};
+  int32_t val[8]{};        // the same, as the signed number a signed field carries
+  int8_t dec[8]{};         // every axis as a stick value, for choosing one by moving it
+  int32_t base_val[8]{};   // both, where hidpad_axis_capture_begin found them
+  int8_t base_dec[8]{};
   bool fresh = false;
   // Where each axis rests when nothing touches it, decided from the first report (see hid_trigger_rest).
   // Only the axes read as triggers use it.
@@ -222,6 +226,17 @@ int8_t hid_stick_value(long logical_min, long logical_max, int bits, unsigned lo
   if (bits < 2 || bits > 31) bits = 16;
   const unsigned long mask = (1ul << bits) - 1, u = raw & mask;
   const long half = 1l << (bits - 1);
+  // A signed field that spans its whole width carries the GameCube byte in its top eight bits (a B0XX in
+  // DInput: +20688 up, -20432 down, 0 at rest): that byte, exactly. Scaling from the middle of the range put
+  // rest half a step below zero, which the flipped axis rounded down to -1: a stick at rest read 0.0125
+  // (player report 11-22).
+  if (bits >= 8 && (encoding == kStickTwos ? logical_min >= 0 || (logical_min == -half && logical_max == half - 1)
+                                           : encoding == kStickDeclared && logical_min == -half && logical_max == half - 1)) {
+    const long s = u >= (unsigned long)half ? (long)u - (half << 1) : (long)u;
+    long v = s >= 0 ? s >> (bits - 8) : -((-s + (1l << (bits - 8)) - 1) >> (bits - 8));   // floor, whatever >> does to a negative
+    if (flip) v = -v;
+    return (int8_t)std::clamp(v, -128l, 127l);
+  }
   if (encoding == kStickTwos) {
     // The field's bits as a signed number, scaled across the declared range (or the field's own when the
     // declared range is unsigned).
@@ -230,6 +245,10 @@ int8_t hid_stick_value(long logical_min, long logical_max, int bits, unsigned lo
     return hid_axis_signed(-half, half - 1, s, flip);
   }
   if (encoding == kStickOffset) return hid_axis_signed(0, (half << 1) - 1, (long)u, flip);   // centred mid-field
+  // As declared. A field declared with a signed range holds a signed number: Windows hands its bits over
+  // unsigned, so a negative reading (left, down) came out as a large positive one, and both directions of
+  // the stick read as the same one (a B0XX r2 in DInput, 11-22: "left and right both = right").
+  if (logical_min < 0) return hid_axis_signed(logical_min, logical_max, u >= (unsigned long)half ? (long)u - (half << 1) : (long)u, flip);
   return hid_axis_signed(logical_min, logical_max, (long)u, flip);
 }
 
@@ -281,6 +300,11 @@ void hidpad_device_removed(void* device_handle) {
 bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size, uint32_t count) {
   HANDLE device = (HANDLE)device_handle;
   if (!report || !size || !count) return false;
+  // Raw Input packs the reports that arrived since the window last read into one message, oldest first:
+  // the newest is the pad's state now. Reading the first one dropped the rest, so the last change before
+  // the pad went quiet was lost until its next report: b0xx-ahk writes each vJoy axis on its own, and a
+  // released C-stick stayed up or down "until I press another button" (TutukaSSBM, 1.0.0 to 1.0.8).
+  report += (size_t)(count - 1) * size;
 
   RID_DEVICE_INFO info{}; info.cbSize = sizeof info;
   UINT info_size = sizeof info;
@@ -343,8 +367,16 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
       return false;
     out = (LONG)raw;
     s.raw[i] = (int32_t)raw;
+    // A field declared with a signed range: its bits as the signed number they are (see hid_stick_value).
+    if (s.axes[i].logical_min < 0 && s.axes[i].bits >= 2 && s.axes[i].bits <= 31 && (raw >> (s.axes[i].bits - 1)) & 1u)
+      out = (LONG)((long long)(raw & ((1ull << s.axes[i].bits) - 1)) - (1ll << s.axes[i].bits));
+    s.val[i] = (int32_t)out;
     return true;
   };
+  unsigned present = 0;
+  for (int i = 0; i < 7; ++i) if (s.axes[i].present) present |= 1u << i;
+  static const uint8_t kNoRoles[HID_ROLE_COUNT] = {kHidAxisAuto, kHidAxisAuto, kHidAxisAuto, kHidAxisAuto, kHidAxisAuto, kHidAxisAuto};
+  const uint8_t* roles = index >= 0 && index < 4 ? g_hid_axis_role[index].data() : kNoRoles;
 
   if (s.frame1) {
     // Frame1 DInput (hid_pad.h): each stick field read as the GameCube byte it carries, exactly.
@@ -382,7 +414,10 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
   // pads and most vJoy feeder configurations use.
   // The stick axes this pad uses: X/Y, then Rx/Ry when present, otherwise Z/Rz.
   const bool rxry = s.axes[3].present && s.axes[4].present;
-  const int used[4] = {0, 1, rxry ? 3 : 2, rxry ? 4 : 5};
+  // Each one is the player's own choice when they made one (Controls, by moving it).
+  const int used[4] = {hid_role_axis(roles, HID_ROLE_STICK_X, 0, present), hid_role_axis(roles, HID_ROLE_STICK_Y, 1, present),
+                       hid_role_axis(roles, HID_ROLE_CSTICK_X, rxry ? 3 : 2, present),
+                       hid_role_axis(roles, HID_ROLE_CSTICK_Y, rxry ? 4 : 5, present)};
   // Their encoding, decided once from the first report (hid_stick_encoding), for all of them together: another
   // reading only when every stick axis the pad has is off-centre as declared and centred in that same reading,
   // as a box whose descriptor and data disagree reads at rest. One stick held at plug-in keeps the declared reading.
@@ -390,7 +425,7 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
     int8_t agreed = -1; int seen = 0; bool same = true, all_zero = true;
     for (const int i : used) {
       LONG rest = 0;
-      if (!read_axis(i, rest)) continue;
+      if (i < 0 || !read_axis(i, rest)) continue;
       if (rest != 0) all_zero = false;
       const int8_t e = hid_stick_encoding(s.axes[i].logical_min, s.axes[i].logical_max, s.axes[i].bits, (unsigned long)rest);
       if (seen++ == 0) agreed = e; else if (e != agreed) same = false;
@@ -411,13 +446,12 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
     // Two's-complement data in a field declared unsigned (a B0XX r2 on firmware v3) is the GameCube's own
     // signed reading, up positive (its raw values: up +20688, down -20432): not flipped as HID's Y is.
     if (s.stick_enc[i] == kStickTwos && ax.logical_min >= 0) flip = false;
-    return s.stick_enc[i] == kStickDeclared ? to_signed(ax, value, flip)
-                                            : hid_stick_value(ax.logical_min, ax.logical_max, ax.bits, (unsigned long)value, s.stick_enc[i], flip);
+    return hid_stick_value(ax.logical_min, ax.logical_max, ax.bits, (unsigned long)value, s.stick_enc[i] < 0 ? kStickDeclared : s.stick_enc[i], flip);
   };
-  if (read_axis(used[0], value)) pad.stick_x = stick(used[0], false);
-  if (read_axis(used[1], value)) pad.stick_y = stick(used[1], true);
-  if (read_axis(used[2], value)) pad.sub_x = stick(used[2], false);
-  if (read_axis(used[3], value)) pad.sub_y = stick(used[3], true);
+  if (used[0] >= 0 && read_axis(used[0], value)) pad.stick_x = stick(used[0], false);
+  if (used[1] >= 0 && read_axis(used[1], value)) pad.stick_y = stick(used[1], true);
+  if (used[2] >= 0 && read_axis(used[2], value)) pad.sub_x = stick(used[2], false);
+  if (used[3] >= 0 && read_axis(used[3], value)) pad.sub_y = stick(used[3], true);
   // Controls > Box layouts: a direction the pad reports reversed, turned round by the player.
   if (index >= 0 && index < 4 && g_hid_stick_invert[index]) {
     const uint8_t inv = g_hid_stick_invert[index];
@@ -438,16 +472,18 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
     }
     return hid_trigger_value(s.axes[i].logical_min, s.axes[i].logical_max, raw, s.rest[i]);
   };
-  if (s.haybox) {
-    // HayBox DInput: Z is the left trigger, Rz the right (TUGamepad's report).
-    if (read_axis(2, value)) pad.trig_l = trigger(2, value);
-    if (read_axis(5, value)) pad.trig_r = trigger(5, value);
-  } else {
-    if (s.axes[6].present && read_axis(6, value)) pad.trig_l = trigger(6, value);
-    if (s.axes[3].present && s.axes[4].present && s.axes[2].present && read_axis(2, value))
-      pad.trig_r = trigger(2, value);
+  // HayBox DInput: Z is the left trigger, Rz the right (TUGamepad's report). Any other pad: the slider
+  // is the left one, and Z the right one when Rx/Ry carry the C-stick. The player's own choice comes first.
+  const int trig_l = hid_role_axis(roles, HID_ROLE_TRIGGER_L, s.haybox ? 2 : s.axes[6].present ? 6 : -1, present);
+  const int trig_r = hid_role_axis(roles, HID_ROLE_TRIGGER_R, s.haybox ? 5 : rxry && s.axes[2].present ? 2 : -1, present);
+  if (trig_l >= 0 && read_axis(trig_l, value)) pad.trig_l = trigger(trig_l, value);
+  if (trig_r >= 0 && read_axis(trig_r, value)) pad.trig_r = trigger(trig_r, value);
   }
-  }
+  // Every axis as a stick value, whatever it is used for: what choosing one by moving it compares.
+  for (int i = 0; i < 7; ++i)
+    if (read_axis(i, value))
+      s.dec[i] = hid_stick_value(s.axes[i].logical_min, s.axes[i].logical_max, s.axes[i].bits, (unsigned long)value,
+                                 s.stick_enc[i] < 0 ? kStickDeclared : s.stick_enc[i], false);
 
   uint32_t mask = 0;
   {
@@ -526,6 +562,51 @@ std::string hidpad_name(int slot) {
   std::lock_guard<std::mutex> lock(g_mutex);
   return g_slots[slot].ready ? g_slots[slot].name : std::string();
 }
+
+void hidpad_axis_capture_begin(int slot) {
+  if (slot < 0 || slot >= kHidPadSlots) return;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  Slot& s = g_slots[slot];
+  std::memcpy(s.base_dec, s.dec, sizeof s.dec);
+  std::memcpy(s.base_val, s.val, sizeof s.val);
+}
+
+int hidpad_axis_capture_poll(int slot) {
+  if (slot < 0 || slot >= kHidPadSlots) return -1;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const Slot& s = g_slots[slot];
+  if (!s.ready || s.frame1) return -1;
+  unsigned present = 0;
+  for (int i = 0; i < 7; ++i) if (s.axes[i].present) present |= 1u << i;
+  return hid_moved_axis(s.base_dec, s.dec, present);
+}
+
+void hidpad_assign_axis(int slot, int role, int axis) {
+  if (slot < 0 || slot >= kHidPadSlots || slot >= 4 || role < 0 || role >= HID_ROLE_COUNT || axis < 0 || axis >= 7) return;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  Slot& s = g_slots[slot];
+  if (!s.ready || !s.axes[axis].present) return;
+  for (uint8_t& other : g_hid_axis_role[slot]) if (other == axis) other = kHidAxisAuto;
+  g_hid_axis_role[slot][role] = (uint8_t)axis;
+  const Axis& ax = s.axes[axis];
+  if (role >= HID_ROLE_TRIGGER_L) {
+    // Where it sat before the press, not where the first report of the session happened to find it.
+    s.rest[axis] = hid_trigger_rest(ax.logical_min, ax.logical_max, s.base_val[axis]);
+    host::log("hid pad %d: %s trigger set to axis %s", slot + 1, role == HID_ROLE_TRIGGER_L ? "L" : "R", axis_name(ax.usage));
+    return;
+  }
+  // The push that chose it was right or up. Read it as the reader will, and turn it round if that comes out
+  // left or down.
+  const int8_t enc = s.stick_enc[axis] < 0 ? kStickDeclared : s.stick_enc[axis];
+  bool flip = role == HID_ROLE_STICK_Y || role == HID_ROLE_CSTICK_Y;
+  if (enc == kStickTwos && ax.logical_min >= 0) flip = false;
+  const int8_t read = hid_stick_value(ax.logical_min, ax.logical_max, ax.bits, (unsigned long)s.val[axis], enc, flip);
+  const uint8_t bit = (uint8_t)(1u << role);   // HID_INVERT_* are in the roles' order
+  g_hid_stick_invert[slot] = (uint8_t)((g_hid_stick_invert[slot] & ~bit) | (read < 0 ? bit : 0));
+  host::log("hid pad %d: role %d set to axis %s%s", slot + 1, role, axis_name(ax.usage), read < 0 ? ", inverted" : "");
+}
+
+const char* hidpad_axis_name(int axis) { return axis >= 0 && axis < 8 ? axis_name(kAxisOrder[axis]) : ""; }
 
 HidPadAxes hidpad_axes(int slot) {
   HidPadAxes out{};
