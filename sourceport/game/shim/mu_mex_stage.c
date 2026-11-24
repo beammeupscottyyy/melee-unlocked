@@ -203,6 +203,70 @@ static int mex_match_coll(unsigned int value)
     return -1;
 }
 
+static unsigned int mex_file_print(const char* file);
+
+/* The same stage file name, spelled with or without the leading slash and in any case: m-ex and
+ * Nucleus (SSBM Nucleus) write MxDt names differently ("/GrBx.dat", "GrBx.dat"). */
+static int mex_same_name(const char* a, const char* b)
+{
+    if (*a == '/') a++;
+    if (*b == '/') b++;
+    for (; *a != '\0' && *b != '\0'; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char) (x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char) (y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+/* The stage files the native code was checked with, by their structure print (mex_file_print): ACE
+ * 2.0.1's. Another disc's copy of a stage takes its native code by another spelling of its name only
+ * when its print is one of these, so a different build of a stage never runs code written for this
+ * one (SUPA DIDDY BROS., a Nucleus disc, 11-23: same files as ACE's, names without the slash). */
+static const struct { const char* file; unsigned int print; } mex_native_prints[] = {
+    {"GrAc.dat", 0xAE7E1842u},
+    {"GrAr.dat", 0x787A000Eu},
+    {"GrBeat.dat", 0xF3B688F0u},
+    {"GrBx.dat", 0x72FEC200u},
+    {"GrCasino.dat", 0xB718C1F5u},
+    {"GrClv.dat", 0x964694D4u},
+    {"GrDo.dat", 0xF8D8F6EAu},
+    {"GrDp.dat", 0x96E145EAu},
+    {"GrFc.dat", 0x310A4F0Au},
+    {"GrGc.dat", 0x3268E1B1u},
+    {"GrGh.dat", 0xC3C6CAC5u},
+    {"GrKpCst.dat", 0xE18FC404u},
+    {"GrLm.dat", 0xDF71BFDBu},
+    {"GrMVb.dat", 0x95DA5E51u},
+    {"GrMaze.dat", 0xD84BD15Au},
+    {"GrNRc.dat", 0x7A8C3D17u},
+    {"GrOHy.dat", 0x0BCA11ADu},
+    {"GrOMc.dat", 0x8B7ACCE8u},
+    {"GrOMk.dat", 0x9FE6B212u},
+    {"GrOPc.dat", 0xE218584Du},
+    {"GrOPz.dat", 0x6C6F7878u},
+    {"GrOSf.dat", 0xAA2F7D76u},
+    {"GrOSz.dat", 0x74573612u},
+    {"GrSb.dat", 0x00FEA82Du},
+    {"GrSp.dat", 0x060DECE2u},
+    {"GrSv.dat", 0xA7B0A3B1u},
+    {"GrTDa.dat", 0x16E6B463u},
+    {"GrTDd.dat", 0x518253CEu},
+    {"GrTDe.dat", 0xB1BD96A3u},
+    {"GrTFloats.dat", 0xA183F304u},
+    {"GrTLc.dat", 0x35FF13EAu},
+    {"GrTLz.dat", 0xBA2D5476u},
+    {"GrTSn.dat", 0x789A3BFEu},
+    {"GrTTs.dat", 0xFBCC204Du},
+    {"GrTWf.dat", 0xAE6A85E3u},
+    {"GrTp2.dat", 0xAA050C1Eu},
+    {"GrWWLL2.dat", 0x66CBF5E3u},
+    {"GrWarioCastle.dat", 0xBE41BFA5u},
+    {"GrWiiSword.dat", 0x8FE9FFD7u},
+    {"GrWw.dat", 0x4A0BDBD1u},
+};
+
 static const MuGrStage* mex_descriptor(const char* file)
 {
     int i;
@@ -210,6 +274,22 @@ static const MuGrStage* mex_descriptor(const char* file)
         if (mex_gr_registry[i]->file != NULL && strcmp(mex_gr_registry[i]->file, file) == 0) {
             return mex_gr_registry[i];
         }
+    }
+    /* Another spelling: only with the structure the native code was checked with. */
+    for (i = 0; mex_gr_registry[i] != NULL; i++) {
+        unsigned int print, k;
+        if (mex_gr_registry[i]->file == NULL || !mex_same_name(mex_gr_registry[i]->file, file)) {
+            continue;
+        }
+        print = mex_file_print(file);
+        for (k = 0; k < sizeof mex_native_prints / sizeof mex_native_prints[0]; k++) {
+            if (print != 0 && mex_native_prints[k].print == print && mex_same_name(mex_native_prints[k].file, file)) {
+                return mex_gr_registry[i];
+            }
+        }
+        OSReport("[mex] %s is a different build of this stage than its native code was checked with (print %08X)\n",
+                 file, print);
+        return NULL;
     }
     return NULL;
 }
@@ -292,6 +372,41 @@ static int mex_file_has_code(const char* file)
 done:
     DVDClose(&info);
     return result;
+}
+
+/* A stage file's structure print: CRC-32 (zlib) of its 0x20-byte header and its tail (relocation table
+ * end to file end: the public and extern tables and their names). 0 when unreadable. */
+static unsigned int mex_file_print(const char* file)
+{
+    DVDFileInfo info;
+    unsigned int file_size, data_size, relocs, tail, crc = 0;
+    u8 head[0x20];
+    const s32 entry = DVDConvertPathToEntrynum(lbFileGetFullName(file));
+    if (entry < 0 || !DVDFastOpen(entry, &info)) {
+        return 0;
+    }
+    if (!mex_probe_read(&info, mex_probe_buf, 0x20, 0)) {
+        goto done;
+    }
+    memcpy(head, mex_probe_buf, sizeof head);
+    file_size = mex_be32_at(head);
+    data_size = mex_be32_at(head + 4);
+    relocs = mex_be32_at(head + 8);
+    if (file_size > info.length || data_size > file_size || relocs > file_size / 4) {
+        goto done;
+    }
+    tail = 0x20 + data_size + 4 * relocs;
+    if (tail >= file_size || file_size - tail > sizeof mex_probe_buf) {
+        goto done;
+    }
+    if (!mex_probe_read(&info, mex_probe_buf, (s32) (file_size - tail), (s32) tail)) {
+        goto done;
+    }
+    crc = mex_crc32(0xFFFFFFFFu, head, (int) sizeof head);
+    crc = ~mex_crc32(crc, mex_probe_buf, (int) (file_size - tail));
+done:
+    DVDClose(&info);
+    return crc;
 }
 
 static const char* const mex_field_name[W_COUNT] = {

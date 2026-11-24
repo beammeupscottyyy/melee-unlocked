@@ -1837,6 +1837,9 @@ void test_request_training(int character) {
   g_commands.push_back({CommandKind::TestTraining, std::to_string(character)});
 }
 
+std::atomic<bool> g_arena_from_friends{false};
+void submit_arena_from_friends() { g_arena_from_friends.store(true); }
+
 void submit_warmup_return() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_commands.push_back({CommandKind::WarmupReturn, "the player chose Back to match"});
@@ -2026,9 +2029,55 @@ void tick() {
   // its tickets through the launcher's bridge. Friends there is a search by connect code, so nothing
   // else of the app's menu flow below runs, unless the local channel to a running YouGame app is up
   // (friends_flow(), below).
+  // The ARENA card on the Friends lobby's select (the app's channel or the launcher's bridge alike): as an
+  // accepted arena invite, without the join. The lobby is not disarmed: the select's unload sends its LEAVE,
+  // so the room closes for the others. Only from the lobby's own select (the online major).
+  if (g_arena_from_friends.exchange(false)) {
+    if (major == kOnlineMajor && slippi::online::friends_lobby_armed() && !slippi::playback::enabled()) {
+      host::log("arena: from the Friends lobby to the online select");
+      yougame::friends::events.online_menu(false);
+      slippi::online::native_cleanup_match();
+      g_lifecycle = Lifecycle{};
+      clear_search_metadata();
+      set_online_mode(2);
+      g_practice = {};
+      g_practice.valid = true;
+      g_practice.players[0].active = true;
+      g_practice.players[0].character = 0;
+      write_event_backup();
+      if (g_content_bridge) g_content_bridge(2, true);
+      request_major(kOnlineMajor);
+      return;
+    }
+    host::log("arena: the Friends lobby's card was pressed off its select; nothing done");
+  }
   if (!yougame::active() && yougame::launcher() && !slippi::playback::enabled()) {
     if (major == 1) ++g_friend_menu_ticks;
     else g_friend_menu_ticks = 0;
+    // Tests only (MELEE_TEST_FRIENDS_LOBBY): the 4-door Friends lobby through the launcher's bridge, as the
+    // Friends row opens it with the app's channel up, so a hidden run plays the lobby on YouGame.
+    static bool test_lobby_done = false;
+    if (!test_lobby_done && major == 1 && g_bridge && g_friend_menu_ticks >= 120 &&
+        host::test_env::getenv("MELEE_TEST_FRIENDS_LOBBY") && yougame::identity().ok) {
+      test_lobby_done = true;
+      host::log("friends lobby test: the 4-door lobby through the launcher's bridge");
+      yougame::set_menu_service(1);          // as the YouGame page's Friends row picks it
+      yougame::set_launcher_session(true);
+      yougame::friends::events.online_menu(false);
+      slippi::online::native_cleanup_match();
+      g_lifecycle = Lifecycle{};
+      clear_search_metadata();
+      set_online_mode(2);
+      g_practice = {};
+      g_practice.valid = true;
+      g_practice.players[0].active = true;
+      g_practice.players[0].character = 0;
+      write_event_backup();
+      if (g_content_bridge) g_content_bridge(2, true);
+      slippi::online::arm_friends_lobby({});
+      request_major(kOnlineMajor);
+      return;
+    }
     if (doubles_press && major == 1 && g_bridge && g_friend_menu_ticks >= 120 && yougame::friends::menu_safe(major, minor)) {
       doubles_press = false;
       const auto id = yougame::identity();

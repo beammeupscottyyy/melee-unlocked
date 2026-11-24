@@ -7,6 +7,7 @@
 #include "replay_bar.h"
 #include "replay_coach.h"
 #include "replay_control.h"
+#include "replay_tips.h"
 #include "imgui.h"
 
 #include <algorithm>
@@ -44,6 +45,9 @@ struct State {
   int moments_port = -1;
   size_t events_seen = (size_t)-1;
   double moments_at = -1.0;
+  // A tip jump on its way: where it lands, and when it was asked for (replay_tips.h).
+  int32_t jump_to = replay_control::kNoFrame;
+  double jump_at = 0.0;
 };
 State g;
 
@@ -282,14 +286,24 @@ void frame(int style, const practice_menu::Frame& f) {
       g.tries = 1;
       replay_control::take_over(g.port);
     }
+    // A tip jump has landed once playback stands on its target out of a seek (or it has had 3 s).
+    if (g.jump_to != replay_control::kNoFrame &&
+        ((!st.seeking && st.frame >= g.jump_to - 2 && st.frame <= g.jump_to + replay_tips::kSlack) || now - g.jump_at > 3.0))
+      g.jump_to = replay_control::kNoFrame;
     if (pressed & (kX | kY)) {
-      // Previous / next tip from where playback is (a tip's jump lands a second before it).
-      const replay_coach::Moment* pick = nullptr;
-      for (const replay_coach::Moment& m : g.moments) {
-        if ((pressed & kY) && m.frame - kLead > st.frame + 5) { pick = &m; break; }
-        if ((pressed & kX) && m.frame - kLead < st.frame - 5) pick = &m;
+      // Last / next tip (a tip's jump lands a second before it), counted from where a jump still on
+      // its way lands, never from the frame it restored from (replay_tips.h).
+      std::vector<int32_t> starts;
+      starts.reserve(g.moments.size());
+      for (const replay_coach::Moment& m : g.moments) starts.push_back(m.frame - kLead);
+      std::sort(starts.begin(), starts.end());
+      const int32_t ref = g.jump_to != replay_control::kNoFrame ? g.jump_to : st.frame;
+      const int i = replay_tips::pick(starts, ref, (pressed & kX) != 0);
+      if (i >= 0 && starts[(size_t)i] != g.jump_to) {
+        g.jump_to = starts[(size_t)i];
+        g.jump_at = now;
+        replay_control::seek_to(g.jump_to);
       }
-      if (pick) replay_control::seek_to(pick->frame - kLead);
     }
     if (pressed & kDLeft) replay_control::seek_to(st.frame - kJump);
     if (pressed & kDRight) {

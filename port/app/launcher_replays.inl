@@ -452,7 +452,11 @@ void refresh_replays(const std::filesystem::path& selected={}) {
     std::vector<std::pair<std::filesystem::file_time_type,std::filesystem::path>> unique_found;
     for(size_t i=0;i<keyed.size();++i) if(i==0||keyed[i].first!=keyed[i-1].first) unique_found.push_back(found[keyed[i].second]);
     found.swap(unique_found);
-    if(!choice.empty()&&std::none_of(found.begin(),found.end(),[&](const auto& f){return f.second==choice;})) {
+    // A replay opened from elsewhere stays listed, but only while it is still there: right after a delete the
+    // remembered choice is the deleted file, which came back as a row that could not be read or deleted
+    // (tyler631, 11-23; it went away only when the launcher restarted).
+    std::error_code there_error;
+    if(!choice.empty()&&std::filesystem::is_regular_file(choice,there_error)&&std::none_of(found.begin(),found.end(),[&](const auto& f){return f.second==choice;})) {
       std::error_code fe; found.emplace_back(std::filesystem::last_write_time(choice,fe),choice);
     }
     {

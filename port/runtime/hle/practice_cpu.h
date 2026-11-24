@@ -32,4 +32,8 @@ bool ghost(int index, MuPcConfig& out);
 void initialize_source_test_ghost();
 // The special moves' names for a character (FighterKind), for the attack rows; nullptr if unknown.
 const char* special_name(int kind, int which);   // which: 0 neutral, 1 side, 2 up, 3 down
+// VS Mode: the pro (practice_ghosts index) a port's CPU plays as, -1 for the game's own CPU. Offline VS
+// only: the game library asks for it (CMD_VS_PRO) and never online, in Unranked or Ranked, or in a replay.
+void set_vs_pro(int port, int pro);
+int vs_pro(int port);
 }  // namespace practice_cpu

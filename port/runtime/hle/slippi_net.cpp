@@ -2441,6 +2441,8 @@ Matchmaking::~Matchmaking() {
 // The text is stored before the state that announces it, so a reader that sees the error state
 // always finds its text.
 void Matchmaking::fail(const std::string& message) {
+  // Said in the log too: a Friends lobby that closed at once left no reason anywhere (11-23).
+  host::log("slippi: search failed: %s", message.c_str());
   { std::lock_guard<std::mutex> lk(result_mutex_); error_msg_ = message; }
   state_ = ERROR_ENCOUNTERED;
 }

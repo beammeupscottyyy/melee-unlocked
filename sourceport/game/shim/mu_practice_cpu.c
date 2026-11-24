@@ -214,6 +214,79 @@ int mu_practice_dpad_keys(void)
     return (pc_settings()->tools & MU_PC_TOOL_DPAD) != 0;
 }
 
+/* VS Mode Pro AI (Settings > Game, "Pro AI in VS Mode"): the pro a port's CPU plays as, -1 for the game's
+ * own CPU. Offline VS matches only, the special ones included: never online (Unranked, Ranked, Direct,
+ * rooms) or in a replay. */
+#define CMD_VS_PRO 0xC8
+static int vs_pro_for(int port)
+{
+    static int frame = -1;
+    static unsigned char pros[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    const int now = (int) gm_GetFrameCount();
+    if (now != frame) {
+        static unsigned char response[4096];   /* the host's minimum reply capacity: a smaller buffer is refused */
+        unsigned int got = 0;
+        frame = now;
+        if (mu_online_abi_command(CMD_VS_PRO, NULL, 0, response, sizeof response, &got) == 0 && got == 4) {
+            __builtin_memcpy(pros, response, 4);
+        } else {
+            pros[0] = pros[1] = pros[2] = pros[3] = 0xFF;
+        }
+    }
+    return port >= 0 && port < 4 && pros[port] != 0xFF ? (int) pros[port] : -1;
+}
+static int vs_pro_allowed(void)
+{
+    /* MELEE_TEST_VS_PRO_ANY_MODE (tests only): any offline mode, so a Training run with chosen characters
+     * can drive the VS path (VS Mode's test script picks fighters no pro knows). */
+    static int any_mode = -1;
+    if (any_mode < 0) any_mode = mu_test_getenv("MELEE_TEST_VS_PRO_ANY_MODE") != NULL;
+    if (any_mode) return !mu_online_active() && !mu_online_pending() && !mu_replay_abi_active();
+    switch (gm_GetCurrentGameMode()) {
+    case GM_VS:
+    case GM_SUPER_SUDDEN_DEATH_VS:
+    case GM_INVISIBLE_VS:
+    case GM_SLOMO_VS:
+    case GM_LIGHTNING_VS:
+    case GM_TINY_VS:
+    case GM_GIANT_VS:
+    case GM_STAMINA_VS:
+        break;
+    default:
+        return 0;
+    }
+    return !mu_online_active() && !mu_online_pending() && !mu_replay_abi_active();
+}
+/* The nearest fighter on another team (any other fighter when every one shares a team: no teams). */
+static Fighter* vs_pro_opponent(Fighter* fp)
+{
+    Fighter* best = NULL;
+    float best_d = 0.0f;
+    int teams = 0, k;
+    for (k = 0; k < 4; k++) {
+        HSD_GObj* g;
+        Fighter* o;
+        if (k == fp->player_idx || Player_GetPlayerSlotType(k) == Gm_PKind_NA) continue;
+        g = Player_GetEntity(k);
+        o = g != NULL ? g->user_data : NULL;
+        if (o != NULL && o->team != fp->team) teams = 1;
+    }
+    for (k = 0; k < 4; k++) {
+        HSD_GObj* g;
+        Fighter* o;
+        float dx, dy, d;
+        if (k == fp->player_idx || Player_GetPlayerSlotType(k) == Gm_PKind_NA) continue;
+        g = Player_GetEntity(k);
+        o = g != NULL ? g->user_data : NULL;
+        if (o == NULL || (teams && o->team == fp->team)) continue;
+        dx = o->cur_pos.x - fp->cur_pos.x;
+        dy = o->cur_pos.y - fp->cur_pos.y;
+        d = dx * dx + dy * dy;
+        if (best == NULL || d < best_d) { best = o; best_d = d; }
+    }
+    return best;
+}
+
 /* Nonzero when the practice CPU set this fighter's controller for the frame. */
 int mu_practice_cpu_drive(void* fighter, MuLabInput* out)
 {
@@ -239,6 +312,22 @@ int mu_practice_cpu_drive(void* fighter, MuLabInput* out)
             t.enabled = 1;
             t.preset = (mu_pc_u8) MU_PC_PRESET_PRO(test_pro);
             return g != NULL && g->user_data != NULL && pc_drive(fp, g->user_data, &t, out, 0);
+        }
+    }
+    if (fp != NULL && !fp->is_sub_fighter && ftCo_IsCpuControlled(fp) && vs_pro_allowed()) {
+        const int pro = vs_pro_for(fp->player_idx);
+        if (pro >= 0) {
+            Fighter* opp = vs_pro_opponent(fp);
+            MuPcConfig t;
+            __builtin_memset(&t, 0, sizeof t);
+            mu_pc_defaults(&t);
+            t.enabled = 1;
+            t.preset = (mu_pc_u8) MU_PC_PRESET_PRO(pro);
+            /* Only when the pro has a network for this fighter: asked first (the host answers the same frame again
+             * from what it kept), then played through pc_drive for its recovery net. No network for this
+             * character: the game's own CPU plays it, not a default practice CPU passing for the pro. */
+            MuLabInput probe;
+            if (opp != NULL && ghost_drive(fp, opp, &t, &probe) != 0 && pc_drive(fp, opp, &t, out, 0)) return 1;
         }
     }
     if (fp != NULL && pc_allowed()) pc_rng();

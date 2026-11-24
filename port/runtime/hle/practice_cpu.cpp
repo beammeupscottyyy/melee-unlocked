@@ -22,6 +22,16 @@
 #include "ghost_ai.h"
 
 namespace practice_cpu {
+
+namespace {
+std::atomic<int> g_vs_pro[4] = {-1, -1, -1, -1};
+}
+void set_vs_pro(int port, int pro) {
+  if (port < 0 || port > 3) return;
+  const int count = (int)(sizeof practice_ghosts::kGhosts / sizeof practice_ghosts::kGhosts[0]);
+  g_vs_pro[port].store(pro >= 0 && pro < count && practice_ghosts::kReleased[pro] ? pro : -1);
+}
+int vs_pro(int port) { return port >= 0 && port < 4 ? g_vs_pro[port].load() : -1; }
 namespace {
 std::mutex g_mutex;
 MuPcConfig g_config = [] {

@@ -49,6 +49,7 @@
 #include "native_practice.h"
 #endif
 #include "practice_cpu.h"
+#include "practice_ghosts.h"
 #include "window.h"
 #include "audio.h"
 #include "host.h"
@@ -113,6 +114,7 @@ static bool arena_capture() { return false; }
 static uint16_t arena_withheld() { return 0; }
 #endif
 #include "practice_menu.h"
+#include "settings_chord.h"
 // Lab view: the release ships its silhouette packs in Lab\ (tools/build_lab_assets.py), on both engines.
 constexpr bool kLabViewAvailable = true;
 #ifndef MELEE_PORT_VERSION
@@ -2329,6 +2331,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   options.hide_hud_emblems = false;
   options.community_codes = 0;
   options.pro_ai_stronger = 0;   // a file without the key: ask
+  options.pro_ai_extra_delay = 0;
   options.unlock_all = true;   // a file without the key: on
   options.results_screen = true;
   options.training_hud = true;
@@ -2407,6 +2410,19 @@ void load_pc_settings(RenderOptions& options, int& volume) {
     value = first == std::string::npos ? std::string() : value.substr(first);
     while (!value.empty() && (value.back() == '\r' || value.back() == ' ' || value.back() == '\t')) value.pop_back();
     if (key == "truewsfit") { truewsfit_seen = true; continue; }
+    // Read outside the long else-if chain below: one more branch there is past MSVC's nesting limit (C1061).
+    if (key == "proaireaction") { options.pro_ai_extra_delay = std::clamp(std::atoi(value.c_str()), 0, phillip_ai::kMaxExtraDelay); continue; }
+    if (key == "practicechord") {
+      const int chord = (int)std::strtol(value.c_str(), nullptr, 16);
+      if (host::settings_shortcut::valid_practice_chord((uint16_t)chord)) options.practice_chord = chord;
+      continue;
+    }
+    if (key == "vspro") {
+      int v[4] = {-1, -1, -1, -1};
+      std::sscanf(value.c_str(), "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]);
+      for (int i = 0; i < 4; ++i) options.vs_pro[i] = std::clamp(v[i], -1, 99);
+      continue;
+    }
     if (value.empty()) continue;
     if (source_port::mods::parse_choice(key, value, &options.mod_choices)) continue;
     if (load_rtx_key(key, value)) continue;
@@ -2907,6 +2923,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
   host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
   phillip_ai::set_stronger_choice(options.pro_ai_stronger);
+  host::settings_shortcut::practice_chord().store((uint16_t)options.practice_chord, std::memory_order_relaxed);
+  phillip_ai::set_extra_delay(options.pro_ai_extra_delay);
+  for (int port = 0; port < 4; ++port) practice_cpu::set_vs_pro(port, options.vs_pro[port]);
   RenderOptions::live_unlock_all() = options.unlock_all;
   RenderOptions::live_zelda_as_sheik() = options.zelda_as_sheik;
   RenderOptions::live_results_screen() = options.results_screen;
@@ -4125,7 +4144,7 @@ static void apply_practice_tools(RenderOptions& options) {
 static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
   using namespace practice_ui;
   MuPcConfig c = practice_cpu::config();
-  bool changed = false;
+  bool changed = false, pro_changed = false;
   switch (tab) {
   case 1: {
     bool on = c.enabled != 0;
@@ -4150,7 +4169,18 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
     heading("Style");
     changed |= percent_row("Aggression", &c.aggression, "How often it attacks (rather than moves) when you are in range.");
     changed |= number_row("Attack range", &c.attack_range, 10, 80, "%d units", "How close you must be before it attacks.");
-    changed |= number_row("Reaction time", &c.reaction_frames, 0, 40, "%d frames", "Frames before it answers an attack. People react in 15 to 25.");
+    if (practice_menu::pro_active(c)) {
+      // A pro in use: its reaction, not the practice CPU's, so changing it keeps the pro (Wens, 11-23).
+      uint8_t extra = (uint8_t)options.pro_ai_extra_delay;
+      if (number_row("Pro reaction", &extra, 0, phillip_ai::kMaxExtraDelay, "+%d frames",
+                     "Frames added to the pro's own reaction (18 for most). 0 plays as it was trained; more reacts later.")) {
+        options.pro_ai_extra_delay = extra;
+        phillip_ai::set_extra_delay(extra);
+        pro_changed = true;
+      }
+    } else {
+      changed |= number_row("Reaction time", &c.reaction_frames, 0, 40, "%d frames", "Frames before it answers an attack. People react in 15 to 25.");
+    }
     changed |= number_row("CPU delay", &c.act_delay, 0, 30, "%d frames", "Frames it waits before it acts out of shield, getting up and leaving hitstun.");
     {
       static const char* const respawn[MU_PC_RESPAWN_COUNT] = {"Wait", "Get off at once", "Mix"};
@@ -4350,7 +4380,7 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
     practice_cpu::set_config(c);
     apply_practice_tools(options);
   }
-  return changed;
+  return changed || pro_changed;
 }
 
 // An arena room's match window (host::options.spectate) picks how it shows the match: STANDARD,
@@ -4801,6 +4831,7 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     }
     if (r.changed) { state.dirty = true; apply_practice_tools(options); }
     if (r.stronger_changed) { options.pro_ai_stronger = phillip_ai::stronger_choice(); state.dirty = true; }
+    if (r.pro_reaction_changed) { options.pro_ai_extra_delay = phillip_ai::extra_delay(); state.dirty = true; }
     const auto close_menu = [&state]() { state.practice_open = false; state.practice_release_capture = true; };
     if (r.start_unranked && practice.can_start) { slippi::native_practice::submit_start_unranked(); close_menu(); }
     if (r.start_direct || r.start_teams) {
@@ -4827,7 +4858,7 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     practice_card_title(title, true);
     ImGui::TextDisabled("%s", matchmaking_state_text(practice.matchmaking_state));
     if (!practice.opponent.empty()) ImGui::TextDisabled("vs %s", practice.opponent.c_str());
-    ImGui::TextDisabled("Keep practicing. Tab or Start + D-pad Up + Z: search controls");
+    ImGui::TextDisabled("Keep practicing. Tab or %s: search controls", host::settings_shortcut::practice_chord_name().c_str());
     practice_card_end();
   }
 
@@ -4836,7 +4867,7 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
       ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetTime() < 20.0 ? 1.0f : 0.5f);
       practice_card_begin("##native_practice_hint", ImVec2(screen.x - 12, 52), ImVec2(1, 0), false);
       practice_card_title("Find a match while you train", false);
-      ImGui::TextDisabled("Start + D-pad Up + Z (Tab on a keyboard), then Search");
+      ImGui::TextDisabled("%s (Tab on a keyboard), then Search", host::settings_shortcut::practice_chord_name().c_str());
       practice_card_end();
       ImGui::PopStyleVar();
     }
@@ -5096,9 +5127,22 @@ static void draw_arena_panel(RenderOptions& options, const host::PadState* pads,
   // 0xEF). The Static Recomp's select never does: it drew an ARENA tab there that nothing opens.
   float hand_x = 0, hand_y = 0;
   // Ranked and Unranked have no rooms: no ARENA tab or "Push the hand here" box on their selects.
-  f.on_online_menus = (slippi::online::in_online_menus() && slippi::arena::css_hand(&hand_x, &hand_y) &&
+  // The YouGame Friends lobby's select too: its ARENA card takes the player to the arena (FromFriends).
+  const bool friends_lobby = slippi::arena::css_friends_lobby() && slippi::online::friends_lobby_armed() && yougame::session();
+  f.on_online_menus = ((slippi::online::in_online_menus() || friends_lobby) && slippi::arena::css_hand(&hand_x, &hand_y) &&
                        !slippi::arena::css_ranked_or_unranked()) ||
                       slippi::arena::test_fixture_active();
+  {
+    // Logged on a change: whether the room panel is offered on this select, and what decided it.
+    static int last = -1;
+    const int now = (f.on_online_menus ? 1 : 0) | (friends_lobby ? 2 : 0) | (slippi::arena::css_friends_lobby() ? 4 : 0) |
+                    (slippi::online::friends_lobby_armed() ? 8 : 0) | (yougame::session() ? 16 : 0) | (slippi::online::in_online_menus() ? 32 : 0);
+    if (now != last && (now & 4 || last & 4)) {
+      last = now;
+      host::log("arena panel: %s (Friends lobby select %d, armed %d, YouGame %d, online menus %d)",
+                f.on_online_menus ? "offered" : "not offered", (now >> 2) & 1, (now >> 3) & 1, (now >> 4) & 1, (now >> 5) & 1);
+    } else if (now != last) last = now;
+  }
   arena_panel::frame(f);
 }
 #endif
@@ -5251,7 +5295,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nstockhudscale " << options.stock_hud_scale
        << "\ndamagehudscale " << options.damage_hud_scale
        << "\nplayernicknames " << (options.show_player_nicknames ? 1 : 0)
-       << "\nmatchmakinghint " << (options.matchmaking_hint ? 1 : 0) << "\npracticestyle " << options.practice_style << "\npracticeopens " << options.practice_opens
+       << "\nmatchmakinghint " << (options.matchmaking_hint ? 1 : 0) << "\npracticestyle " << options.practice_style << "\npracticechord " << std::hex << options.practice_chord << std::dec << "\npracticeopens " << options.practice_opens
        << "\ninputoverlay " << options.input_overlay << "\ninputoverlayports " << options.input_overlay_ports
        << "\nclean_replays " << (options.clean_replays ? 1 : 0)
        << "\nlabview " << options.lab_view << "\nlabskipscene " << options.lab_skip_scene
@@ -5318,6 +5362,8 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nhide_hud_emblems " << (options.hide_hud_emblems ? 1 : 0)
        << "\ncommunity_codes " << std::hex << options.community_codes << std::dec
        << "\nproaistronger " << options.pro_ai_stronger
+       << "\nproaireaction " << options.pro_ai_extra_delay
+       << "\nvspro " << options.vs_pro[0] << "," << options.vs_pro[1] << "," << options.vs_pro[2] << "," << options.vs_pro[3]
        << "\nunlock_all " << (options.unlock_all ? 1 : 0)
        << "\nzelda_as_sheik " << (options.zelda_as_sheik ? 1 : 0)
        << "\nresults_screen " << (options.results_screen ? 1 : 0)
@@ -10547,6 +10593,39 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("When you pick Zelda, the match starts as Sheik, as holding A at the start does in Versus.\n"
                         "Works in every mode, rogueMelee included. Down B still changes between them.\n"
                         "Offline only: online, use Slippi's own character choice. Source Port only.");
+    {
+      // VS Mode CPU slots can be a Pro AI (owner 11-23: "vs mode slots and people add them in, not during
+      // unranked or ranked"). Offline VS only; the game library and the host both refuse it online.
+      ImGui::SeparatorText("Pro AI in VS Mode");
+      struct Choice { int pro; std::string name; };
+      static std::vector<Choice> choices;
+      if (choices.empty()) {
+        choices.push_back({-1, "Game CPU"});
+        const int count = (int)(sizeof practice_ghosts::kGhosts / sizeof practice_ghosts::kGhosts[0]);
+        for (int i = 0; i < count; ++i)
+          if (practice_ghosts::kReleased[i])
+            choices.push_back({i, std::string(practice_ghosts::kGhosts[i].name) + " (" + practice_ghosts::kGhosts[i].character + ")"});
+      }
+      static std::vector<const char*> labels;
+      if (labels.empty()) for (const Choice& c : choices) labels.push_back(c.name.c_str());
+      for (int port = 0; port < 4; ++port) {
+        int at = 0;
+        for (int i = 0; i < (int)choices.size(); ++i) if (choices[i].pro == options.vs_pro[port]) at = i;
+        char label[32];
+        std::snprintf(label, sizeof label, "P%d as a CPU plays", port + 1);
+        ImGui::SetNextItemWidth(220.0f);
+        if (settings_combo(label, &at, labels.data(), (int)labels.size())) {
+          options.vs_pro[port] = choices[at].pro;
+          practice_cpu::set_vs_pro(port, options.vs_pro[port]);
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("When this port is a CPU in VS Mode, the pro plays it instead of the game's CPU.\n"
+                            "Each pro plays the character shown beside its name; other characters stay the game's\n"
+                            "CPU. Two CPU ports set to pros fight each other. Offline VS only: never online, in\n"
+                            "Unranked or Ranked.");
+      }
+    }
     if (settings_toggle("Show results screen", &options.results_screen)) {
       RenderOptions::live_results_screen() = options.results_screen;
       changed = true;
@@ -11961,7 +12040,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #ifndef MELEE_NO_SLIPPI   // no matchmaking panel in the build without that layer
     changed |= settings_toggle("Show the Practice menu hint in Training", &options.matchmaking_hint);
     if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Start + D-pad Up + Z opens the Practice menu. The hint stops by itself once you have used it.");
+      ImGui::SetTooltip("%s opens the Practice menu. The hint stops by itself once you have used it.",
+                        host::settings_shortcut::practice_chord_name().c_str());
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tab still opens matchmaking with it off.");
     {
       static const char* const looks[practice_menu::kStyleCount] = {
@@ -11971,8 +12051,56 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetNextItemWidth(260.0f);
       if (settings_combo("Practice menu look", &look, looks, practice_menu::kStyleCount)) { options.practice_style = look; changed = true; }
       if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("How the Practice menu (Start + D-pad Up + Z in Training) looks. All of them work with the controller;\n"
-                          "the window also works with the mouse.");
+        ImGui::SetTooltip("How the Practice menu (%s in Training) looks. All of them work with the controller;\n"
+                          "the window also works with the mouse.", host::settings_shortcut::practice_chord_name().c_str());
+    }
+    {
+      // The Practice menu's buttons, set by holding them: box controllers whose firmware makes the D-pad
+      // from other buttons could not press Start + D-pad Up + Z together (buro, 11-23).
+      namespace chord = host::settings_shortcut;
+      static int step = 0;        // 0 idle, 1 waiting for every button to be let go, 2 collecting
+      static uint16_t widest = 0;
+      static double started = 0.0;
+      static std::string note;
+      const double now = ImGui::GetTime();
+      ImGui::Text("Practice menu buttons: %s", chord::chord_name((uint16_t)options.practice_chord).c_str());
+      ImGui::SameLine();
+      if (step == 0 && settings_widgets::Button("Change##practicechord")) {
+        step = 1; widest = 0; started = now; note.clear();
+        chord::start_recording();
+      }
+      if (step == 0 && options.practice_chord != chord::kDefaultPracticeChord) {
+        ImGui::SameLine();
+        if (settings_widgets::Button("Default##practicechord")) {
+          options.practice_chord = chord::kDefaultPracticeChord;
+          chord::practice_chord().store(chord::kDefaultPracticeChord, std::memory_order_relaxed);
+          changed = true;
+        }
+      }
+      if (step != 0) {
+        const uint16_t held = chord::recorded_held().load(std::memory_order_relaxed);
+        if (step == 1 && held == 0) step = 2;
+        else if (step == 2) {
+          widest |= held;
+          if (held == 0 && widest) {
+            if (chord::valid_practice_chord(widest)) {
+              options.practice_chord = widest;
+              chord::practice_chord().store(widest, std::memory_order_relaxed);
+              changed = true;
+              note = "Set: " + chord::chord_name(widest);
+            } else {
+              note = chord::chord_name(widest) + " can't be used: hold two or more buttons that are not Start + D-pad Down + Z (settings).";
+            }
+            step = 0;
+          }
+        }
+        if (step != 0 && (now - started > 10.0 || !chord::recording_active())) { step = 0; note = "Nothing was set (10 seconds passed)."; }
+        if (step == 0) chord::recording().store(false, std::memory_order_relaxed);
+        else ImGui::TextDisabled("Hold the buttons together on your controller, then let go of all of them.");
+      }
+      if (step == 0 && !note.empty()) ImGui::TextDisabled("%s", note.c_str());
+      if (ImGui::IsItemHovered() || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("The buttons held together that open the Practice menu in Training.");
     }
 #endif
     changed |= settings_toggle("Performance overlay", &options.performance_overlay);

@@ -18,6 +18,7 @@
 #include "practice_ghosts.h"
 #include "ghost_ai.h"
 #include "phillip_ai.h"
+#include "settings_chord.h"
 #include "native_practice.h"
 #include "render_options.h"
 #include "slippi_online.h"
@@ -299,6 +300,9 @@ bool ghost_offered(int i, bool neural) {
 // The pro the CPU plays as now, or "".
 // "Stronger Pro AI": the setting as a menu byte, and the pro the question is about.
 uint8_t g_stronger_byte = 0;
+// The Pro AI's added reaction as a menu byte (phillip_ai::extra_delay), and that it changed this frame.
+uint8_t g_pro_extra_byte = 0;
+bool g_pro_reaction_changed = false;
 int g_stronger_pro = -1;
 // This pro (or any pro, -1) has stronger AIs, and one of them is not downloaded yet.
 bool stronger_offered(int pro) {
@@ -647,7 +651,14 @@ std::vector<Row> rows_for(Page p) {
                               "Drift, double jumps, fast fall timing and when its aerials come out."));
       rows.push_back(percent_row("Aggression", &c.aggression, "How often it attacks rather than moves when you are in range."));
       rows.push_back(number_row("Attack range", &c.attack_range, 10, 80, 5, "%d", "How close you must be before it attacks."));
-      rows.push_back(number_row("Reaction", &c.reaction_frames, 0, 40, 1, "%df", "Frames before it answers. People take 15 to 25."));
+      if (!active_pro(c).empty()) {
+        // A pro in use: its reaction, which keeps the pro (the practice CPU's turned it off, Wens 11-23).
+        g_pro_extra_byte = (uint8_t)phillip_ai::extra_delay();
+        rows.push_back(number_row("Pro reaction", &g_pro_extra_byte, 0, phillip_ai::kMaxExtraDelay, 1, "+%df",
+                                  "Frames added to the pro's own reaction (18 for most). 0 plays as trained."));
+      } else {
+        rows.push_back(number_row("Reaction", &c.reaction_frames, 0, 40, 1, "%df", "Frames before it answers. People take 15 to 25."));
+      }
       rows.push_back(number_row("CPU delay", &c.act_delay, 0, 30, 1, "%df",
                                 "Frames it waits before it acts out of shield, getting up and leaving hitstun."));
       {
@@ -918,6 +929,11 @@ void change(Page p, Row& r, int dir) {
     default: return;
   }
   if (*r.byte == before) return;
+  if (r.byte == &g_pro_extra_byte) {   // the pro's reaction: the pro stays in use
+    phillip_ai::set_extra_delay(*r.byte);
+    g_pro_reaction_changed = true;
+    return;
+  }
   g_c_changed = true;
   if (cpu_page(p)) {
     g_c.preset = 0;
@@ -2002,7 +2018,7 @@ void draw_bars_closed(ImDrawList* dl, const Frame& f) {
   draw_bar(dl, right - w, top, right, h, u, true, f.search.mode.c_str(), v, true, 1.0f, false);
   const float dot = 0.55f + 0.45f * std::sin((float)f.time * 4.0f);
   dl->AddCircleFilled(ImVec2(right - 20 * u, top + h * 0.5f), 5.5f * u, IM_COL32(40, 170, 70, (int)(255 * dot)), 16);
-  const std::string sub = f.search.opponent.empty() ? std::string("Start + D-pad Up + Z: menu") : "Found " + f.search.opponent;
+  const std::string sub = f.search.opponent.empty() ? host::settings_shortcut::practice_chord_name() + ": menu" : "Found " + f.search.opponent;
   text(dl, right - w + 4 * u, top + h + 6 * u, 15 * u, IM_COL32(230, 232, 240, 230), sub.c_str());
 }
 
@@ -2383,6 +2399,8 @@ void draw_strip(ImDrawList* dl, const Frame& f, std::vector<Row>& rows, float a)
 
 }  // namespace
 
+bool pro_active(const MuPcConfig& c) { return !active_pro(c).empty(); }
+
 float legend(ImDrawList* dl, float x, float cy, float u, const char* spec, float a, bool draw) {
   return hints(dl, x, cy, u, spec, a, draw);
 }
@@ -2617,6 +2635,7 @@ Result frame(int style, const Frame& f) {
     out.stronger_changed = true;
     g_c_changed = false;
   }
+  if (g_pro_reaction_changed) { g_pro_reaction_changed = false; out.pro_reaction_changed = true; }
   if (g_c_changed) { practice_cpu::set_config(g_c); out.changed = true; }
   // Draw what the input left.
   rows = rows_for(level().page);

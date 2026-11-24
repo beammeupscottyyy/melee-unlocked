@@ -205,9 +205,13 @@ if(TARGET melee_game)
     VERBATIM)
 elseif(MELEE_LINUX_GAME_LIBRARY AND EXISTS "${MELEE_LINUX_GAME_LIBRARY}")
   get_filename_component(MELEE_LINUX_GAME_DIR "${MELEE_LINUX_GAME_LIBRARY}" DIRECTORY)
-  add_custom_command(TARGET melee_source POST_BUILD
+  # Copied on every build, not only when the host relinks: a game library rebuilt with no host change
+  # stayed stale beside it and the Linux package check refused it (1.0.18).
+  add_custom_target(melee_game_copy
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:melee_source>"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_LINUX_GAME_LIBRARY}" "$<TARGET_FILE_DIR:melee_source>/${MELEE_GAME_FILE}"
     VERBATIM)
+  add_dependencies(melee_source melee_game_copy)
 endif()
 
 # The launcher (MeleeUnlocked).

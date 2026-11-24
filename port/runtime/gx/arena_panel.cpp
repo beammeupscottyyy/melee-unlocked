@@ -962,8 +962,10 @@ void press(Do what, const View& v) {
   switch (what) {
     case Do::Rules: if (v.active) { g.page = Page::Rules; g.row = 0; } break;
     case Do::AddCode:
-      // Under YouGame a friend comes in through the app's invite for the room, not a typed code.
-      if (yougame::session()) send_act(Act::AddCode, 0, {});
+      // Under YouGame a friend comes in through the app's invite for the room, not a typed code. On the
+      // Friends lobby's select the arena first takes the player to its home, the online select.
+      if (yougame::session() && !v.active && ar::css_friends_lobby()) send_act(Act::FromFriends);
+      else if (yougame::session()) send_act(Act::AddCode, 0, {});
       else open_code_page();
       break;
     case Do::Spot:

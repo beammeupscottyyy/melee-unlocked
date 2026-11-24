@@ -10,6 +10,8 @@
 
 struct ImDrawList;
 
+struct MuPcConfig;   // mu_practice_cpu.h
+
 namespace practice_menu {
 
 // Saved as "practicestyle". kWindow is the full Practice window, for the mouse and keyboard.
@@ -79,8 +81,12 @@ struct Result {
   bool cancel_search = false;
   bool open_window = false;      // "All settings": the full Practice window
   bool stronger_changed = false; // "Stronger Pro AI" became Always or Never: save it (phillip_ai::stronger_choice)
+  bool pro_reaction_changed = false;   // the Pro AI's added reaction changed: save it (phillip_ai::extra_delay)
   std::string direct_code;
 };
+
+// A Fight a pro preset is in use (the Pro AI plays the CPU).
+bool pro_active(const MuPcConfig& c);
 
 // Draws the menu (open) or what the look keeps on screen while closed (the search time, the
 // strip), and handles the controller and keyboard. Call once per overlay frame inside ImGui.

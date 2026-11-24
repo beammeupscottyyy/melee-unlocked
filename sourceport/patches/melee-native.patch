@@ -133242,7 +133242,7 @@ index 6cf45d12e..02e60aa67 100644
  /* 1C58E0 */ Item_GObj* Ground_801C58E0(s32, s32);
  /* 1C5940 */ int Ground_801C5940(void);
 diff --git a/src/melee/gr/grpstadium.c b/src/melee/gr/grpstadium.c
-index fb1668c71..0de95ec14 100644
+index fb1668c71..779601c1c 100644
 --- a/src/melee/gr/grpstadium.c
 +++ b/src/melee/gr/grpstadium.c
 @@ -15,7 +15,6 @@
@@ -133265,12 +133265,15 @@ index fb1668c71..0de95ec14 100644
  
  static struct grPStadium_YakumonoParam {
      int x0;
-@@ -62,13 +66,19 @@ static struct grPStadium_YakumonoParam {
+@@ -62,13 +66,22 @@ static struct grPStadium_YakumonoParam {
      s16 x4C;
      s16 x4E;
      s16 x50;
 -}* yakumono_param;
 +} DISC_STRUCT* yakumono_param;
++#ifdef MU_NATIVE
++static void mu_tmce_stadium_restore(void);
++#endif
  
  GrJoint grPs_803E1248[] = {
      { 1, 3, 0 }, { 2, 3, 0 }, { 3, 4, 0 },
@@ -133286,7 +133289,7 @@ index fb1668c71..0de95ec14 100644
  static StageCallbacks grPs_StageCallbacks[] = {
      {
          NULL,
-@@ -94,40 +104,40 @@ static StageCallbacks grPs_StageCallbacks[] = {
+@@ -94,40 +107,40 @@ static StageCallbacks grPs_StageCallbacks[] = {
      {
          grStadium_801D1840,
          grStadium_801D19D0,
@@ -133333,11 +133336,26 @@ index fb1668c71..0de95ec14 100644
          grStadium_801D1E10,
          grStadium_801D1E18,
          grStadium_801D1E1C,
-@@ -163,6 +173,11 @@ void grStadium_OnDemoInit(int unused) {}
+@@ -163,6 +176,26 @@ void grStadium_OnDemoInit(int unused) {}
  void grStadium_OnInit(void)
  {
      yakumono_param = Ground_GetYakumonoParam();
 +#ifdef MU_NATIVE
++    /* The lab's Stadium option rewrites three of the stage file's timers (mu_tmce_stadium_transform).
++     * A stage file still in memory would bring them into the next match: every match starts from
++     * the file's own (GitHub #135). */
++    mu_tmce_stadium_restore();
++    {
++        /* MELEE_TEST_PS_LAB_LEFTOVER=<0-3> (tests only): as if TM-CE's lab had picked that
++         * transformation earlier in the session, so a hidden online pair proves the pick stays the
++         * game's own outside a TM-CE event. */
++        extern const char* mu_test_getenv(const char* name);
++        const char* v = mu_test_getenv("MELEE_TEST_PS_LAB_LEFTOVER");
++        if (v != NULL && *v >= '0' && *v <= '3') {
++            mu_tmce_stadium_override = 1;
++            mu_tmce_stadium_transformation = *v - '0';
++        }
++    }
 +    /* 20XX Hack Pack "Stage Swap Engine", its stage file patch (80018130): a fixed transformation
 +     * stage reads its transformation timings as zero, so it transforms at once. */
 +    yakumono_param = (void*) mu_hp_stadium_param(yakumono_param, sizeof(*yakumono_param));
@@ -133345,7 +133363,7 @@ index fb1668c71..0de95ec14 100644
  
      stage_info.unk8C.b4 = false;
      stage_info.unk8C.b5 = true;
-@@ -289,15 +304,15 @@ void fn_801D13C8(Ground_GObj* gobj)
+@@ -289,15 +322,15 @@ void fn_801D13C8(Ground_GObj* gobj)
      gp->u.stadium.xC4_b0 = false;
  }
  
@@ -133370,7 +133388,7 @@ index fb1668c71..0de95ec14 100644
  
  void grStadium_801D13E0(Ground_GObj* gobj)
  {
-@@ -308,7 +323,7 @@ void grStadium_801D13E0(Ground_GObj* gobj)
+@@ -308,7 +341,7 @@ void grStadium_801D13E0(Ground_GObj* gobj)
      Ground* gr = GET_GROUND(gobj);
      HSD_JObj* jobj = GET_JOBJ(gobj);
  
@@ -133379,7 +133397,7 @@ index fb1668c71..0de95ec14 100644
      grAnime_801C8138(gobj, gr->map_id, 0);
      mobj = lbDvd_GetPreloadedArchive(0x7D5);
      gr->u.stadium.xCC = mobj;
-@@ -332,6 +347,9 @@ void grStadium_801D13E0(Ground_GObj* gobj)
+@@ -332,6 +365,9 @@ void grStadium_801D13E0(Ground_GObj* gobj)
          var_r27 += randi(temp_r28 - var_r27);
      }
      gr->u.stadium.xD8 = var_r27;
@@ -133389,7 +133407,7 @@ index fb1668c71..0de95ec14 100644
      gr->x11_flags.b012 = 1;
      mpLib_800575B0(0x55);
      mpLib_800575B0(0x6F);
-@@ -347,11 +365,20 @@ bool grStadium_801D1518(Ground_GObj* gobj)
+@@ -347,11 +383,20 @@ bool grStadium_801D1518(Ground_GObj* gobj)
  void grStadium_801D1520(Ground_GObj* gobj)
  {
      Ground* gp = GET_GROUND(gobj);
@@ -133412,7 +133430,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  void grStadium_801D156C(Ground_GObj* gobj) {}
-@@ -360,7 +387,7 @@ void grStadium_801D1570(Ground_GObj* gobj)
+@@ -360,7 +405,7 @@ void grStadium_801D1570(Ground_GObj* gobj)
  {
      Ground* gp = GET_GROUND(gobj);
      HSD_JObj* jobj = GET_JOBJ(gobj);
@@ -133421,7 +133439,7 @@ index fb1668c71..0de95ec14 100644
      Ground_801C3214(gp->map_id);
      mpJointListAdd(4);
      grAnime_801C8138(gobj, gp->map_id, 0);
-@@ -374,9 +401,9 @@ bool grStadium_801D15FC(Ground_GObj* gobj)
+@@ -374,9 +419,9 @@ bool grStadium_801D15FC(Ground_GObj* gobj)
      return false;
  }
  
@@ -133433,7 +133451,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  void grStadium_801D1624(Ground_GObj* gobj)
-@@ -388,7 +415,7 @@ void grStadium_801D1648(Ground_GObj* gobj)
+@@ -388,7 +433,7 @@ void grStadium_801D1648(Ground_GObj* gobj)
  {
      Ground* gp = GET_GROUND(gobj);
      HSD_JObj* jobj = GET_JOBJ(gobj);
@@ -133442,7 +133460,7 @@ index fb1668c71..0de95ec14 100644
      Ground_801C3214(gp->map_id);
      mpJointListAdd(3);
      grAnime_801C8138(gobj, gp->map_id, 0);
-@@ -402,9 +429,9 @@ bool grStadium_801D16D4(Ground_GObj* gobj)
+@@ -402,9 +447,9 @@ bool grStadium_801D16D4(Ground_GObj* gobj)
      return false;
  }
  
@@ -133454,7 +133472,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  void grStadium_801D16FC(Ground_GObj* gobj)
-@@ -420,7 +447,7 @@ void grStadium_801D1720(Ground_GObj* gobj)
+@@ -420,7 +465,7 @@ void grStadium_801D1720(Ground_GObj* gobj)
      Ground* gp = GET_GROUND(gobj);
      HSD_JObj* jobj = GET_JOBJ(gobj);
  
@@ -133463,7 +133481,7 @@ index fb1668c71..0de95ec14 100644
      Ground_801C3214(gp->map_id);
      mpJointListAdd(5);
      grAnime_801C8138(gobj, gp->map_id, 0);
-@@ -436,9 +463,9 @@ bool grStadium_801D17E0(Ground_GObj* gobj)
+@@ -436,9 +481,9 @@ bool grStadium_801D17E0(Ground_GObj* gobj)
      return false;
  }
  
@@ -133475,7 +133493,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  void grStadium_801D1808(Ground_GObj* gobj)
-@@ -463,7 +490,7 @@ void grStadium_801D1840(Ground_GObj* gobj)
+@@ -463,7 +508,7 @@ void grStadium_801D1840(Ground_GObj* gobj)
      Ground* gp = GET_GROUND(gobj);
      HSD_JObj* jobj = GET_JOBJ(gobj);
  
@@ -133484,7 +133502,7 @@ index fb1668c71..0de95ec14 100644
      Ground_801C3214(gp->map_id);
      mpJointListAdd(1);
      mpJointListAdd(2);
-@@ -507,9 +534,9 @@ bool grStadium_801D19D0(Ground_GObj* gobj)
+@@ -507,9 +552,9 @@ bool grStadium_801D19D0(Ground_GObj* gobj)
      return false;
  }
  
@@ -133496,7 +133514,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  void grStadium_801D19F8(Ground_GObj* gobj)
-@@ -533,7 +560,7 @@ void grStadium_801D1A38(Ground_GObj* gobj)
+@@ -533,7 +578,7 @@ void grStadium_801D1A38(Ground_GObj* gobj)
      gp = GET_GROUND(gobj);
      jobj = GET_JOBJ(gobj);
  
@@ -133505,7 +133523,7 @@ index fb1668c71..0de95ec14 100644
      Ground_801C3214(gp->map_id);
      mpJointListAdd(7);
      grAnime_801C8138(gobj, gp->map_id, 0);
-@@ -586,7 +613,7 @@ void grStadium_801D1B48(Ground_GObj* gobj)
+@@ -586,7 +631,7 @@ void grStadium_801D1B48(Ground_GObj* gobj)
          mpLib_80057BC0(0);
      }
  
@@ -133514,7 +133532,7 @@ index fb1668c71..0de95ec14 100644
      mpLib_8005667C(0);
  }
  
-@@ -606,10 +633,9 @@ void grStadium_801D1D84(Ground_GObj* gobj)
+@@ -606,10 +651,9 @@ void grStadium_801D1D84(Ground_GObj* gobj)
      mpLib_80057BC0(7);
  }
  
@@ -133527,7 +133545,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  bool grStadium_801D1E10(Ground_GObj* gobj)
-@@ -837,6 +863,21 @@ void grStadium_801D2278(Ground_GObj* gobj)
+@@ -837,6 +881,21 @@ void grStadium_801D2278(Ground_GObj* gobj)
      grStadium_801D2528(gobj, 0, 0);
  }
  
@@ -133549,7 +133567,7 @@ index fb1668c71..0de95ec14 100644
  void grStadium_801D2344(Ground_GObj* g)
  {
      Ground_GObj* gobj = g;
-@@ -906,7 +947,12 @@ void grStadium_801D2344(Ground_GObj* g)
+@@ -906,7 +965,12 @@ void grStadium_801D2344(Ground_GObj* g)
          temp_r3_8->flag = 0;
          if (gp->u.display.xDC == NULL ||
              Player_GetEntity(gp->u.display.xEE) == NULL ||
@@ -133563,7 +133581,7 @@ index fb1668c71..0de95ec14 100644
          {
              grStadium_801D2A60(gobj);
          }
-@@ -1165,8 +1211,8 @@ static HSD_CameraDescPerspective grPs_803E14FC = {
+@@ -1165,8 +1229,8 @@ static HSD_CameraDescPerspective grPs_803E14FC = {
      1,
      { 0, 0xFA, 0, 0xA0 },
      { 0, 0xFA, 0, 0xA0 },
@@ -133574,7 +133592,7 @@ index fb1668c71..0de95ec14 100644
      0.0F,
      NULL,
      0.1F,
-@@ -1236,7 +1282,7 @@ HSD_GObj* grStadium_801D2E24(void)
+@@ -1236,7 +1300,7 @@ HSD_GObj* grStadium_801D2E24(void)
      return gobj;
  }
  
@@ -133583,7 +133601,7 @@ index fb1668c71..0de95ec14 100644
  {
      ImageDescWrapper* wrapper;
      Ground* gp2;
-@@ -1261,7 +1307,7 @@ void fn_801D2ED0(HSD_GObj* gobj, int unused)
+@@ -1261,7 +1325,7 @@ void fn_801D2ED0(HSD_GObj* gobj, int unused)
      gp2->u.display.xF8_0 = true;
  }
  
@@ -133592,7 +133610,7 @@ index fb1668c71..0de95ec14 100644
  {
      HSD_GObj* vision_gobj;
      Ground* gp2;
-@@ -1281,7 +1327,7 @@ void grStadium_801D2FD0(Ground_GObj* gobj, int unused)
+@@ -1281,7 +1345,7 @@ void grStadium_801D2FD0(Ground_GObj* gobj, int unused)
      }
  }
  
@@ -133601,7 +133619,7 @@ index fb1668c71..0de95ec14 100644
  {
      void* new_var2; // Permuter slop
      ImageDescWrapper* wrapper = GET_WRAPPER(gobj);
-@@ -1304,30 +1350,6 @@ void grStadium_801D3084(HSD_GObj* gobj, int unused)
+@@ -1304,30 +1368,6 @@ void grStadium_801D3084(HSD_GObj* gobj, int unused)
  
  /// @todo these are commonly used inlines; they should be moved to jobj.h
  
@@ -133632,7 +133650,7 @@ index fb1668c71..0de95ec14 100644
  HSD_TObj* grStadium_801D3138(Ground_GObj* gobj, HSD_ImageDesc* desc,
                               HSD_MObj** arg2)
  {
-@@ -1355,24 +1377,24 @@ HSD_TObj* grStadium_801D3138(Ground_GObj* gobj, HSD_ImageDesc* desc,
+@@ -1355,24 +1395,24 @@ HSD_TObj* grStadium_801D3138(Ground_GObj* gobj, HSD_ImageDesc* desc,
              }
          }
  
@@ -133665,7 +133683,7 @@ index fb1668c71..0de95ec14 100644
          }
      }
      return NULL;
-@@ -1435,7 +1457,7 @@ bool grStadium_801D32D0(Ground_GObj* gobj)
+@@ -1435,7 +1475,7 @@ bool grStadium_801D32D0(Ground_GObj* gobj)
  
  static const GXColor grPs_804DAF3C = { 0xFF, 0xFF, 0xFF, 0xFF };
  
@@ -133674,7 +133692,7 @@ index fb1668c71..0de95ec14 100644
  static u8 grPs_8049F040[0x100];
  
  void grStadium_801D3460(Ground_GObj* gobj)
-@@ -1466,7 +1488,7 @@ void grStadium_801D3460(Ground_GObj* gobj)
+@@ -1466,7 +1506,7 @@ void grStadium_801D3460(Ground_GObj* gobj)
      HSD_SisLib_803A7664(gp2->win_dynamic_p);
      temp_r29 = GET_GROUND(Ground_GetMapGObj(2));
  
@@ -133683,7 +133701,7 @@ index fb1668c71..0de95ec14 100644
  
      HSD_SisLib_803A6530(1, 5, 6);
      temp_r0 = temp_r29->u.stadium.xDE;
-@@ -1706,8 +1728,7 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
+@@ -1706,8 +1746,7 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
      gp2 = text_gobj->user_data;
      HSD_ASSERT(0x884, gp2->win_static_p);
      HSD_ASSERT(0x885, gp2->win_dynamic_p);
@@ -133693,7 +133711,7 @@ index fb1668c71..0de95ec14 100644
          if ((Player_GetPlayerSlotType(player_index) != Gm_PKind_NA) &&
              (Player_8003219C(player_index) == 0))
          {
-@@ -1716,8 +1737,7 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
+@@ -1716,8 +1755,7 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
                  player_num += 1;
              }
          }
@@ -133703,7 +133721,7 @@ index fb1668c71..0de95ec14 100644
      HSD_SisLib_803A7664(gp2->win_dynamic_p);
  
      if (player_num == 1) {
-@@ -1747,10 +1767,15 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
+@@ -1747,10 +1785,15 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
          gp2->win_dynamic_p->default_kerning = 1;
      }
      colors.s.presets = grPs_803B7F8C;
@@ -133722,7 +133740,7 @@ index fb1668c71..0de95ec14 100644
          if (Player_GetPlayerSlotType(player_num) != Gm_PKind_NA &&
              Player_8003219C(player_num) == 0)
          {
-@@ -1778,8 +1803,7 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
+@@ -1778,8 +1821,7 @@ void grStadium_801D3BBC(Ground_GObj* arg0)
                  text_offset += 0x20;
              }
          }
@@ -133732,7 +133750,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  const StadiumAlphaPresets grPs_803B7F8C = { {
-@@ -1867,7 +1891,7 @@ void grStadium_801D4194(Ground_GObj* arg0)
+@@ -1867,7 +1909,7 @@ void grStadium_801D4194(Ground_GObj* arg0)
  }
  
  /// HSD_DevComCallback
@@ -133741,7 +133759,7 @@ index fb1668c71..0de95ec14 100644
  {
      Ground_GObj* map_gobj;
      Ground* gp;
-@@ -1880,29 +1904,25 @@ static void fn_801D4220(int dcreq, int args, void* buf, bool cancelflag)
+@@ -1880,29 +1922,25 @@ static void fn_801D4220(int dcreq, int args, void* buf, bool cancelflag)
      gp->u.stadium.xC4_b1 = false;
  }
  
@@ -133778,7 +133796,7 @@ index fb1668c71..0de95ec14 100644
  
  Ground* grStadium_801D4354(Ground_GObj* gobj)
  {
-@@ -1916,6 +1936,46 @@ char* datfiles[] = {
+@@ -1916,6 +1954,46 @@ char* datfiles[] = {
      "GrPs4.dat",
  };
  
@@ -133825,7 +133843,7 @@ index fb1668c71..0de95ec14 100644
  static struct VecScalar {
      Vec3 vec;
      float scalar;
-@@ -2006,162 +2066,207 @@ void grStadium_801D435C(Ground_GObj* arg0)
+@@ -2006,162 +2084,211 @@ void grStadium_801D435C(Ground_GObj* arg0)
  
  void grStadium_801D4548(Ground_GObj* gobj)
  {
@@ -133886,16 +133904,16 @@ index fb1668c71..0de95ec14 100644
 +    gp = GET_GROUND(gobj);
 +    scale = Ground_801C0498();
 +    if (gm_8018841C()) {
-+        return;
-+    }
+         return;
+     }
 +#ifdef MU_NATIVE
 +    /* IngameCheckIfFrozen: a frozen Stadium never transforms. With the Slippi menus on it runs on
 +     * every match, as in Legacy's netplay build (the toggle comes from the SSS). */
 +    if ((mu_replay_code(MU_RC_PS_FROZEN_CHECK) || mu_slippi_menus_enabled()) &&
 +        mu_ps_frozen_toggle())
 +    {
-         return;
-     }
++        return;
++    }
 +#endif
  
      if (Stage_80225194() == 0xF0) {
@@ -133973,8 +133991,12 @@ index fb1668c71..0de95ec14 100644
 +                        kind = kinds[r];
 +                        break;
 +                    }
-+                    /* Training Mode CE's lab picks the transformation (mu_tmce_stadium_transform) */
-+                    if (mu_tmce_stadium_override) {
++                    /* Training Mode CE's lab picks the transformation (mu_tmce_stadium_transform).
++                     * Only in a TM-CE event: the lab's switch is never cleared, and read anywhere else
++                     * (an online match after the lab, GitHub #135) it skipped the random pick the other
++                     * player's game makes, so every later Stadium match desynced at its first change. */
++                    if (mu_tmce_stadium_override && mu_tmce_active() &&
++                        gm_GetCurrentGameMode() == GM_EVENT) {
 +                        r = mu_tmce_stadium_transformation;
 +                        kind = kinds[r];
 +                        break;
@@ -134149,7 +134171,7 @@ index fb1668c71..0de95ec14 100644
                  mpLib_80057528(0x55);
                  mpLib_80057528(0x6F);
              }
-@@ -2170,68 +2275,73 @@ void grStadium_801D4548(Ground_GObj* gobj)
+@@ -2170,68 +2297,73 @@ void grStadium_801D4548(Ground_GObj* gobj)
          Camera_RequestQuake(QuakeKind_Loop, NULL);
          return;
      case 5:
@@ -134267,7 +134289,7 @@ index fb1668c71..0de95ec14 100644
  }
  
  /**
-@@ -2253,7 +2363,7 @@ bool grStadium_801D4FF8(int pl_slot)
+@@ -2253,7 +2385,7 @@ bool grStadium_801D4FF8(int pl_slot)
      return false;
  }
  
@@ -134276,7 +134298,7 @@ index fb1668c71..0de95ec14 100644
  {
      grStadium_801D1EF8(gobj);
      grDisplay_801C5DB0(gobj, arg1);
-@@ -2290,3 +2400,28 @@ void grStadium_801D511C(void)
+@@ -2290,3 +2422,45 @@ void grStadium_801D511C(void)
  
      lbDvd_80017740(0, 0x7D5, 4, 4, 0x50000, 0, 7, 0x10, 0);
  }
@@ -134295,9 +134317,26 @@ index fb1668c71..0de95ec14 100644
 + * choice; natively the same fields are set here and the pick reads mu_tmce_stadium_transformation. */
 +int mu_tmce_stadium_override;
 +int mu_tmce_stadium_transformation;
++static void* mu_tmce_stadium_saved_at;   /* the stage data whose timers the lab changed */
++static u32 mu_tmce_stadium_saved[3];
++static void mu_tmce_stadium_restore(void)
++{
++    if (mu_tmce_stadium_saved_at != NULL && mu_tmce_stadium_saved_at == (void*) yakumono_param) {
++        yakumono_param->x8 = mu_tmce_stadium_saved[0];
++        yakumono_param->xC = mu_tmce_stadium_saved[1];
++        yakumono_param->x10 = mu_tmce_stadium_saved[2];
++    }
++    mu_tmce_stadium_saved_at = NULL;
++}
 +void mu_tmce_stadium_transform(HSD_GObj* map_gobj, int transformation_id)
 +{
 +    Ground* gp = GET_GROUND(map_gobj);
++    if (mu_tmce_stadium_saved_at != (void*) yakumono_param) {
++        mu_tmce_stadium_saved_at = yakumono_param;
++        mu_tmce_stadium_saved[0] = yakumono_param->x8;
++        mu_tmce_stadium_saved[1] = yakumono_param->xC;
++        mu_tmce_stadium_saved[2] = yakumono_param->x10;
++    }
 +    gp->u.stadium.xD8 = -1;             /* transform now */
 +    yakumono_param->x8 = 0x1000001;     /* max transformation length */
 +    yakumono_param->xC = 0x1000000;     /* default transformation length */

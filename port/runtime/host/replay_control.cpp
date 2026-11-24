@@ -43,6 +43,7 @@ constexpr uint16_t kPadStart = 0x1000, kPadZ = 0x0010, kPadR = 0x0020;
 
 // Takeover state (see replay_control.h). Requests come from the render thread.
 std::atomic<int> g_take_port{-1};
+std::atomic<bool> g_took_over{false};   // took_over
 std::atomic<int32_t> g_take_frame{kNoFrame};
 std::atomic<int> g_take_request{-2};    // -2 none, else the port to take over
 std::atomic<int> g_take_action{0};      // 1 retry, 2 back to watching
@@ -506,6 +507,7 @@ void takeover_requests(int32_t frame) {
     if (g.engine.keep) g.engine.keep(frame);
     g_take_frame.store(frame);
     g_take_port.store(port);
+    g_took_over.store(true);
     set_paused(false, frame);
     host::log("replay: takeover of P%d from frame %d", port + 1, frame);
   }
@@ -578,6 +580,8 @@ void take_over(int port) { g_take_request.store(port); }
 void retry_takeover() { g_take_action.store(1); }
 void stop_takeover() { g_take_action.store(2); }
 int takeover_port() { return g_take_port.load(std::memory_order_relaxed); }
+bool took_over() { return g_took_over.load(); }
+void forget_takeovers() { g_took_over.store(false); }
 int32_t takeover_frame() { return g_take_frame.load(std::memory_order_relaxed); }
 void set_players(uint32_t ports, const std::string names[4]) {
   std::lock_guard<std::mutex> lock(g_names_mutex);

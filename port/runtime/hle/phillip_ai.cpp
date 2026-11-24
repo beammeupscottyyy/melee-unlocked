@@ -277,6 +277,7 @@ void fetch_later(const Entry& e, bool retry = false) {
 }
 
 std::atomic<int> g_stronger{kStrongerAsk};
+std::atomic<int> g_extra_delay{0};   // set_extra_delay
 
 // Phillip's newest policies (90 MB) need about 10 ms a step: a PC plays them only once a background
 // check shows it steps one fast enough (0 not known, 1 fast enough, -1 too slow). Until then, and on
@@ -1019,9 +1020,9 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
       s.jobs.clear();
       s.answers.clear();
     }
-    host::log("pro ai: P%u plays pro %u with %s (%s%s%s, %d frames of delay, temperature %.2f) from frame %u",
+    host::log("pro ai: P%u plays pro %u with %s (%s%s%s, %d frames of delay + %d added, temperature %.2f) from frame %u",
               (unsigned)o.slot + 1, o.pro, e->file.c_str(), e->kind.c_str(), e->trained_as.empty() ? "" : ", trained as ",
-              e->trained_as.c_str(), e->delay, e->temperature, o.frame);
+              e->trained_as.c_str(), e->delay, g_extra_delay.load(), e->temperature, o.frame);
     s.entry = e;
     s.first = o.frame;
     s.live = true;
@@ -1038,14 +1039,17 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
   // The answer due now was asked for `delay` frames ago; before that the fighter holds still, as
   // Phillip does on the first frames of a game.
   MuGhostAct a{};
-  const uint32_t delay = (uint32_t)s.entry->delay;
+  // Its own delay plus the player's extra reaction time. Answers are kept for the longest extra, so
+  // raising it mid-match finds the older answers it now needs instead of waiting for them.
+  const uint32_t delay = (uint32_t)(s.entry->delay + std::clamp(g_extra_delay.load(), 0, kMaxExtraDelay));
   if (o.frame - s.first >= delay) {
     const uint32_t due = o.frame - delay;
     std::unique_lock<std::mutex> lk2(s.m);
     const bool got = s.cv.wait_for(lk2, std::chrono::seconds(5), [&] { return s.answers.count(due) != 0; });
     if (got) a = s.answers[due];
     else host::log("pro ai: P%u answer for frame %u is late", (unsigned)o.slot + 1, due);
-    s.answers.erase(s.answers.begin(), s.answers.upper_bound(due));
+    const uint32_t keep = (uint32_t)(s.entry->delay + kMaxExtraDelay);
+    if (o.frame > keep) s.answers.erase(s.answers.begin(), s.answers.lower_bound(o.frame - keep));
   }
   // Phillip plays every frame itself, recovery included: no practice CPU safety net for it.
   a.buttons |= MU_GHOST_ACT_OWN_RECOVERY;
@@ -1055,6 +1059,8 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
 }
 
 void set_stronger_choice(int choice) { g_stronger = std::clamp(choice, 0, 2); }
+void set_extra_delay(int frames) { g_extra_delay = std::clamp(frames, 0, kMaxExtraDelay); }
+int extra_delay() { return g_extra_delay.load(); }
 int stronger_choice() { return g_stronger.load(); }
 
 StrongerStatus stronger_status(int pro) {

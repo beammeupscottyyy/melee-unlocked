@@ -79,5 +79,36 @@ int main() {
   b = 0;
   hold_lone_start(false, false, 0, b, waited);
   expect(b == 0 && waited == 0);
+  {
+    // The Practice chord can be set (buro, 11-23: a box controller's firmware could not press the default).
+    namespace sc = host::settings_shortcut;
+    expect(sc::practice_chord().load() == sc::kDefaultPracticeChord);
+    expect(sc::chord_name(sc::kDefaultPracticeChord) == "Start + D-pad Up + Z");
+    expect(sc::chord_name(0x0400 | 0x0040 | 0x1000) == "Start + X + L");
+    expect(sc::valid_practice_chord(0x0400 | 0x0040 | 0x1000));   // Start + X + L
+    expect(sc::valid_practice_chord(sc::kDefaultPracticeChord));
+    expect(!sc::valid_practice_chord(0x0100));                    // one button
+    expect(!sc::valid_practice_chord(0x1010));                    // Start + Z: part of the settings chord
+    expect(!sc::valid_practice_chord(sc::kSettingsChord));         // the settings chord itself
+    expect(!sc::valid_practice_chord(sc::kSettingsChord | 0x0100));   // holds all of it
+    expect(!sc::valid_practice_chord(0x8000 | 0x1000));           // not a chord button
+    // A set chord opens the panel, and the default one no longer does.
+    sc::practice_chord().store(0x0400 | 0x0040 | 0x1000);
+    bool held2 = false;
+    uint16_t pad = sc::kDefaultPracticeChord;
+    expect(!sc::poll_practice(true, pad, held2));
+    pad = 0;
+    expect(!sc::poll_practice(true, pad, held2));
+    pad = 0x0400 | 0x0040 | 0x1000 | 0x0100;
+    expect(sc::poll_practice(true, pad, held2));
+    expect(pad == 0x0100);   // its buttons never reach the game
+    expect(sc::practice_chord_name() == "Start + X + L");
+    sc::practice_chord().store(sc::kDefaultPracticeChord);
+    // Recording ends by itself.
+    sc::start_recording();
+    expect(sc::recording_active() && sc::recorded_held().load() == 0xFFFF);
+    sc::recording_until().store(sc::chord_clock_ms() - 1);
+    expect(!sc::recording_active() && !sc::recording().load());
+  }
   return 0;
 }

@@ -92,7 +92,9 @@ class SquadReplayWiring(unittest.TestCase):
         event = function(recording, 'h_replay_event')
         # Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
         state = ('bool g_squad_replay_pending = false;\nbool g_replay_squad = false;\n'
-                 'bool g_replay_written = false;\nbool g_replay_spectator_only = false;\n')
+                 'bool g_replay_written = false;\nbool g_replay_spectator_only = false;\n'
+                 # The viewer's watched-only rule (replay_control::took_over): a normal match here.
+                 'bool g_replaying = false;\nnamespace replay_control { inline bool took_over() { return false; } }\n')
         generated = state + handler + '  (void) response; (void) response_capacity;\n  return -1;\n}\n' + writer + '  ++writes;\n  g_replay_written = true;\n}\n'
         generated += function(read(GAME / 'shim/mu_entry.c'), 'mu_slippi_command')
         generated += event

@@ -1368,7 +1368,24 @@ bool exit_requested() { return g_exit; }
 void request_exit(int code) { g_exit_code.store(code); g_exit.store(true); }
 static std::atomic<bool> g_replay_viewing{false};
 void set_replay_viewing(bool on) { g_replay_viewing.store(on); }
-void request_user_exit() { request_exit(g_replay_viewing.load() ? kViewerClosedExit : 0); }
+// The player closed the window. If the game is stuck and never gets to its own exit, the process stayed
+// in the background holding the controllers and the adapter (a replay that froze, tyler631 11-23: the
+// adapter read "in use by another program" until Task Manager ended it). A closed window ends the
+// process within kStuckExitSeconds whatever the game thread is doing, through end_process (logs, files
+// still being written and the shader caches are saved first).
+constexpr int kStuckExitSeconds = 10;
+void request_user_exit() {
+  request_exit(g_replay_viewing.load() ? kViewerClosedExit : 0);
+  static std::atomic<bool> armed{false};
+  if (armed.exchange(true)) return;
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::seconds(kStuckExitSeconds));
+    if (process_ending()) return;
+    log("exit: still running %d s after the window was closed (the game is stuck); ending the process so it "
+        "lets go of the controllers", kStuckExitSeconds);
+    end_process(g_exit_code.load());
+  }).detach();
+}
 static void (*g_before_restart)() = nullptr;
 void set_before_restart(void (*hook)()) { g_before_restart = hook; }
 void request_restart() {
@@ -3804,6 +3821,19 @@ void retrace() {
     window_set_client_size(second ? resize_every.w2 : resize_every.w1, second ? resize_every.h2 : resize_every.h1);
   }
   if (options.frames && g_retraces >= options.frames) request_exit(0);
+  {
+    // MELEE_TEST_CLOSE_STUCK=<retrace> (tests only): the window is closed at that retrace and the game
+    // thread then hangs, as a stuck game does; the process must still end (request_user_exit).
+    static const uint32_t close_stuck = [] {
+      const char* v = host::test_env::getenv("MELEE_TEST_CLOSE_STUCK");
+      return v ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u;
+    }();
+    if (close_stuck && g_retraces >= close_stuck) {
+      log("test: closing the window at retrace %u, then the game thread hangs", g_retraces);
+      request_user_exit();
+      for (;;) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
   log_stack_peak(false);
   test_stack_depth(false);
   if (g_exit) {

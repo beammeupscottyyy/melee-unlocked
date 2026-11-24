@@ -96,6 +96,11 @@ void take_over(int port);        // start (the game resumes); a port the replay 
 void retry_takeover();           // back to the takeover's frame, same port, again
 void stop_takeover();            // back to the takeover's frame, watching the recording
 int takeover_port();             // -1 while watching
+// A takeover happened since this replay was loaded (cleared by forget_takeovers, at each replay's start):
+// only then does the viewer save the game it played as a new replay. Watching alone saves no copy
+// (tyler631, 11-23: each watch of a 5 s replay left another copy of it).
+bool took_over();
+void forget_takeovers();
 void set_live_start(bool held);  // input thread: Start on the live port (kept from the game)
 bool live_start_held();
 int32_t takeover_frame();        // kNoFrame while watching

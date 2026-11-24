@@ -2427,6 +2427,13 @@ struct UiSnapshot {
     current_scene(&scene_major, &scene_minor, &scene_frame);
     const bool training = scene_major == 0x1C;   // Training, where a lone Start opens its pause menu
     const bool home_input = g_background_input || (g_hwnd && window_focused(g_hwnd));
+    if (settings_shortcut::recording_active()) {
+      // Settings is recording the Practice menu's buttons: it gets them, nothing else does.
+      uint16_t held = 0;
+      for (int i = 0; i < 4; ++i)
+        if (pads[i].err == 0) { held |= static_cast<uint16_t>(pads[i].button & settings_shortcut::kChordButtons); pads[i].button = 0; }
+      settings_shortcut::recorded_held().store(held, std::memory_order_relaxed);
+    }
     for (int i = 0; i < 4; ++i) {
       // Only ImGui receives the filtered keyboard copy. All chord/console/friends readers
       // below keep the original routed pad, including Start and the arrow-made stick.

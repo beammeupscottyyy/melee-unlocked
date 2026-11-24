@@ -77,6 +77,8 @@ struct Test { bool on = false; int index = 0, count = 0, base = 0; uint8_t chara
 bool g_active = false, g_hosting = false;
 std::string g_notice;            // a line for the player beside the room tab (a full room), until g_notice_until
 uint64_t g_notice_until = 0;
+std::function<void()> g_friends_exit;   // the host's way from the Friends lobby's select to the online select
+uint64_t g_open_on_arrival = 0;         // until then: open the room once on the online select (FromFriends)
 bool g_close_room = false;       // a full room refused this player: leave it at the next tick
 bool g_member_closed = false;    // the host said the room is over
 const char* g_closed_reason = nullptr;   // a member's room ended (host gone): closed after the links are read
@@ -1023,6 +1025,15 @@ void yg_open(const std::string& room) {
 
 // The room's own acts under YouGame; true when handled.
 bool yg_act(const Pending& p) {
+  if (p.a == Act::FromFriends) {
+    // The ARENA card on the Friends lobby's select: the lobby closes (the select's unload leaves it), the
+    // online select opens in Direct's mode, and the room opens there with its invite (tick, below).
+    if (g_active || !yg_identity() || !g_friends_exit) return true;
+    event("from the Friends lobby to the online select, then a room");
+    g_open_on_arrival = now_ms() + 30000;
+    g_friends_exit();
+    return true;
+  }
   if (p.a == Act::JoinYouGame) {
     if (p.text.empty() || !yg_identity()) return true;
     if (g_active) leave_room();
@@ -1590,6 +1601,7 @@ bool autolock_due() {
 bool locks_in_itself() { return g_test.on || (test_autolock() && autolock_due()); }
 void set_recording_codes(std::vector<uint8_t> codes) { g_codes = std::move(codes); }
 void set_viewer_launcher(std::function<void*(const std::string&)> launch) { g_launch_viewer = std::move(launch); }
+void set_friends_exit(std::function<void()> go) { g_friends_exit = std::move(go); }
 
 // This member's pick on the character select goes to the room (twice a second, when it changed),
 // so every panel can show each player's portrait.
@@ -1673,8 +1685,23 @@ void test_add_codes() {
   }
 }
 
+extern std::atomic<int> g_css_mode;
 void tick() {
   if (!rooms_enabled()) return;   // tests only: rooms off
+  // Came from the Friends lobby's ARENA card: on the online select (Direct's mode), open the room and invite.
+  if (g_open_on_arrival) {
+    if (now_ms() > g_open_on_arrival || g_active) {
+      if (!g_active) event("the online select did not open in time; no room");
+      g_open_on_arrival = 0;
+    } else if (online::in_online_menus() && g_css_mode.load() == (int)Matchmaking::DIRECT && !css_friends_lobby()) {
+      g_open_on_arrival = 0;
+      // The invite is the YouGame app's friend picker: with the app there the room opens on it; under the
+      // launcher alone (no picker) only the room opens, and Z on its card invites as it does from Direct.
+      const bool picker = yougame::active() || yougame::channel_connected();
+      event(picker ? "on the online select: the room opens with its invite" : "on the online select: the room opens");
+      yg_act(Pending{picker ? Act::AddCode : Act::OpenRoom, 0, {}});
+    }
+  }
   test_add_codes();
   test_leave();
   stray_room_hello();
@@ -2010,7 +2037,11 @@ bool css_hand(float* x, float* y) {
 }
 
 std::atomic<int> g_css_mode{-1};
-void set_css_mode(int mode) { g_css_mode.store(mode); }
+void set_css_mode(int mode) {
+  // Logged on a change only: which select the panel follows (the Friends lobby's is kCssFriendsLobby).
+  if (g_css_mode.exchange(mode) != mode) host::log("arena: the select's mode is %d%s", mode, mode == kCssFriendsLobby ? " (the Friends lobby)" : "");
+}
+bool css_friends_lobby() { return g_css_mode.load() == kCssFriendsLobby; }
 bool css_ranked_or_unranked() {
   const int mode = g_css_mode.load();
   return mode == Matchmaking::RANKED || mode == Matchmaking::UNRANKED;

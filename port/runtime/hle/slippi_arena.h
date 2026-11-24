@@ -34,6 +34,9 @@ bool locks_in_itself();   // tests: the room locks pairs in with a random stage 
 void set_recording_codes(std::vector<uint8_t> codes);
 // Opens a viewer window on a live recording; returns its process handle, or null. Set by the host.
 void set_viewer_launcher(std::function<void*(const std::string& path)> launch);
+// Leaves the YouGame Friends lobby's select for the online select in Direct's mode (the arena's home under
+// YouGame), as an accepted arena invite does. Set by the host (native_practice).
+void set_friends_exit(std::function<void()> go);
 
 // ---- simulation thread ----
 void tick();                                                   // once a frame, any scene
@@ -47,6 +50,7 @@ enum class Act : uint8_t {
   OpenRoom = 20, AddCode = 21,   // the host's own (AddCode carries a connect code)
   LeaveRoom = 22,                // this player leaves the room (a host's room closes with it)
   JoinYouGame = 23,              // under YouGame: join the arena whose room code is text (an invite)
+  FromFriends = 24,              // under YouGame, on the Friends lobby's select: to the online select, then a room
 };
 void act(Act a, uint8_t arg = 0, const std::string& text = {});
 
@@ -94,6 +98,9 @@ void set_css_mode(int mode);
 // Ranked or Unranked: no rooms there (they are a Direct feature; under YouGame, a YouGame Friends one), so no
 // ARENA tab or box (pc_settings.cpp).
 bool css_ranked_or_unranked();
+// The YouGame Friends lobby's 4-door select reports its hand with this mode (shim/mu_slippi_css.c).
+constexpr int kCssFriendsLobby = 0x40;
+bool css_friends_lobby();
 // Rooms for players (the tab, the panels, the room logic, the settings rows). MELEE_TEST_ARENA_ROOMS=0
 // (tests only) turns them off, for runs that compare a game with and without them.
 bool rooms_enabled();

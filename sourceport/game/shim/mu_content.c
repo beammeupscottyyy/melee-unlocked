@@ -106,7 +106,7 @@ int mu_title_demo_stage(int stkind)
     extern int Stage_8022519C(int stkind);
     extern int gm_801641CC(unsigned char index);
     extern unsigned int lbFileGetSize(const char* basename);
-    static unsigned char response[64];
+    static unsigned char response[4096];   /* the host's minimum reply capacity: a smaller buffer is refused */
     unsigned int got = 0;
     unsigned int growth = 0;
     unsigned int budget;

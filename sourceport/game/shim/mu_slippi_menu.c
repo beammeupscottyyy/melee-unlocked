@@ -1723,6 +1723,12 @@ int mu_lobby_css(void)
     return lobby.major && mu_slippi_menus_enabled() && mu_slippi_on_online_css();
 }
 
+/* The Friends lobby's 4-door select, not the Doubles home's 2-door one (an arena's card shows on it). */
+int mu_lobby_css_friends4(void)
+{
+    return mu_lobby_css() && lobby.view_ok && !(lobby.view.mode & MU_LOBBY_M_DOUBLES);
+}
+
 const MuLobbyView* mu_lobby_read(void)
 {
     if (!lobby.major) return NULL;

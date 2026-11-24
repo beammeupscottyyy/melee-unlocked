@@ -40,10 +40,10 @@ def bot_script(index, hand=False):
     hand_steps = ["400 sx=-127", "560", "600 sy=-127", "606", "640 sy=-127", "646",
                   "700 A", "706", "900 B", "906"] if hand else []
     return "\n".join([
-        "# The online menu opens on YouGame's page: Z turns to Slippi's page (Direct, Unranked, Teams,",
-        "# Party) with the cursor on Unranked, one row up is Direct. On the Direct CSS (scene 8) move onto",
-        "# a character and pick it. No Start: the room starts the search and locks the pick in.",
-        "300 Z", "306", "400 sy=80", "408", "480 A", "490",
+        "# The online menu opens on Slippi's page (YouGame's rows are closed here and the test room's Slippi",
+        "# side is signed in) with the cursor on Unranked; one row up is Direct. On the Direct CSS (scene 8)",
+        "# move onto a character and pick it. No Start: the room starts the search and locks the pick in.",
+        "400 sy=80", "408", "480 A", "490",
         "@scene 8", "60 sx=61 sy=127", "77", "100 A", "110", *hand_steps,
         "@match", "@loop 240", "0", f"{run_from} sx=-127", "238", ""])
 

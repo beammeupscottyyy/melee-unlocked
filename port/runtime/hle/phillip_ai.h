@@ -17,6 +17,11 @@ bool act(const MuGhostObs& obs, MuGhostAct& out);  // false: no policy for this 
 // Always: each is downloaded the first time its matchup is played. Never: only the lighter ones play.
 enum StrongerChoice { kStrongerAsk = 0, kStrongerAlways = 1, kStrongerNever = 2 };
 void set_stronger_choice(int choice);
+// Frames added to a Pro AI's own reaction (its model's delay, 18 for most): 0 plays as it was trained,
+// more makes it react later (Wens, 11-23: the practice CPU's Reaction row turned the pro off).
+constexpr int kMaxExtraDelay = 40;
+void set_extra_delay(int frames);
+int extra_delay();
 int stronger_choice();
 // One pro's stronger policies (pro < 0: every pro's): how many there are, how many are not
 // downloaded yet and their size, and whether a download is running.
