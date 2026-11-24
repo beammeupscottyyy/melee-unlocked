@@ -7,7 +7,14 @@
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/jobj.h>
 
-unsigned int mu_hud_scales_abi(void);   /* mu_online_abi.c: stock | damage << 8, percent */
+unsigned int mu_hud_scales_abi(void);   /* mu_online_abi.c: stock | damage << 8, percent; bit 16 hide percents */
+
+/* Damage percents: Hidden (UnclePunch's Hide HUD, owner 11-24): the percent and emblem draws are left out
+ * (if/ifstatus.c); the HUD is still made and runs, so the stock steal's check and everything else stay. */
+int mu_hud_percents_hidden(void)
+{
+    return (mu_hud_scales_abi() >> 16) & 1;
+}
 
 typedef struct MuHudRoot {
     HSD_JObj* root;

@@ -27,12 +27,13 @@ static int tournament_offered; /* hello.tournament availability, refreshed by th
 /* The two pages (owner's pick 11-18; Z flips between them): YouGame's rows, Tournament only when offered,
  * then Slippi's own five. The labels say the service: "YouGame Ranked", "Slippi Ranked" (mu_online_pages.h). */
 static const int mu_online_top_rows[] = {
-    MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_OPT_FRIENDS,
+    MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED,
     /* YouGame Doubles is back (11-21: YouGame says it is ready). 0.9.990 left the row out while
-     * YouGame's server had native Doubles off. */
+     * YouGame's server had native Doubles off. Above Friends (owner 11-23): the searches first. */
 #if defined(MELEE_DOUBLES)
     MU_SLP_OPT_DOUBLES,
 #endif
+    MU_SLP_OPT_FRIENDS,
 #if MU_SQUAD
     /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
 #ifndef MU_NO_SLIPPI

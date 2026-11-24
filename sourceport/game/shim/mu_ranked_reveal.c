@@ -352,6 +352,9 @@ void mu_ranked_reveal_frame(void)
         reveal_close(); memset(s, 0, sizeof *s); return;
     }
     if (mu_slippi_css_scene_request()) { reveal_close(); return; }
+    /* The CSS rank panel plays the result as Slippi's RankInfo does (mu_ranked_rank.c): the boxed
+     * reveal that sat over it is not drawn any more (it covered the panel's own text). */
+    reveal_close(); return;
     s->reduced = mu_rank_badge_reduced_motion();
     if (mu_ranked_read_ranks(&ranks)) reveal_accept(s, &ranks.result);
     else {

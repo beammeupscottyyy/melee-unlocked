@@ -298,6 +298,8 @@ int presented_test_fill();
 void set_hud_scales(int stocks_percent, int damage_percent, bool pal_stocks);
 // The same sizes for the native game (MuHostApi.hud_scales): stock | damage << 8, percent.
 uint32_t hud_scales_packed();
+// Damage percents: Hidden (Source Port): the players' percents and emblems are not drawn (bit 16 above).
+void set_hide_percents(bool on);
 // "Low poly fighters" (RenderOptions::low_poly_fighters), published the same way: the native game
 // reads it through MuHostApi.display_options, the Static Recomp's parts hook (host.cpp) reads it live.
 void set_low_poly_fighters(bool on);

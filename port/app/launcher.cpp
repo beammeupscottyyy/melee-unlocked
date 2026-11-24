@@ -20,6 +20,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <sddl.h>
+#include <psapi.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <intrin.h>
@@ -30,6 +31,7 @@
 #include <set>
 #include <sstream>
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cstdarg>
 #include <cstdint>
@@ -51,8 +53,15 @@
 #include "launch_process.h"
 #include "launcher_engine.h"
 #include "launcher_lobby.h"
+#include "launcher_yglobby.h"
+#include "launcher_egg.h"
+#include "launcher_pad.h"
+#include "launcher_melee_assets.h"
+#include "launcher_melee_look.h"
+#include "launcher_skin.h"
 #include "launcher_lobby_p2p.h"
 #include "launcher_yougame.h"
+#include "launcher_yougame_app.h"   // helper_main: the hidden copy that talks to the YouGame app
 #include "launcher_yougame_web.h"   // raise_sign_in: Connect pressed while the sign-in window is open
 #include "launcher_theme.h"
 #include "launcher_replay_data.h"
@@ -73,6 +82,7 @@ inline int mu_message_box(HWND owner, const wchar_t* text, const wchar_t* captio
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "version.lib")
@@ -140,6 +150,13 @@ HWND g_iso_edit, g_play_btn, g_slippi_btn, g_update_btn, g_versions_btn, g_log, 
 HFONT g_font, g_font_big, g_font_mono, g_font_mark, g_font_nav, g_font_label, g_font_small;
 HICON g_mark = nullptr;          // IDI_MELEE_MARK, the wordmark drawn at the top of the rail
 HBRUSH g_br_field, g_br_log;
+bool brawl_pages(); COLORREF bo(COLORREF c);
+HBRUSH field_brush() {
+  if (!brawl_pages()) return g_br_field;
+  static HBRUSH b = nullptr; static COLORREF c = 0; const COLORREF want = bo(C_FIELD);
+  if (!b || c != want) { if (b) DeleteObject(b); b = CreateSolidBrush(want); c = want; }
+  return b;
+}
 HBITMAP g_dog = nullptr;         // Bailey cut out of her white plate, 32bpp premultiplied
 int g_dog_w = 0, g_dog_h = 0;
 RECT g_dog_rect{};              // where she was last drawn: clicking her changes the picture
@@ -200,6 +217,8 @@ int g_tab = 0, g_nav_hot = -1;
 int g_seg_hot = -1;              // the GAME BUILD segment under the mouse, when a click would pick it
 bool g_tracking = false;
 int g_dpi = 96;
+COLORREF g_skin_color = RGB(0x4C, 0x5F, 0xD5);   // the Brawl Online look's colour (Melee blue, the owner's default)
+int g_skin_w = 0, g_skin_h = 0;   // client size at 96 dpi, 0 = the mockup's 1264 x 711
 int S(int v) { return MulDiv(v, g_dpi, 96); }
 
 std::wstring widen(const std::string& s) { int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0); std::wstring w(n ? n - 1 : 0, 0); if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n); return w; }
@@ -308,8 +327,13 @@ void load_ini() {
       else if (line == "replayhideshort=1") g_replay_hide_short = true;
       else if (line.rfind("replaysort=", 0) == 0) g_replay_sort = std::clamp(std::atoi(line.c_str() + 11), 0, 3);
       else if (line.rfind("lobbyopen=", 0) == 0) g_lobby_prefs.open_to = line.substr(10);
+      else if (line == "lobbypreview=1") launcher::yglobby::set_preview(true);
+      else if (line == "lobbyelo=1") launcher::yglobby::set_elo(true);
+      else if (line.rfind("look=", 0) == 0) launcher::melee_look::set_look(std::atoi(line.c_str() + 5));
+      else if (line.rfind("skinsize=", 0) == 0) { int w = 0, h = 0; if (std::sscanf(line.c_str() + 9, "%d,%d", &w, &h) == 2 && w >= 980 && h >= 560 && w <= 8000 && h <= 5000) { g_skin_w = w; g_skin_h = h; } }
       else if (line.rfind("lobbyiso=", 0) == 0) g_lobby_prefs.custom_iso = line.substr(9);
       else if (line.rfind("lobbyisoname=", 0) == 0) g_lobby_prefs.custom_name = line.substr(13);
+      else if (line.rfind("skincolor=#",0)==0 && line.size()==17) { const unsigned v=std::strtoul(line.c_str()+11,nullptr,16); g_skin_color=RGB((v>>16)&255,(v>>8)&255,v&255); }
       else if (line.rfind("accent=#",0)==0 && line.size()==14) {
         unsigned value=0; if(std::sscanf(line.c_str()+8,"%6x",&value)==1)
           launcher::theme::accent=RGB((value>>16)&255,(value>>8)&255,value&255);
@@ -347,6 +371,10 @@ void save_ini() {
     if (!g_replay_folder.empty()) f << "replaydir=" << g_replay_folder << "\n";
     if (g_replay_sort != 0) f << "replaysort=" << g_replay_sort << "\n";
     if (g_replay_hide_short) f << "replayhideshort=1\n";
+    if (launcher::yglobby::preview()) f << "lobbypreview=1\n";
+    if (launcher::yglobby::elo()) f << "lobbyelo=1\n";
+    f << "look=" << launcher::melee_look::look() << "\n";
+    if (g_skin_w) f << "skinsize=" << g_skin_w << "," << g_skin_h << "\n";
     // Kept so that browsing for a disc does not silently undo a hand-set override.
     if (g_cpu_build != CPU_AUTO) f << "cpubuild=" << g_cpu_build << "\n";
     f << "engine=" << g_engine << "\n";   // always: no line means a player from before the Source Port default
@@ -357,6 +385,7 @@ void save_ini() {
     if (!g_lobby_prefs.open_to.empty() && g_lobby_prefs.open_to != "vanilla") f << "lobbyopen=" << g_lobby_prefs.open_to << "\n";
     if (!g_lobby_prefs.custom_iso.empty()) f << "lobbyiso=" << g_lobby_prefs.custom_iso << "\nlobbyisoname=" << g_lobby_prefs.custom_name << "\n";
     f << launcher::yougame::ini_lines();   // YouGame: the environment and the protected session
+    { char sc[24]; std::snprintf(sc,sizeof sc,"skincolor=#%02X%02X%02X",GetRValue(g_skin_color),GetGValue(g_skin_color),GetBValue(g_skin_color)); f << sc << "\n"; }
     char color[16]; std::snprintf(color,sizeof color,"accent=#%02X%02X%02X",GetRValue(launcher::theme::accent),GetGValue(launcher::theme::accent),GetBValue(launcher::theme::accent));
     f << color << "\n";
   }
@@ -542,6 +571,37 @@ std::string unsaved_replay_dir() {
 // The folder replays are saved in: the player's choice (Replays page, "Replay folder"), else Replays
 // next to the launcher.
 std::string replay_folder() { return g_replay_folder.empty() ? g_dir + "\\Replays" : g_replay_folder; }
+// Your main for the lobby card, until you pick one: in your newest 300 replays, the player in the most of them (you)
+// and the character they played most. Needs 5 games under one name or code.
+void guess_main_from_replays() {
+  if (launcher::yglobby::main_picked()) return;
+  std::thread([folder = replay_folder()] {
+    namespace fs = std::filesystem; std::error_code ec;
+    std::vector<std::pair<fs::file_time_type, fs::path>> files;
+    for (fs::recursive_directory_iterator it(fs::path(widen(folder)), fs::directory_options::skip_permission_denied, ec), end; !ec && it != end; it.increment(ec)) {
+      std::error_code e2;
+      if (it->is_regular_file(e2) && it->path().extension() == L".slp") files.push_back({it->last_write_time(e2), it->path()});
+      if (files.size() > 5000) break;
+    }
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (files.size() > 300) files.resize(300);
+    std::map<std::string, std::map<int, int>> used; std::map<std::string, int> games;
+    for (const auto& f : files) {
+      const auto info = launcher::replay::inspect(f.second); if (!info.valid) continue;
+      for (const auto& pl : info.players) {
+        const std::string id = pl.code;   // a connect code: a real player (local games name ports "Player 1")
+        if (id.empty() || pl.character < 0 || pl.character > 25) continue;
+        ++games[id]; ++used[id][pl.character];
+      }
+    }
+    std::string you; int most = 0;
+    for (const auto& g : games) if (g.second > most) { most = g.second; you = g.first; }
+    if (most < 5) return;
+    int best = -1, times = 0;
+    for (const auto& c : used[you]) if (c.second > times) { times = c.second; best = c.first; }
+    if (best >= 0 && !launcher::yglobby::main_picked()) launcher::yglobby::set_my_main(best);
+  }).detach();
+}
 std::string replay_dir_for_game() {
   if (g_save_replays) return replay_folder();
   std::error_code ec;
@@ -622,10 +682,56 @@ COLORREF lerp(COLORREF a, COLORREF b, int num, int den) {
              GetBValue(a) + (GetBValue(b) - GetBValue(a)) * num / den);
 }
 
-void fill(HDC dc, RECT r, COLORREF c) { HBRUSH b = CreateSolidBrush(c); FillRect(dc, &r, b); DeleteObject(b); }
+// The Brawl Online look's pages: beside its sidebar the launcher's own pages (Game, Replays, Mods, Build) wear its
+// colours. The basic drawing below swaps Classic's palette for the look's; Classic draws as it always did.
+bool brawl_pages() { return launcher::skin::shown() && launcher::skin::is_compact(); }
+const launcher::skin::Look& bo_look() {
+  static launcher::skin::Look l{}; static ULONGLONG at = 0;
+  if (!at || GetTickCount64() - at > 100) { l = launcher::skin::look(); at = GetTickCount64(); }   // the colour can change (the picker)
+  return l;
+}
+COLORREF shade(COLORREF c, double k) { return RGB((int)(GetRValue(c) * k), (int)(GetGValue(c) * k), (int)(GetBValue(c) * k)); }
+COLORREF bo(COLORREF c) {
+  if (!brawl_pages()) return c;
+  const auto& L = bo_look();
+  if (c == C_CONTENT_TOP) return L.page_top;
+  if (c == C_CONTENT_BOT) return L.page;
+  if (c == RGB(0x13, 0x1A, 0x2A) || c == RGB(0x14, 0x1C, 0x2C) || c == C_BTN) return L.raised;   // cards (Replays, Mods), buttons
+  if (c == C_BTN_DOWN) return L.page;
+  if (c == C_FIELD || c == C_LOG_BG) return shade(L.page, 0.72);
+  if (c == C_FIELD_BORDER || c == C_BTN_BORDER || c == C_DIVIDER || c == C_SEP) return L.line;
+  if (c == C_TEXT) return L.text;
+  if (c == C_DIM || c == C_LOG_TEXT) return L.text2;
+  if (c == C_FAINT) return L.dim;
+  if (c == launcher::theme::top()) return L.accent;
+  if (c == launcher::theme::bottom()) return shade(L.accent, 0.8);
+  return c;
+}
+// A message box centred on the launcher window as it is now (Windows centres it on where the owner was).
+HWND g_box_owner = nullptr; HHOOK g_box_hook = nullptr;
+LRESULT CALLBACK box_hook(int code, WPARAM wp, LPARAM lp) {
+  if (code == HCBT_ACTIVATE) {
+    const HWND box = (HWND)wp; RECT o{}, b{};
+    if (g_box_owner && GetWindowRect(g_box_owner, &o) && GetWindowRect(box, &b)) {
+      const int w = b.right - b.left, h = b.bottom - b.top;
+      SetWindowPos(box, nullptr, o.left + (o.right - o.left - w) / 2, o.top + (o.bottom - o.top - h) / 2, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    UnhookWindowsHookEx(g_box_hook); g_box_hook = nullptr;
+  }
+  return g_box_hook ? CallNextHookEx(g_box_hook, code, wp, lp) : 0;
+}
+int centered_box(HWND owner, const wchar_t* text, const wchar_t* title, UINT flags) {
+  g_box_owner = owner && IsWindowVisible(owner) && !IsIconic(owner) ? owner : nullptr;
+  if (g_box_owner && !g_box_hook) g_box_hook = SetWindowsHookExW(WH_CBT, box_hook, nullptr, GetCurrentThreadId());
+  const int r = MessageBoxW(owner, text, title, flags);
+  if (g_box_hook) { UnhookWindowsHookEx(g_box_hook); g_box_hook = nullptr; }
+  return r;
+}
+void fill(HDC dc, RECT r, COLORREF c) { HBRUSH b = CreateSolidBrush(bo(c)); FillRect(dc, &r, b); DeleteObject(b); }
 
 // Vertical gradient, one FillRect per row. Small window, so the simple version is fast enough.
 void vgrad(HDC dc, RECT r, COLORREF top, COLORREF bot) {
+  top = bo(top); bot = bo(bot);
   int h = r.bottom - r.top;
   for (int y = 0; y < h; ++y) {
     RECT row{r.left, r.top + y, r.right, r.top + y + 1};
@@ -636,7 +742,12 @@ void vgrad(HDC dc, RECT r, COLORREF top, COLORREF bot) {
 // The content column's background colour at a given client y. Owner-drawn buttons use this to
 // reproduce the parent's gradient inside their own rect, so their rounded corners blend instead of
 // showing a box.
-COLORREF content_bg_at(int y) { return lerp(C_CONTENT_TOP, C_CONTENT_BOT, y, S(WIN_H) - 1); }
+// The fields' brush: Classic's, or one of the look's colour (kept until that colour changes).
+HBRUSH field_brush();
+COLORREF content_bg_at(int y) {
+  if (brawl_pages()) { const auto& L = bo_look(); return lerp(L.page_top, L.page, std::min(y, S(320)), S(320)); }   // the look's page gradient
+  return lerp(C_CONTENT_TOP, C_CONTENT_BOT, y, S(WIN_H) - 1);
+}
 
 // A rounded rectangle with an optional vertical gradient fill and a 1px border, supersampled 3x so
 // the corners come out smooth. The destination is stretched into the scratch bitmap first, which is
@@ -645,6 +756,8 @@ void round_rect(HDC dc, RECT r, int radius, COLORREF top, COLORREF bot, COLORREF
   const int SS = 3;
   int w = r.right - r.left, h = r.bottom - r.top;
   if (w <= 0 || h <= 0) return;
+  if (top != NO_FILL) { top = bo(top); bot = bo(bot); }
+  if (border != NO_FILL) border = bo(border);
   HDC md = CreateCompatibleDC(dc);
   HBITMAP bmp = CreateCompatibleBitmap(dc, w * SS, h * SS);
   HGDIOBJ oldb = SelectObject(md, bmp);
@@ -672,9 +785,19 @@ void round_rect(HDC dc, RECT r, int radius, COLORREF top, COLORREF bot, COLORREF
 }
 
 void draw_text(HDC dc, const std::wstring& s, RECT r, HFONT f, COLORREF col, UINT fmt, int tracking = 0) {
+  if (brawl_pages()) {   // the Play page's sizes, and no spread letters
+    tracking = 0;
+    static HFONT body = nullptr, small_ = nullptr;
+    if (!body) {
+      LOGFONTW lf{}; GetObjectW(g_font, sizeof lf, &lf);
+      lf.lfHeight = -S(13); body = CreateFontIndirectW(&lf);
+      lf.lfHeight = -S(12); small_ = CreateFontIndirectW(&lf);
+    }
+    (void)body; (void)small_;   // the pages lay their text out for their own sizes: those stay
+  }
   HGDIOBJ old = SelectObject(dc, f);
   SetBkMode(dc, TRANSPARENT);
-  SetTextColor(dc, col);
+  SetTextColor(dc, bo(col));
   if (tracking) SetTextCharacterExtra(dc, tracking);
   // Fixed English text shows in the player's language, line by line; anything else (paths,
   // names) as is.
@@ -686,7 +809,7 @@ void draw_text(HDC dc, const std::wstring& s, RECT r, HFONT f, COLORREF col, UIN
     shown += launcher::lang::txw(s.substr(at, end - at).c_str());
     at = end + 1;
   }
-  DrawTextW(dc, shown.c_str(), -1, &r, fmt);
+  if (!launcher::melee_look::text(dc, shown, r, f, col, fmt)) DrawTextW(dc, shown.c_str(), -1, &r, fmt);
   if (tracking) SetTextCharacterExtra(dc, 0);
   SelectObject(dc, old);
 }
@@ -878,6 +1001,7 @@ void load_rail_art() {
   const std::string custom = rail_image_path();
   if (!custom.empty()) g_dog = load_art_file(widen(custom), box_w, box_h, g_dog_w, g_dog_h);
   if (!g_dog) g_dog = load_art(IDB_BAILEY, box_w, box_h, g_dog_w, g_dog_h);
+  launcher::skin::set_rail_art(g_dog, g_dog_w, g_dog_h);
   g_wordmark = load_art(IDB_MELEE_MARK, S(RAIL_W - 44), S(NAV_Y - 22), g_wordmark_w, g_wordmark_h);
 }
 
@@ -1088,7 +1212,10 @@ void paint_play(HDC dc) {
       COLORREF top = C_BTN, bot = C_BTN, border = C_BTN_BORDER, text = C_DIM;
       if (i == on) { top = C_ACC_HI; bot = C_ACC_LO; border = NO_FILL; text = C_PLAY_TEXT; }
       else if ((i != 1 && !installed) || (i == 1 && !recomp) || (i == 2 && !vanilla_supported())) { top = bot = RGB(0x1A, 0x21, 0x32); border = RGB(0x28, 0x31, 0x47); text = RGB(0x5C, 0x68, 0x7E); }
-      round_rect(dc, r, 7, top, bot, border);
+      // In the Melee looks the choices wear Melee's frame too, as every button on the page does.
+      if (brawl_pages()) { RECT g = r; InflateRect(&g, -S(3), 0);   // a gap between the choices
+        launcher::skin::button(dc, g_main, g, launcher::lang::txw(names[i]), i == on, false, i != on && text == RGB(0x5C, 0x68, 0x7E)); continue; }
+      if (!launcher::melee_look::button(dc, r, top, bot, i == on ? launcher::theme::glow() : border == NO_FILL ? C_BTN_BORDER : border)) round_rect(dc, r, 7, top, bot, border);
       draw_text(dc, names[i], r, g_font_small, text, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
   }
@@ -1204,6 +1331,67 @@ void settings_standby_stop();
 #include "launcher_replays.inl"
 #include "launcher_match_character.inl"
 #include "launcher_theme_picker.inl"
+void select_tab(int idx);
+// The Brawl Online look over the whole window, sized as that launcher is (1264x711).
+// Holds the window's drawing while the look changes (size, controls, skin), then draws it once: no frame of the
+// old look at the new size, or the new look half drawn.
+struct HoldDrawing {
+  bool held;
+  HoldDrawing() : held(g_main && IsWindowVisible(g_main)) { if (held) SendMessageW(g_main, WM_SETREDRAW, FALSE, 0); }
+  ~HoldDrawing() {
+    if (!held) return;
+    SendMessageW(g_main, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(g_main, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+  }
+};
+// The Brawl Online look's window can be resized (from 980 x 560) and maximised; it keeps the size it was given.
+// Classic and the pages beside the skin's sidebar keep their fixed sizes.
+constexpr LONG kFixedFrame = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+void set_resizable(bool on) {
+  const LONG_PTR st = GetWindowLongPtrW(g_main, GWL_STYLE);
+  const LONG_PTR want = on ? (st | WS_THICKFRAME | WS_MAXIMIZEBOX) : (st & ~(LONG_PTR)(WS_THICKFRAME | WS_MAXIMIZEBOX));
+  if (!on && IsZoomed(g_main)) ShowWindow(g_main, SW_RESTORE);
+  if (want != st) { SetWindowLongPtrW(g_main, GWL_STYLE, want); SetWindowPos(g_main, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED); }
+}
+void show_skin() {
+  HoldDrawing hold;
+  set_resizable(true);
+  RECT size{0, 0, S(g_skin_w ? g_skin_w : 1264), S(g_skin_h ? g_skin_h : 711)}; AdjustWindowRect(&size, kFixedFrame | WS_THICKFRAME | WS_MAXIMIZEBOX, FALSE);
+  RECT work{}; if (!g_launcher_test) SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+  int w = size.right - size.left, h = size.bottom - size.top;
+  if (work.right > work.left) { w = std::min(w, int(work.right - work.left)); h = std::min(h, int(work.bottom - work.top)); }
+  RECT cur{}; GetWindowRect(g_main, &cur);
+  SetWindowPos(g_main, nullptr, cur.left, cur.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+  launcher::yglobby::hide();
+  launcher::skin::show();
+}
+// A look picked: saved, and the window changed to it in one paint.
+void apply_look(int look) {
+  if (look == launcher::melee_look::look()) return;
+  HoldDrawing hold;
+  launcher::melee_look::set_look(look);
+  save_ini();
+  if (look == launcher::melee_look::kBrawlOnline) show_skin();
+  else { launcher::skin::hide(); const int t = g_tab; g_tab = -1; select_tab(t < 0 ? 0 : t); if (t == 2) launcher::yglobby::open(); }
+}
+// The colour wheel's menu: the launcher's look, then its colour.
+void show_look_menu() {
+  HMENU m = CreatePopupMenu();
+  const int now = launcher::melee_look::look();
+  AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"Look");
+  AppendMenuW(m, MF_STRING | (now == 0 ? MF_CHECKED : 0), 1, L"Classic");
+  AppendMenuW(m, MF_STRING | (now == 1 ? MF_CHECKED : 0), 2, L"Classic, Melee font");
+  AppendMenuW(m, MF_STRING | (now == 2 ? MF_CHECKED : 0), 3, L"Brawl Online by sarahkittyy");
+  AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(m, MF_STRING, 4, L"Launcher color");
+  RECT b{}; GetWindowRect(GetDlgItem(g_main, ID_THEME), &b);
+  UINT align = TPM_BOTTOMALIGN | TPM_RIGHTALIGN; POINT at{b.right, b.top};
+  if (launcher::skin::shown()) { GetCursorPos(&at); at.y -= S(14); align = TPM_BOTTOMALIGN | TPM_LEFTALIGN; }   // above the palette tool
+  const int pick = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | align, at.x, at.y, 0, g_main, nullptr);
+  DestroyMenu(m);
+  if (pick == 4) { open_theme_picker(); return; }
+  if (pick >= 1 && pick <= 3 && pick - 1 != now) apply_look(pick - 1);
+}
 #include "launcher_crash.inl"
 // Standard Win32 printing also renders the controls when the test window is off the desktop.
 // Bottom of the z-order first, so a child over another (the lobby banner over the Lobby page)
@@ -1354,7 +1542,7 @@ void yougame_connect() {
     return;
   }
   if (launcher::yougame::account().signed_in) {
-    if (MessageBoxW(g_main, launcher::lang::txw(L"Disconnect your YouGame account from this launcher?").c_str(), L"YouGame",
+    if (centered_box(g_main, launcher::lang::txw(L"Disconnect your YouGame account from this launcher?").c_str(), L"YouGame",
                     MB_YESNO | MB_ICONQUESTION) == IDYES)
       std::thread([] { launcher::yougame::sign_out(); }).detach();   // the browser view's folder goes too
     return;
@@ -1486,6 +1674,11 @@ void draw_button(DRAWITEMSTRUCT* di) {
     return;
   }
 
+  if (brawl_pages()) {   // the look's button: the accent ones (PLAY) in Melee's frame and font, the others outlined
+    wchar_t label[128]{}; GetWindowTextW(di->hwndItem, label, 128);
+    launcher::skin::button(di->hDC, g_main, r, launcher::lang::txw(label), primary, down, disabled);
+    return;
+  }
   COLORREF top, bot, border = NO_FILL, text;
   if (primary) {
     top = C_PLAY_HI; bot = C_PLAY_LO; text = C_PLAY_TEXT;
@@ -1495,14 +1688,16 @@ void draw_button(DRAWITEMSTRUCT* di) {
     top = bot = down ? C_BTN_DOWN : C_BTN; border = C_BTN_BORDER; text = C_TEXT;
     if (disabled) { top = bot = RGB(0x1A, 0x21, 0x32); border = RGB(0x28, 0x31, 0x47); text = RGB(0x5C, 0x68, 0x7E); }
   }
-  round_rect(di->hDC, r, primary ? 10 : 7, top, bot, border);
+  if (!launcher::melee_look::button(di->hDC, r, top, bot, primary ? launcher::theme::glow() : (disabled ? RGB(0x33, 0x3D, 0x55) : RGB(0x4D, 0x5B, 0x80))))
+    round_rect(di->hDC, r, primary ? 10 : 7, top, bot, border);
   if (di->itemState & ODS_FOCUS) {
     RECT f{r.left + S(3), r.top + S(3), r.right - S(3), r.bottom - S(3)};
     round_rect(di->hDC, f, primary ? 8 : 5, NO_FILL, NO_FILL, primary ? C_PLAY_TEXT : C_ACC_LO);   // focus ring
   }
   wchar_t cap[128]{}; GetWindowTextW(di->hwndItem, cap, 128);
-  draw_text(di->hDC, cap, r, primary ? g_font_big : g_font, text,
-            DT_CENTER | DT_SINGLELINE | DT_VCENTER, primary ? S(2) : 0);
+  if (!launcher::melee_look::caption(di->hDC, launcher::lang::txw(cap), r, primary ? g_font_big : g_font, text, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS))
+    draw_text(di->hDC, cap, r, primary ? g_font_big : g_font, text,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER, primary ? S(2) : 0);
 }
 
 
@@ -1523,7 +1718,11 @@ void select_tab(int idx) {
   for (HWND h : g_build) if (h) ShowWindow(h, idx == 1 ? SW_SHOW : SW_HIDE);
   replay_layout();
   if (idx != 2) launcher::lobby::hide();
+  if (idx != 2) launcher::yglobby::hide();
+  const bool skin_full = launcher::skin::shown() && !launcher::skin::is_compact();
+  if (previous != idx) log_line("page: %d -> %d%s", previous, idx, launcher::skin::shown() ? (skin_full ? " (Brawl Online look)" : " (beside its sidebar)") : "");   // what opened which page
   if (g_main && previous != idx) {
+    set_resizable(false);
     RECT size{0,0,S(idx==2?LOBBY_W:(idx==3?REPLAY_W:(idx==4?MODS_W:WIN_W))),S(idx==2?LOBBY_H:(idx==3?REPLAY_H:(idx==4?MODS_H:WIN_H)))};
     AdjustWindowRect(&size,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
     int width=size.right-size.left, height=size.bottom-size.top;
@@ -1544,6 +1743,7 @@ void select_tab(int idx) {
   mod_manager::show_page(idx == 4);
   if (idx == 0 && (!g_slippi_missing || vanilla_active())) ShowWindow(g_slippi_btn, SW_HIDE);
   if (idx != 0) ShowWindow(g_update_btn, SW_HIDE);
+  if (skin_full && idx != 2) launcher::skin::compact(idx == 1 ? 5 : idx == 3 ? 3 : idx == 4 ? 4 : 2);   // e.g. Play found no game: Build, with the sidebar
   if (g_main) InvalidateRect(g_main, nullptr, FALSE);
 }
 
@@ -1574,6 +1774,7 @@ void build_thread() {
 }
 
 void start_build() {
+  log_line("build: started (page %d)", g_tab);
   if (g_building || g_iso.empty()) return;
   g_building = true;
   EnableWindow(g_build_btn, FALSE); EnableWindow(g_play_btn, FALSE);
@@ -1606,7 +1807,7 @@ void report_launch_error(DWORD error, const std::string& exe, const std::string&
       L"\n\nPlease include this message when reporting the problem.";
   log_line("Launch failed: Windows error %lu; executable=%s; directory=%s",
            error, exe.c_str(), cwd.c_str());
-  MessageBoxW(g_main, message.c_str(), L"Melee Unlocked Launcher", MB_ICONERROR);
+  centered_box(g_main, message.c_str(), L"Melee Unlocked Launcher", MB_ICONERROR);
 }
 
 // The settings window waits hidden in the background, fully started, so the Settings button only
@@ -1659,12 +1860,13 @@ void choose_rail_image() {
     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
     int w = 0, h = 0;
     HBITMAP test = load_art_file(file, 64, 64, w, h);
-    if (!test) { MessageBoxW(g_main, L"That picture could not be opened.", L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING); return; }
+    if (!test) { centered_box(g_main, L"That picture could not be opened.", L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING); return; }
     DeleteObject(test);
     // A copy beside the launcher, so the picture stays when the original is moved or deleted.
     for (const char* old : {".png", ".jpg", ".jpeg", ".bmp", ".gif"}) DeleteFileW(widen(g_dir + "\\rail-image" + old).c_str());
     CopyFileW(file, (widen(g_dir + "\\rail-image") + ext).c_str(), FALSE);
   } else return;
+  launcher::skin::set_rail_art(nullptr, 0, 0);
   if (g_dog) { DeleteObject(g_dog); g_dog = nullptr; }
   g_dog_rect = RECT{};
   load_rail_art();
@@ -1682,6 +1884,7 @@ void open_settings(const std::string& tab) {
   if (!tab.empty()) settings_standby_stop();
   if (g_settings_standby && WaitForSingleObject(g_settings_standby, 0) == WAIT_TIMEOUT && g_settings_standby_exe == g_game_exe) {
     AllowSetForegroundWindow(GetProcessId(g_settings_standby));
+    SetPriorityClass(g_settings_standby, ABOVE_NORMAL_PRIORITY_CLASS);   // smooth while the PC is busy (a build)
     SetEvent(g_settings_show);
     CloseHandle(g_settings_standby); g_settings_standby = nullptr;
     SetTimer(g_main, ID_TIMER_STANDBY, 3000, nullptr);
@@ -1698,6 +1901,7 @@ void open_settings(const std::string& tab) {
     report_launch_error(error, g_game_exe, cwd);
     return;
   }
+  SetPriorityClass(pi.hProcess, ABOVE_NORMAL_PRIORITY_CLASS);   // the settings window stays smooth while the PC is busy
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
 }
@@ -1840,11 +2044,15 @@ bool game_exe_version_mismatch(const std::string& exe) {
   const std::string text = name + " in this folder is version " + found + ", but this launcher is version " MELEE_PORT_VERSION
       ". An update did not replace it (the file was in use, or antivirus held it).\n\nClose the game and the launcher, then "
       "extract the whole " MELEE_PORT_VERSION " release zip over this folder again.";
-  MessageBoxW(g_main, widen(text).c_str(), L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING);
+  centered_box(g_main, widen(text).c_str(), L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING);
   return true;
 }
 
+bool test_scripted() { return g_launcher_test && std::getenv("MELEE_LAUNCHER_TEST_SCRIPT"); }
+void test_action(const char* what) { if (FILE* f = std::fopen("launcher-actions.log", "ab")) { std::fprintf(f, "%s\n", what); std::fclose(f); } }
 void start_game() {
+  if (test_scripted()) {   // test runs: what Play would start, logged instead of started
+    const std::string exe = game_exe(); test_action(("start_game " + exe.substr(exe.find_last_of("\/") + 1) + (file_exists(exe) ? " (there)" : " (missing: would open Build)")).c_str()); return; }
   if (g_playing || g_iso.empty()) return;
   if (yougame_sign_in_for_play()) return;   // the launcher's own sign-in first, once; the game starts when it closes
   if (const std::wstring problem = base_disc_problem(g_iso); !problem.empty()) {
@@ -1856,7 +2064,7 @@ void start_game() {
       mod_manager::open();
       if (!inside) std::thread(mod_manager::install_file, widen(g_iso), std::string(), std::string()).detach();
     }
-    MessageBoxW(g_main, problem.c_str(), L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING);
+    centered_box(g_main, problem.c_str(), L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING);
     return;
   }
   g_game_exe = !g_mod_launch_iso.empty() ? (g_mod_launch_engine == "source" ? source_exe_in(source_exe_dir()) : static_recomp_exe()) : game_exe();
@@ -1865,9 +2073,9 @@ void start_game() {
   }
   if (!file_exists(g_game_exe) && !g_mod_launch_iso.empty()) {
 #ifdef MELEE_NO_SLIPPI   // one game here: it is that game which is missing
-    MessageBoxW(g_main,L"The game is not installed beside this launcher. Install it before playing this mod.",L"Mods",MB_ICONINFORMATION);
+    centered_box(g_main,L"The game is not installed beside this launcher. Install it before playing this mod.",L"Mods",MB_ICONINFORMATION);
 #else
-    MessageBoxW(g_main,L"The required game engine is not installed. Install it before playing this mod.",L"Mods",MB_ICONINFORMATION);
+    centered_box(g_main,L"The required game engine is not installed. Install it before playing this mod.",L"Mods",MB_ICONINFORMATION);
 #endif
     g_mod_launch_iso.clear(); g_mod_launch_engine.clear(); g_mod_launch_kind.clear(); return;
   }
@@ -1969,7 +2177,7 @@ void launch_game_now() {
     static bool told = false;
     if (!told && !std::getenv("MELEE_LAUNCHER_TEST")) {
       told = true;
-      if (MessageBoxW(g_main, widen(app_missing).c_str(), L"YouGame extension", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+      if (centered_box(g_main, widen(app_missing).c_str(), L"YouGame extension", MB_YESNO | MB_ICONINFORMATION) == IDYES)
         ShellExecuteW(nullptr, L"open", widen(launcher::yougame::open_target()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
   }
@@ -2027,7 +2235,7 @@ void launch_game_now() {
     SetEnvironmentVariableW(L"MELEE_YOUGAME_MATCH_BRIDGE", nullptr);
   }
   if (error != ERROR_SUCCESS) {
-    launcher::lobby::game_running(false);
+    launcher::lobby::game_running(false); launcher::pad::game_running(false);
 #ifdef MELEE_NO_SLIPPI
     launcher::lobby::restart_after_match();   // no game took the lobby's port after all
 #endif
@@ -2037,7 +2245,8 @@ void launch_game_now() {
   CloseHandle(pi.hThread);
   crash_report::note_launch();
   g_playing = true;
-  launcher::lobby::game_running(true);
+  launcher::lobby::game_running(true); launcher::pad::game_running(true);
+  launcher::melee_assets::set_disc(g_iso);
   EnableWindow(g_play_btn, FALSE);
   set_text(g_play_btn, "Running");
   ShowWindow(g_main, SW_MINIMIZE);
@@ -2066,13 +2275,13 @@ void browse() {
       // told nothing (player report 11-21: "whenever I browse for an ISO it just goes to the mods tab").
       std::string why;
       if (!verify_iso(narrow(file), &why)) {
-        MessageBoxW(g_main, widen("This disc can't be used: " + why + ".\n\nMelee Unlocked needs your Melee NTSC 1.02 ISO "
+        centered_box(g_main, widen("This disc can't be used: " + why + ".\n\nMelee Unlocked needs your Melee NTSC 1.02 ISO "
                                   "(a full, unmodified disc image). Press Browse and pick that file.").c_str(),
                     L"Melee Unlocked Launcher", MB_ICONINFORMATION);
         return;
       }
       if (g_iso.empty())
-        MessageBoxW(g_main, L"This is a modded Melee disc, so it goes into Mods.\n\nTo play, Melee Unlocked also needs your "
+        centered_box(g_main, L"This is a modded Melee disc, so it goes into Mods.\n\nTo play, Melee Unlocked also needs your "
                     L"unmodified Melee NTSC 1.02 ISO: press Browse on the Play page and pick it.",
                     L"Melee Unlocked Launcher", MB_ICONINFORMATION);
       mod_manager::open(); std::thread(mod_manager::install_file, std::wstring(file), std::string(), g_iso).detach();
@@ -2109,7 +2318,7 @@ void offer_dlss5() {
                                        "Download NVIDIA's DLSS 5 model now (") + host::updater::kDlss5ModelSize +
                            ")? It goes beside the game and stays there through updates.\n\n"
                            "You can also download it any time from PC settings > Video in the game.";
-  if (MessageBoxW(g_main, widen(text).c_str(), L"Melee Unlocked Launcher", MB_YESNO | MB_ICONQUESTION) == IDYES)
+  if (centered_box(g_main, widen(text).c_str(), L"Melee Unlocked Launcher", MB_YESNO | MB_ICONQUESTION) == IDYES)
     host::updater::dlss5_model_download(g_dir);
 }
 
@@ -2140,7 +2349,7 @@ void refresh_updater() {
   } else if (st == State::UpdateAvailable && !g_update_prompted) {
     g_update_prompted = true;
     std::string text = "Melee Unlocked " + host::updater::latest_version() + " is available (you have " MELEE_PORT_VERSION ").\n\nUpdate now? The game folder is updated in place; settings, saves and replays are kept.\n\nNo keeps this version; the Update button stays on the Play page.";
-    if (MessageBoxW(g_main, widen(text).c_str(), L"Melee Unlocked Launcher", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) { settings_standby_stop(); host::updater::download_and_install(); }
+    if (centered_box(g_main, widen(text).c_str(), L"Melee Unlocked Launcher", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) { settings_standby_stop(); host::updater::download_and_install(); }
     st = host::updater::state();
   }
   std::string line = "Version " MELEE_PORT_VERSION ". " + host::updater::message() + " | " + launcher::lang::tx("What's new");
@@ -2209,7 +2418,7 @@ void show_changelog() {
   static HWND window;
   if (window && IsWindow(window)) { SetForegroundWindow(window); return; }
   if (host::updater::releases().empty()) {
-    MessageBoxW(g_main, launcher::lang::txw(L"The changelog is still loading or could not be reached. Try again shortly.").c_str(),
+    centered_box(g_main, launcher::lang::txw(L"The changelog is still loading or could not be reached. Try again shortly.").c_str(),
                 L"Melee Unlocked Launcher", MB_OK | MB_ICONINFORMATION);
     return;
   }
@@ -2248,7 +2457,7 @@ void choose_version() {
         file_exists((it->path() / "Sys" / "codehandler.bin").string())) installed.push_back(id);
   }
   if (catalog.empty() && installed.empty()) {
-    MessageBoxW(g_main, L"Version history is still loading or could not be reached. Try again shortly.", L"Melee Unlocked Launcher", MB_OK | MB_ICONINFORMATION);
+    centered_box(g_main, L"Version history is still loading or could not be reached. Try again shortly.", L"Melee Unlocked Launcher", MB_OK | MB_ICONINFORMATION);
     return;
   }
   HMENU menu = CreatePopupMenu();
@@ -2287,7 +2496,7 @@ void choose_version() {
   if (picked < 2000 || picked - 2000 >= catalog.size()) return;
   const std::string version = catalog[picked - 2000].version;
   const std::string label = "Install and select Melee Unlocked " + version + "?\n\nIt will be kept in Versions beside the current build. Your ISO, settings, saves, and replays stay shared.";
-  if (MessageBoxW(g_main, widen(label).c_str(), L"Choose game version", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+  if (centered_box(g_main, widen(label).c_str(), L"Choose game version", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
   if (host::updater::install_release(version, false, g_dir)) {
     g_rollback_consumed = false;
     InvalidateRect(g_main, nullptr, FALSE);
@@ -2353,6 +2562,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       create_replay_controls();
       select_tab(0);
       load_ini();
+      guess_main_from_replays();
       if (launcher::yougame::adopt_staging_app()) {
         log_line("yougame: only the YouGame Staging app is installed: using YouGame Staging (launcher.ini yougame_env=staging)");
         save_ini();
@@ -2423,6 +2633,67 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }).detach();
       }
 #endif   // MELEE_YOUGAME_COMING_SOON: none of YouGame starts until it opens
+      // Test runs only: open the Multiplayer Lobby page once the launcher is up (the page is set up after this).
+      if (const char* page = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_PAGE") : nullptr; page && std::string(page) == "lobby")
+        std::thread([] { Sleep(400); PostMessageW(g_main, WM_APP + 70, 0, 0); }).detach();
+      if (const char* script = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_SCRIPT") : nullptr)
+        std::thread([path = std::string(script)] {
+          auto log = [](const std::string& s) { if (FILE* f = std::fopen("launcher-script.log", "ab")) { std::fprintf(f, "%s\n", s.c_str()); std::fclose(f); } };
+          auto at = [](int x, int y, POINT* local) {   // the deepest visible child under a client point, as a click finds it
+            HWND w = g_main; POINT p{MulDiv(x, g_dpi, 96), MulDiv(y, g_dpi, 96)};
+            for (;;) { HWND c = ChildWindowFromPointEx(w, p, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT); if (!c || c == w) break; MapWindowPoints(w, c, &p, 1); w = c; }
+            *local = p; return w;
+          };
+          HWND focus = nullptr;
+          std::ifstream in(path); std::string line;
+          Sleep(1500);
+          while (std::getline(in, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream ss(line); std::string op; ss >> op; log("> " + line);
+            if (op == "wait") { int ms = 0; ss >> ms; Sleep(ms); }
+            else if (op == "move" || op == "click") {
+              int x = 0, y = 0; ss >> x >> y; POINT p{}; HWND w = at(x, y, &p); const LPARAM xy = MAKELPARAM(p.x, p.y);
+              wchar_t cls[64] = {}; GetClassNameW(w, cls, 63); char c8[64] = {}; WideCharToMultiByte(CP_UTF8, 0, cls, -1, c8, 63, nullptr, nullptr); log(std::string("  at ") + c8);
+              PostMessageW(w, WM_MOUSEMOVE, 0x4000, xy);   // marked: the script moved
+              if (op == "click") { Sleep(60); PostMessageW(w, WM_LBUTTONDOWN, MK_LBUTTON, xy); Sleep(60); PostMessageW(w, WM_LBUTTONUP, 0, xy); focus = w; }
+              Sleep(250);
+            }
+            else if (op == "type") { std::string t; std::getline(ss, t); if (!t.empty() && t[0] == ' ') t.erase(0, 1);
+              if (focus) { SendMessageW(focus, WM_SETFOCUS, 0, 0); for (char c : t) { PostMessageW(focus, WM_CHAR, (WPARAM)(unsigned char)c, 1); Sleep(30); } } Sleep(250); }
+            else if (op == "key") { int vk = 0; ss >> vk; HWND w = focus ? focus : g_main; PostMessageW(w, WM_KEYDOWN, vk, 1); PostMessageW(w, WM_KEYUP, vk, 0xC0000001); Sleep(250); }
+            else if (op == "capture") { std::string n; ss >> n; SendMessageW(g_main, WM_APP + 73, 0, (LPARAM)new std::string(n + ".bmp")); }
+            else if (op == "look") { int l = 0; ss >> l; SendMessageW(g_main, WM_APP + 74, l, 0); Sleep(500); }
+            else if (op == "size") {   // the client area becomes w x h (96 dpi px), as a player dragging the border
+              int w = 0, h = 0; ss >> w >> h; RECT r{0, 0, MulDiv(w, g_dpi, 96), MulDiv(h, g_dpi, 96)};
+              AdjustWindowRectExForDpi(&r, (DWORD)GetWindowLongPtrW(g_main, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrW(g_main, GWL_EXSTYLE), g_dpi);
+              SetWindowPos(g_main, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); Sleep(400);
+            }
+            else if (op == "min") { ShowWindow(g_main, SW_SHOWMINNOACTIVE); Sleep(400); }
+            else if (op == "restore") { ShowWindow(g_main, SW_SHOWNOACTIVATE); Sleep(400); }
+            else if (op == "wheel") {
+              int x = 0, y = 0, d = 0; ss >> x >> y >> d; POINT p{MulDiv(x, g_dpi, 96), MulDiv(y, g_dpi, 96)}; POINT local{}; HWND w = at(x, y, &local);
+              ClientToScreen(g_main, &p); PostMessageW(w, WM_MOUSEWHEEL, MAKEWPARAM(0, d), MAKELPARAM(p.x, p.y)); Sleep(300);
+            }
+            else if (op == "stats") {   // leak check: GDI and USER objects, private memory, handles
+              PROCESS_MEMORY_COUNTERS_EX pm{}; pm.cb = sizeof pm; GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm);
+              DWORD handles = 0; GetProcessHandleCount(GetCurrentProcess(), &handles);
+              std::string tag; ss >> tag;
+              log("  stats " + tag + " gdi=" + std::to_string(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS)) + " user=" +
+                  std::to_string(GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS)) + " private_kb=" + std::to_string(pm.PrivateUsage / 1024) +
+                  " handles=" + std::to_string(handles));
+            }
+            else if (op == "menu" || op == "menuesc") {
+              int n = 0; ss >> n; HWND m = nullptr;
+              for (int i = 0; i < 40 && !(m = FindWindowW(L"#32768", nullptr)); ++i) Sleep(50);
+              if (!m) { log("  no menu open"); continue; }
+              if (op == "menuesc") { PostMessageW(m, WM_KEYDOWN, VK_ESCAPE, 1); Sleep(300); continue; }
+              for (int i = 0; i <= n; ++i) { PostMessageW(m, WM_KEYDOWN, VK_DOWN, 1); Sleep(40); }
+              PostMessageW(m, WM_KEYDOWN, VK_RETURN, 1); Sleep(400);
+            }
+            else if (op == "quit") { PostMessageW(g_main, WM_CLOSE, 0, 0); break; }
+          }
+          log("done");
+        }).detach();
       if (const char* ms = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_CAPTURE_MS") : nullptr)
         std::thread([ms = std::atoi(ms)] { Sleep(ms); PostMessageW(g_main, WM_APP + 41, 0, 0); }).detach();
       // Test runs only: YouGame's Connect is pressed after this many ms (the hidden responsiveness check).
@@ -2477,6 +2748,26 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       RECT r; GetClientRect(hwnd, &r); paint(hwnd, (HDC)wp, r); print_client_children(hwnd, (HDC)wp); return 0;
     }
     case WM_APP + 41: place_play_children(); capture_test_client(hwnd, "launcher-capture.bmp"); return 0;
+    case WM_APP + 73: { std::unique_ptr<std::string> name((std::string*)lp); capture_test_client(hwnd, name->c_str()); return 0; }   // script: capture
+    case WM_APP + 74: apply_look((int)wp); return 0;   // script: look
+    case WM_APP + 90:   // the settings window left nothing in front: the launcher again (the controller drives it)
+      if (!IsIconic(hwnd)) { SetForegroundWindow(hwnd); BringWindowToTop(hwnd); }
+      return 0;
+    case WM_APP + 70: select_tab(2); launcher::yglobby::open(); return 0;   // MELEE_LAUNCHER_TEST_PAGE=lobby
+    case WM_APP + 71: show_skin(); return 0;   // the launcher opens in the Brawl Online look
+    case WM_SIZE:
+      launcher::skin::fit(); launcher::yglobby::fit();
+      if (wp == SIZE_RESTORED && launcher::skin::shown() && !launcher::skin::is_compact() && (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME)) {
+        g_skin_w = MulDiv(LOWORD(lp), 96, g_dpi); g_skin_h = MulDiv(HIWORD(lp), 96, g_dpi);
+        SetTimer(hwnd, 0x5A1E, 1200, nullptr);   // saved once the drag settles
+      }
+      break;
+    case WM_GETMINMAXINFO:
+      if (g_main && (GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_THICKFRAME)) {
+        RECT m{0, 0, S(980), S(560)}; AdjustWindowRect(&m, kFixedFrame | WS_THICKFRAME | WS_MAXIMIZEBOX, FALSE);
+        auto* mm = (MINMAXINFO*)lp; mm->ptMinTrackSize = {m.right - m.left, m.bottom - m.top}; return 0;
+      }
+      break;   // the skin covers the whole window at any size
     case WM_PAINT: {
       PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
       paint(hwnd, dc, ps.rcPaint);
@@ -2498,7 +2789,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       g_seg_hot = build_seg_at(p);   // only the cursor changes over a segment, so nothing to repaint
       g_dog_hot = PtInRect(&g_dog_rect, p) != 0;
       g_yg_hot = g_tab == 0 && !vanilla_active() && (PtInRect(&g_yg_link[0], p) || PtInRect(&g_yg_link[1], p) || PtInRect(&g_yg_link[2], p));
-      if (!g_tracking) { TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, hwnd, 0}; TrackMouseEvent(&t); g_tracking = true; }
+      // Scripted hidden test runs have no real pointer over the window (leave would come at once): hover stays.
+      static const bool scripted = std::getenv("MELEE_LAUNCHER_TEST") && std::getenv("MELEE_LAUNCHER_TEST_SCRIPT");
+      if (!g_tracking && !scripted) { TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, hwnd, 0}; TrackMouseEvent(&t); g_tracking = true; }
       return 0;
     }
     case WM_MOUSELEAVE:
@@ -2507,6 +2800,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_nav_hot >= 0) { int was = g_nav_hot; g_nav_hot = -1; invalidate(nav_rect(was)); }
       return 0;
     case WM_SETCURSOR:
+      if (LOWORD(lp) == HTCLIENT) {   // Melee's hand in the Melee looks: open over a button, grabbing while pressed
+        wchar_t cls[16] = {}; GetClassNameW((HWND)wp, cls, 15);
+        const bool over = (HWND)wp != hwnd && _wcsicmp(cls, L"Button") == 0 && IsWindowEnabled((HWND)wp);
+        const HCURSOR h = launcher::melee_look::hand_now(over || g_nav_hot >= 0 || g_seg_hot >= 0 || g_dog_hot || g_yg_hot, HIWORD(lp));
+        if (launcher::pad::hand_shown()) { SetCursor(nullptr); return TRUE; }   // the controller's hand is the pointer: one hand
+        if (h) { SetCursor(h); return TRUE; }
+      }
       if (LOWORD(lp) == HTCLIENT && (g_nav_hot >= 0 || g_seg_hot >= 0 || g_dog_hot || g_yg_hot)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
       break;
     case WM_LBUTTONDOWN: {
@@ -2544,14 +2844,14 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Settings is not a page here. The launcher used to draw its own copy of the options, which
         // is a second settings UI to keep in step with the real one; this opens the game's own F1
         // panel instead, so it is the same UI by construction and cannot drift from it.
+        if (launcher::melee_look::look() == launcher::melee_look::kBrawlOnline && (i == 0 || i == 3)) { show_skin(); return 0; }
         if (i == 1) { open_settings(); return 0; }
         if (i == 4) { select_tab(3); refresh_replays(); return 0; }
         if (i == 5) { mod_manager::open(); return 0; }
         if (i == 3 && !launcher::lobby::kPageShown) {
-          // The page is set aside (launcher_lobby.h): the button offers YouGame, the app when it is
-          // installed, otherwise the site's page for getting it.
-          if (MessageBoxW(g_main, L"Open YouGame?", L"Multiplayer Lobby", MB_YESNO | MB_ICONQUESTION) == IDYES)
-            ShellExecuteW(nullptr, L"open", widen(launcher::yougame::open_target()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          // The serverless lobby is set aside (launcher_lobby.h); this page is YouGame's (launcher_yglobby.h).
+          select_tab(2);
+          launcher::yglobby::open();
           return 0;
         }
         if (i == 3) {
@@ -2596,10 +2896,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           refresh_updater();
           break;
         case ID_VERSIONS: choose_version(); break;
-        case ID_THEME: open_theme_picker(); break;
-        case ID_LANGUAGE: pick_language(); break;
+        case ID_THEME: show_look_menu(); break;
+        case ID_LANGUAGE: if (test_scripted()) { test_action("language"); break; } pick_language(); break;
         case ID_MODS: mod_manager::open(); break;
         case ID_SEND_LOGS:
+          if (test_scripted()) { test_action("send_logs"); break; }
           crash_report::send_logs(hwnd, work_dir(), g_engine == ENGINE_SOURCE ? "Source Port" : "Static Recomp",
                                   {replay_folder(), g_dir + "\\Replays", work_dir() + "\\Replays"});
           break;
@@ -2728,7 +3029,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       // The game closed to play a Gecko code only the Static Recomp runs (host::request_engine_switch):
       // that engine is picked, as a click on its GAME BUILD segment would, and started now.
       if (take_engine_switch_request()) {
-        launcher::lobby::game_running(false);
+        launcher::lobby::game_running(false); launcher::pad::game_running(false);
         log_line("The game asked for the Static Recomp (a Gecko code only it runs); starting it.");
         select_build(1);
         start_game();
@@ -2737,7 +3038,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       // The game closed to restart in the release YouGame is on: start it now, straight into the
       // YouGame mode the player picked. Only this start; the active version stays as it was.
       if (std::string folder, mode; take_yougame_restart(folder, mode)) {
-        launcher::lobby::game_running(false);
+        launcher::lobby::game_running(false); launcher::pad::game_running(false);
         const std::string saved = g_active_version;
         g_active_version = folder;
         g_yougame_launch_args = " --online-mode " + mode;
@@ -2749,7 +3050,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       // A replay queue that went on to its next replay: that game is running now, so nothing below
       // applies yet and the launcher stays minimized.
       if(replay_game_done((DWORD)wp)) return 0;
-      launcher::lobby::game_running(false);
+      launcher::lobby::game_running(false); launcher::pad::game_running(false);
       set_text(g_play_btn, "PLAY");
 #ifdef MELEE_NO_SLIPPI
       launcher::lobby::restart_after_match();   // before any dialog: the lobby is back while it is read
@@ -2782,6 +3083,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       launch_game_now();
       return 0;
     case WM_TIMER: {
+      if (wp == 0x5A1E) { KillTimer(hwnd, wp); save_ini(); return 0; }
       if (wp == ID_TIMER_STANDBY) { KillTimer(hwnd, ID_TIMER_STANDBY); settings_standby_start(); return 0; }
       // The lobby answers requests from here too (a banner), also before its page was opened, and
       // hears about a changed Game Build, setup or Mods folder within two seconds.
@@ -2848,7 +3150,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           launcher::lobby::stop_for_match(match);
           g_game_exe = game_exe(); launch_game_now();
         } else {
-          launcher::lobby::game_running(false);
+          launcher::lobby::game_running(false); launcher::pad::game_running(false);
           if (!g_launcher_test)
             MessageBoxW(hwnd, L"The match could not start. Select an installed current build and disc, then request another match.",
                         L"Lobby", MB_ICONWARNING);
@@ -2879,7 +3181,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           launcher::lobby::stop_for_match(match);
           g_game_exe = game_exe(); launch_game_now();
         } else {
-          launcher::lobby::game_running(false);
+          launcher::lobby::game_running(false); launcher::pad::game_running(false);
           if (!g_launcher_test)
             MessageBoxW(hwnd, launcher::lang::trw(source_ready ? "lobby.p2p.setup_failed" : "lobby.p2p.error.launch_engine").c_str(),
                         L"Lobby", MB_ICONWARNING);
@@ -2906,7 +3208,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           }
           g_game_exe = game_exe(); launch_game_now();
         } else {
-          launcher::lobby::game_running(false);
+          launcher::lobby::game_running(false); launcher::pad::game_running(false);
           MessageBoxW(hwnd, mod_match && !mod_ok
                                 ? L"The match could not start: the mod's disc is not where the Mods folder scan found it. Open the Mods page, then request another match."
                                 : L"The match could not start. Select an installed current build and disc, then request another match.",
@@ -2957,12 +3259,12 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       offer_dlss5();
       return 0;
-    case WM_CTLCOLORLISTBOX: SetTextColor((HDC)wp,C_TEXT); SetBkColor((HDC)wp,C_FIELD); return (LRESULT)g_br_field;
+    case WM_CTLCOLORLISTBOX: SetTextColor((HDC)wp,bo(C_TEXT)); SetBkColor((HDC)wp,bo(C_FIELD)); return (LRESULT)field_brush();
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT: {
       HDC dc = (HDC)wp;
-      if ((HWND)lp == g_log) { SetTextColor(dc, C_LOG_TEXT); SetBkColor(dc, C_LOG_BG); return (LRESULT)g_br_log; }
-      SetTextColor(dc, C_TEXT); SetBkColor(dc, C_FIELD); return (LRESULT)g_br_field;
+      if ((HWND)lp == g_log) { SetTextColor(dc, bo(C_LOG_TEXT)); SetBkColor(dc, bo(C_LOG_BG)); return brawl_pages() ? (LRESULT)field_brush() : (LRESULT)g_br_log; }
+      SetTextColor(dc, bo(C_TEXT)); SetBkColor(dc, bo(C_FIELD)); return (LRESULT)field_brush();
     }
     case WM_DESTROY:
       launcher::lobby::shutdown();
@@ -3006,7 +3308,9 @@ static void note_last_update() {
   for (const auto& line : lines) launcher::lobby::log("update: " + line);
 }
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
+  // The hidden copy that talks to the YouGame app for the launcher (no window): answers and exits.
+  if (int code = 0; launcher::yougame::app::helper_main(cmdline, &code)) return code;
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
   wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -3037,6 +3341,58 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   std::wstring title = widen(std::string("Melee Unlocked Launcher ") + MELEE_PORT_VERSION);
   HWND hwnd = CreateWindowExW(0, wc.lpszClassName, title.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
   launcher::lobby::init(hwnd, g_dir);
+  launcher::yglobby::init(hwnd, {[](int) { start_game(); }, [] { save_ini(); }, std::string(MELEE_PORT_VERSION)});
+  launcher::egg::init(hwnd);   // the character select's easter egg, over the launcher
+  launcher::melee_assets::set_disc(g_iso);   // Melee's hand, frames and font, read from the player's own disc
+  if (g_launcher_test && std::getenv("MELEE_LAUNCHER_TEST_ASSETS")) launcher::melee_assets::dump(g_dir);
+  launcher::pad::init(hwnd);   // a GameCube controller (or XInput pad) moves Melee's hand around the launcher
+  launcher::skin::init(hwnd, {[] { start_game(); },
+                              [](int page) { HoldDrawing hold; if (page < 0) { show_skin(); return; } if (page == 0) { g_tab = -1; select_tab(0); } else if (page == 1) { g_tab = -1; select_tab(3); refresh_replays(); } else if (page == 2) mod_manager::open(); else { g_tab = -1; select_tab(1); } launcher::skin::compact(page + 2); },
+                              [] { if (test_scripted()) { test_action("settings"); return; } open_settings(); }, [] { show_look_menu(); },
+                              [] { PostMessageW(g_main, WM_COMMAND, ID_SEND_LOGS, 0); },   // the launcher's own Send logs
+                              [] { PostMessageW(g_main, WM_COMMAND, ID_LANGUAGE, 0); },
+                              [] { choose_rail_image(); },   // clicking Bailey in the skin
+                              [] {   // the status line under Play and Spectate
+                                launcher::skin::Callbacks::Status s;
+                                s.slippi_ok = !g_slippi_missing;
+                                if (s.slippi_ok) { const size_t a = g_slippi_line.rfind('('), b = g_slippi_line.rfind(')');
+                                  s.slippi = a != std::string::npos && b > a ? widen(g_slippi_line.substr(a + 1, b - a - 1)) : widen(g_slippi_line); }
+                                else s.slippi = launcher::lang::txw(L"Sign in");
+                                const auto a = launcher::yougame::account(); s.yougame_ok = a.signed_in;
+                                s.yougame = a.signed_in ? widen(a.code.empty() ? a.name : a.code) : launcher::lang::txw(L"Connect");
+                                const std::string m = mod_manager::summary(); s.mods_on = m != launcher::lang::tx("Mods: none active");
+                                s.mods = s.mods_on ? widen(m.rfind("Mods: ", 0) == 0 ? m.substr(6) : m) : launcher::lang::txw(L"none");
+                                s.version = widen(MELEE_PORT_VERSION);
+                                if (host::updater::state() == host::updater::State::UpdateAvailable) s.update = launcher::lang::txw(L"Update to") + L" " + widen(host::updater::latest_version());
+                                const auto* cur = launcher::lang::find(launcher::lang::current()); s.language = cur ? cur->native : L"English";
+                                return s;
+                              },
+                              [](int part) {
+                                if (part == 0) { HoldDrawing hold; g_tab = -1; select_tab(0); launcher::skin::compact(2); }   // the account in full
+                                else if (part == 1) { if (launcher::yougame::account().signed_in) ShellExecuteW(nullptr, L"open", widen(launcher::yougame::open_target()).c_str(), nullptr, nullptr, SW_SHOWNORMAL); else yougame_connect(); }
+                                else if (part == 2) { HoldDrawing hold; mod_manager::open(); launcher::skin::compact(4); }
+                                else if (part == 3) choose_version();
+                                else if (part == 4) PostMessageW(g_main, WM_COMMAND, ID_UPDATE, 0);
+                                else if (part == 5) PostMessageW(g_main, WM_COMMAND, ID_LANGUAGE, 0);
+                              },
+                              [] {   // the game build Play Melee starts (as the Game page's GAME BUILD row shows it)
+                                const int on = g_engine == ENGINE_SOURCE && source_available() ? (g_vanilla.vanilla && vanilla_supported() ? 2 : 0) : 1;
+                                return launcher::lang::txw(on == 0 ? L"Source Port" : on == 1 ? L"Static Recomp (Legacy)" : L"Vanilla");
+                              },
+                              [] {   // pick another
+                                const int on = g_engine == ENGINE_SOURCE && source_available() ? (g_vanilla.vanilla && vanilla_supported() ? 2 : 0) : 1;
+                                const bool have[3] = {source_available(), recomp_available(), source_available() && vanilla_supported()};
+                                const wchar_t* names[3] = {L"Source Port", L"Static Recomp (Legacy)", L"Vanilla"};
+                                HMENU m = CreatePopupMenu();
+                                AppendMenuW(m, MF_STRING | MF_GRAYED, 0, launcher::lang::txw(L"Game build").c_str());
+                                for (int i = 0; i < 3; ++i) AppendMenuW(m, MF_STRING | (i == on ? MF_CHECKED : 0) | (have[i] ? 0 : MF_GRAYED), 1 + i,
+                                  (launcher::lang::txw(names[i]) + (have[i] ? L"" : L"  (not installed)")).c_str());
+                                POINT p{}; GetCursorPos(&p);
+                                const int pick = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_main, nullptr); DestroyMenu(m);
+                                if (pick >= 1 && pick <= 3 && pick - 1 != on) { select_build(pick - 1); save_ini(); InvalidateRect(g_main, nullptr, FALSE); }
+                              }});
+  if (launcher::melee_look::look() == launcher::melee_look::kBrawlOnline) PostMessageW(hwnd, WM_APP + 71, 0, 0);   // open in that look
+  launcher::skin::set_color(g_skin_color);   // Melee blue until the player picks one in this look
   note_last_update();
   launcher::lobby::set_prefs(g_lobby_prefs);
   launcher::lobby::on_prefs_changed([] { g_lobby_prefs = launcher::lobby::prefs(); save_ini(); });

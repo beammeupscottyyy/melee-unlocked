@@ -150,6 +150,8 @@ int mu_ko_explosions_hidden(void);
  * each player's damage percent is not drawn (if/ifstatus.c ifStatus_802F5E50). Picture only. */
 #define MU_DISPLAY_NO_HUD_EMBLEMS 0x800u
 int mu_hud_emblems_hidden(void);
+/* "Damage percents: Hidden" (hud_scales bit 16): no percents or emblems drawn (shim/mu_hud_scale.c). */
+int mu_hud_percents_hidden(void);
 /* Community codes (HUD tab, MU_DISPLAY_OPTION_* in mu_host.h), the native versions of the players' favourite Gecko codes. All are
  * picture or sound only: never in a replay, never sent to an opponent. */
 #define MU_DISPLAY_HUD_FADE           0x00001000u   /* HUD Transparency: a player's HUD fades while a fighter is behind it */

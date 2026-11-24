@@ -238,8 +238,15 @@ inline json doubles_home_ticket(const std::string& compatibility, const std::str
 // friend pair (n 2) the party that keeps them on one team. A CPU partner is never a local player: the
 // server reads that seat from the frozen home.
 inline constexpr int kLocalPartnerCapability = 1;
+// Ranked Doubles: the same tickets on the ranked queue (ranked true, queue "ranked"), and no local partner
+// (ranked is people only). An unranked ticket is the one it always was.
+inline void doubles_ranked(json& t, bool queue) {
+  t["ranked"] = true;
+  if (queue) t["queue"] = "ranked";
+  t.erase("local_partner");
+}
 inline json doubles_queue_ticket(const std::string& compatibility, const std::string& home, const std::string& generation,
-                                 int humans) {
+                                 int humans, bool ranked = false) {
   if (room(json{{"room", home}}).empty()) throw std::runtime_error("Invalid YouGame friends room");
   if (!doubles_compatibility(compatibility)) throw std::runtime_error("Invalid Doubles compatibility");
   if (generation.empty() || generation.size() > 128) throw std::runtime_error("Invalid Doubles search");
@@ -247,16 +254,19 @@ inline json doubles_queue_ticket(const std::string& compatibility, const std::st
             {"party_room", home}, {"partySearch", generation}, {"queue", "casual"},
             {"local_partner", kLocalPartnerCapability}, {"lobby", doubles_lobby(compatibility, 4)}};
   if (humans == 2) t["party"] = {{"id", generation}, {"n", 2}};
+  if (ranked) doubles_ranked(t, true);
   return t;
 }
 // The match room's admission, and its renewals (rooms MU-DOUBLES-R2-REPORT: "a freshly minted match-admission
 // ticket can also use normal Teams mode/teamsLobby, players 4, casual and the same min4/maxLocal1 lobby, with
 // no room or party fields"). The queue's own ticket names the home (party_room, partySearch, party), which a
 // renewal in the match room must not.
-inline json doubles_match_ticket(const std::string& compatibility) {
+inline json doubles_match_ticket(const std::string& compatibility, bool ranked = false) {
   if (!doubles_compatibility(compatibility)) throw std::runtime_error("Invalid Doubles compatibility");
-  return {{"type", "mpTicket"}, {"mode", "teams"}, {"teamsLobby", 1}, {"players", 4}, {"ranked", false},
-          {"local_partner", kLocalPartnerCapability}, {"lobby", doubles_lobby(compatibility, 4)}};
+  json t = {{"type", "mpTicket"}, {"mode", "teams"}, {"teamsLobby", 1}, {"players", 4}, {"ranked", false},
+            {"local_partner", kLocalPartnerCapability}, {"lobby", doubles_lobby(compatibility, 4)}};
+  if (ranked) doubles_ranked(t, false);
+  return t;
 }
 // Room kinds (Events::room_kind): what a joined room turned out to be. kRoomArena is only ever an invite's
 // own word (inviteMode "arena"): the arena's 8-seat room (slippi_arena.cpp under YouGame) is joined as itself,
@@ -330,7 +340,9 @@ inline json lobby_ticket(const std::string& compatibility, const std::string& co
   if (!lobby_compatibility(compatibility)) throw std::runtime_error("Invalid Friends lobby compatibility");
   return {{"type", "mpTicket"}, {"players", 4}, {"mode", "singles"},
           {"room", code}, {"ranked", false},
-          {"lobby", {{"version", 1}, {"minPlayers", 1}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}}};
+          // minPlayers 2: YouGame takes 1 only from a server game that fills its own seats (refused
+          // "server_lobby" since 11-23, so the room never opened).
+          {"lobby", {{"version", 1}, {"minPlayers", 2}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}}};
 }
 inline bool native_ready(bool yougame, int, const std::string&, const std::string& invite) {
   return !(yougame && !invite.empty());
@@ -430,8 +442,18 @@ class Events {
       // Old page pushes carry only a room code. A new invite notice grants one new
       // acceptance, including a retry of a still-live retired room. Never let that
       // old room displace a pending invite or another active session.
-      if (retired_.count(code) && (!fresh_invite_ || !pending_.empty() || !current_room_.empty() ||
+      // A push that carries the id of an invite the player accepted ({type:"join", room, invite})
+      // is that acceptance itself: an id not seen before may rejoin a room the player left, while
+      // a repeat of the same id (a page reload, a resend) never pulls them back in.
+      const auto invite_id = text(value, "invite", 64);
+      const bool idle = pending_.empty() && current_room_.empty();
+      const bool accepted = !invite_id.empty() && !seen_invites_.count(invite_id) && idle;
+      if (retired_.count(code) && !accepted && (!fresh_invite_ || !idle ||
           (!invite_room_.empty() && invite_room_ != code))) return false;
+      if (!invite_id.empty()) {
+        if (seen_invites_.size() >= 256) seen_invites_.clear();
+        seen_invites_.insert(invite_id);
+      }
       retired_.erase(code); fresh_invite_ = false; invite_room_.clear();
       pending_ = code;
       // The invite's room size when the page says (a 1v1 friend room 2, the Friends lobby 4); 0 unknown,
@@ -705,6 +727,7 @@ class Events {
   bool online_menu_ = false, friend_entry_ = false, version_notice_ = false, version_logged_ = false;
   bool hello_seen_ = false, host_requested_ = false, picker_open_ = false;
   std::set<std::string> retired_; // Retired room pushes need a fresh invite acceptance.
+  std::set<std::string> seen_invites_; // Invite ids a join push already used (one join per accepted invite).
   bool fresh_invite_ = false;
   std::string invite_room_, pending_, toast_, current_room_, picker_error_;
   int pending_players_ = 0, join_players_ = 0;

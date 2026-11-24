@@ -9,7 +9,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <nlohmann/json.hpp>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace launcher::yougame::app {
 
@@ -39,11 +41,21 @@ bool start(bool staging, int wait_ms);
 // Connects to the running app's channel, says hello as this game (`version`), asks the connect code when
 // signed in, and closes. Blocking (a few seconds at most, `timeout_ms` overall); never on a window thread.
 Answer ask(bool staging, const std::string& version, int timeout_ms = 12000);
+// The same connection, then each request in turn (their raw answers by type: {"re","ok","result"} or a refusal with
+// its code, such as notYet). For the Multiplayer Lobby page: socialCounts, socialRooms, socialPlayers, mpRank.
+struct Social { Answer hello; std::map<std::string, nlohmann::json> answers; };
+Social social(bool staging, const std::string& version, const std::vector<nlohmann::json>& requests, int timeout_ms = 15000);
+// Windows: ask() and social() run in a hidden copy of the launcher (no window, so the app puts no YouGame button on
+// the launcher). The copy starts with `--yougame-channel`; its wWinMain hands over to helper_main, which answers on
+// stdout and exits. True when this process was that copy (the exit code is in *code).
+bool helper_main(const wchar_t* command_line, int* code);
 #else
 inline bool installed(bool) { return false; }
 inline bool running(bool) { return false; }
 inline bool start(bool, int) { return false; }
 inline Answer ask(bool, const std::string&, int = 12000) { return {}; }
+struct Social { Answer hello; std::map<std::string, nlohmann::json> answers; };
+inline Social social(bool, const std::string&, const std::vector<nlohmann::json>&, int = 15000) { return {}; }
 #endif
 
 }  // namespace launcher::yougame::app

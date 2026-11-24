@@ -477,6 +477,7 @@ static const unsigned char* pages_art(int id)
     case MP_L_YG_UNRANKED: return mu_sst_un_yougame;
     case MP_L_YG_FRIENDS: return mu_sst_yougame_friends;
     case MP_L_YG_DOUBLES: return mu_sst_yougame_doubles;
+    case MP_L_YG_DOUBLES_RANKED: return mu_sst_dbl_ranked;   /* the Doubles slider's ranked value, as wide as Unranked's */
     case MP_L_YG_SQUAD: return mu_sst_yougame_squad;
     case MP_L_SLP_UNRANKED: return mu_sst_un_slippi;
     case MP_L_SLP_DIRECT: return mu_sst_page_slippi_direct;
@@ -660,7 +661,7 @@ static int pages_label_swap(HSD_JObj* label, int menu_kind, int selection, int c
     id = mu_online_pages_label(selection);
     if (id <= MP_L_NONE || id >= MP_L_END || !(art = pages_art(id))) return 1;
     width = id == MP_L_YG_SQUAD ? MU_SST_SQUAD_W :
-            (art == mu_sst_un_yougame || art == mu_sst_un_both || art == mu_sst_un_slippi) ? MU_SST_UNRANKED_W : MU_LABEL_W;
+            (art == mu_sst_un_yougame || art == mu_sst_un_both || art == mu_sst_un_slippi || art == mu_sst_dbl_ranked) ? MU_SST_UNRANKED_W : MU_LABEL_W;
     shift = id == MP_L_YG_SQUAD ? MU_SST_SQUAD_SHIFT : 0;
     quad = width;
     /* UI audit previews (mu_test_ui.h), in texels of the label (2.2 px each at 1440x1080).

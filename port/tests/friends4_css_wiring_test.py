@@ -305,7 +305,7 @@ class ReviewFixes(unittest.TestCase):
         # The one-argument arm is the Friends profile of the profiled one, which bumps the arm.
         self.assertIn('arm_friends_lobby(room, yougame::lobby::Profile::Friends4);',
                       body(self.online, 'void arm_friends_lobby(const std::string& room)'))
-        self.assertIn('++g_lobby_arm;', body(self.online, 'void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile)'))
+        self.assertIn('++g_lobby_arm;', body(self.online, 'void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile, bool ranked)'))
         command = body(self.online, 'static bool lobby_command(')
         leave = command[command.index('if (op == MU_LOBBY_OP_LEAVE) {'):]
         self.assertIn('++g_lobby_arm;', leave[:leave.index('return true;')])

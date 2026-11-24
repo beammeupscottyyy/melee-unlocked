@@ -1155,6 +1155,19 @@ static void text_think(HSD_GObj* gobj)
         set_text(ST_PRESS_D, prompt);
     }
 #endif
+    /* Searching in Ranked or Unranked (owner 11-24): holding L and R goes to Training and keeps the search
+     * (native_practice kept_go_training); say so where the chat line stands once connected. */
+    if (conn == MU_SLP_MM_MATCHMAKING && !mu_ranked_practice() &&
+        (st->mode == MU_SLP_MODE_RANKED || st->mode == MU_SLP_MODE_UNRANKED)) {
+        char lk[16], rk[16];
+        if (ctrl_port != NULL && mu_host_button_label(*ctrl_port, HSD_PAD_L, lk, sizeof lk) &&
+            mu_host_button_label(*ctrl_port, HSD_PAD_R, rk, sizeof rk)) {
+            snprintf(prompt, sizeof prompt, "Hold %s\x81\x7B%s to warm up", lk, rk);   /* the font's plus: SIS drops an ASCII '+' */
+        } else {
+            strcpy(prompt, "Hold L\x81\x7BR to warm up");
+        }
+        set_text(ST_PRESS_D, prompt);
+    }
 
     /* Press / hold Z (the keyboard player's key for it) */
     prompt[0] = 0;

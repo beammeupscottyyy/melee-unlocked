@@ -1062,13 +1062,20 @@ std::string sets_text(const std::string& sets) {
   }
   return text + (sets.find(',') == std::string::npos ? " set" : " sets");
 }
+// The Brawl Online look is up (the page sits beside its sidebar): the page wears that look.
+bool brawl() { return launcher::skin::shown(); }
 void paint_page(HDC dc) {
   RECT client{}; GetClientRect(g_window, &client);
-  vgrad(dc, client, C_CONTENT_TOP, C_CONTENT_BOT);
+  const bool bo = brawl(); const launcher::skin::Look L = bo ? launcher::skin::look() : launcher::skin::Look{};
+  // In that look Classic's greys become the look's (text, second text, dim).
+  auto col = [&](COLORREF c) { return !bo ? c : c == C_TEXT ? L.text : c == C_FAINT ? L.dim : c == C_DIM ? L.text2 : c == C_OK ? L.ok : c == C_WARN ? L.warn : c; };
+  auto draw_text = [&](HDC d, const std::wstring& s, RECT r, HFONT f, COLORREF c, UINT fmt, int tracking = 0) { ::draw_text(d, s, r, f, col(c), fmt, tracking); };
+  if (bo) launcher::skin::page_background(dc, g_window, client); else vgrad(dc, client, C_CONTENT_TOP, C_CONTENT_BOT);
   const int width = units(client.right), height = units(client.bottom);
-  draw_text(dc, L"MODS", LR(kPad, 26, width - 2 * kPad, 18), g_font_label, C_FAINT, DT_LEFT | DT_SINGLELINE | DT_VCENTER, S(1));
+  if (bo) launcher::skin::heading(dc, g_window, L"Mods", S(kPad), S(12));
+  else draw_text(dc, L"MODS", LR(kPad, 26, width - 2 * kPad, 18), g_font_label, C_FAINT, DT_LEFT | DT_SINGLELINE | DT_VCENTER, S(1));
   draw_text(dc, L"Get downloads each mod from its official release and builds it from your own Melee disc.",
-            LR(kPad, 46, width - 2 * kPad, 18), g_font_small, C_DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            LR(kPad, bo ? 52 : 46, width - 2 * kPad, 18), g_font_small, C_DIM, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
   std::map<std::string, std::string> status; std::map<std::string, int> percent;
   { std::lock_guard<std::mutex> lock(g_mutex); status = g_status; percent = g_percent; }
   const View current = view();
@@ -1077,7 +1084,7 @@ void paint_page(HDC dc) {
     const Row& row = g_rows[g_top + slot];
     const auto& m = row.catalog; const auto& f = row.installed;
     const RECT card = card_rect(slot);
-    round_rect(dc, card, 10, C_CARD, C_CARD, C_CARD_BORDER);
+    if (bo) launcher::skin::card(dc, g_window, card); else round_rect(dc, card, 10, C_CARD, C_CARD, C_CARD_BORDER);
     const int x = units(card.left), y = units(card.top), text_w = units(card.right) - 16 - 100 - (x + 44);
     draw_check(dc, x + 16, y + 14, row.found);
     // Name, then the catalog's latest version beside it.
@@ -1085,7 +1092,11 @@ void paint_page(HDC dc) {
     const std::wstring title = widen(m.name);
     HGDIOBJ old = SelectObject(dc, g_font_nav); RECT measure = name;
     DrawTextW(dc, title.c_str(), -1, &measure, DT_CALCRECT | DT_SINGLELINE); SelectObject(dc, old);
-    draw_text(dc, title, name, g_font_nav, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    // In the Melee looks the name is drawn in Melee's font: its own width, or "Latest ..." lands on it.
+    if (const int melee_w = launcher::melee_look::text_width(title, g_font_nav); melee_w >= 0) measure.right = measure.left + melee_w;
+    if (bo) { launcher::skin::melee_text(dc, g_window, title, name.left, name.top + S(2), 19, RGB(255, 255, 255), name.right - name.left);
+      measure.right = name.left + launcher::skin::melee_width(dc, g_window, title, 19); }   // the version follows the Melee name
+    else draw_text(dc, title, name, g_font_nav, C_TEXT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     if (!m.version.empty() && measure.right + S(8) < name.right)
       draw_text(dc, widen(launcher::lang::fill(tx("Latest {version}"), launcher::lang::Args{{"version", m.version}})),
                 RECT{measure.right + S(8), name.top, name.right, name.bottom}, g_font_small, C_FAINT, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -1184,7 +1195,9 @@ void draw_item_direct(DRAWITEMSTRUCT* di) {
   const int base = (int)(di->CtlID / 1000) * 1000;
   const bool footer = di->CtlID == ID_MOD_FOLDER || di->CtlID == ID_MOD_LINK || di->CtlID == ID_MOD_RESCAN;
   const RECT r = di->rcItem;
-  if (footer) vgrad(di->hDC, r, lerp(C_CONTENT_TOP, C_CONTENT_BOT, wr.top, client.bottom - 1), lerp(C_CONTENT_TOP, C_CONTENT_BOT, wr.bottom, client.bottom - 1));
+  const bool bo = brawl(); const launcher::skin::Look L = bo ? launcher::skin::look() : launcher::skin::Look{};
+  if (bo) fill(di->hDC, r, footer ? L.page : L.raised);   // what is behind it in that look
+  else if (footer) vgrad(di->hDC, r, lerp(C_CONTENT_TOP, C_CONTENT_BOT, wr.top, client.bottom - 1), lerp(C_CONTENT_TOP, C_CONTENT_BOT, wr.bottom, client.bottom - 1));
   else fill(di->hDC, r, C_CARD);
   const bool disabled = (di->itemState & ODS_DISABLED) != 0, down = (di->itemState & ODS_SELECTED) != 0;
   const LONG_PTR style = GetWindowLongPtrW(di->hwndItem, GWLP_USERDATA);
@@ -1206,6 +1219,7 @@ void draw_item_direct(DRAWITEMSTRUCT* di) {
     draw_text(di->hDC, cap, label, g_font_small, disabled ? RGB(0x5C, 0x68, 0x7E) : on ? C_OK : C_DIM, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     return;
   }
+  if (bo) { launcher::skin::button(di->hDC, g_window, r, cap, (style & STYLE_ACCENT) != 0, down, disabled); return; }
   COLORREF top = down ? C_BTN_DOWN : C_BTN, bot = top, border = C_BTN_BORDER, text = C_TEXT;
   if ((style & STYLE_ACCENT) && !disabled) { top = C_ACC_HI; bot = C_ACC_LO; border = NO_FILL; text = C_PLAY_TEXT; if (down) top = bot = C_PLAY_DOWN; }
   if (disabled) { top = bot = RGB(0x1A, 0x21, 0x32); border = RGB(0x28, 0x31, 0x47); text = RGB(0x5C, 0x68, 0x7E); }

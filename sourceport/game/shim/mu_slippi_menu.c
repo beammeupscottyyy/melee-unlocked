@@ -197,6 +197,10 @@ static void pages_notice_show(const char* text);
 static void pages_log_rows(void);
 static void pages_frame(HSD_GObj* menu, int canvas, int idle);
 static int unranked_val = -1;      /* Unranked's slider: 0 YouGame, 1 Both, 2 Slippi; -1 the page's own */
+static int doubles_ranked;         /* Ranked's slider: 0 Ranked (singles, each session's start), 1 Ranked Doubles */
+static void pages_doubles_step(int dir);
+static int pages_ranked_row(void);
+static int pages_ranked_doubles(int option);
 static int pages_refresh;          /* re-hover the row once: its label and description follow */
 static int pages_notice_row = -1;
 static const char* pages_notice;
@@ -489,7 +493,7 @@ void mu_slippi_log_online_rows(void)
 #define MU_ROWS_SQUAD ""
 #endif
 #ifdef MELEE_DOUBLES
-    snprintf(line, sizeof line, "online menu: rows offered Ranked,Unranked,Friends,Doubles,%sSlippi%s tournament=%d\n",
+    snprintf(line, sizeof line, "online menu: rows offered Ranked,Unranked,Doubles,Friends,%sSlippi%s tournament=%d\n",
 #else
     snprintf(line, sizeof line, "online menu: rows offered Ranked,Unranked,Friends,%sSlippi%s tournament=%d\n",
 #endif
@@ -739,11 +743,8 @@ int mu_slippi_on_online_results(void) { return mu_slippi_online_state() == MU_SL
 int mu_slippi_on_online_splash(void) { return mu_slippi_online_state() == MU_SLP_STATE_SPLASH; }
 int mu_slippi_zelda_is_sheik(void)
 {
-#if MU_SQUAD
-    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
-     * Squads keep the picker's exact Zelda/Sheik kinds, also once a friend room turns them on. */
-    if (gmSquad_OnlineChosen() || gmSquad_LobbyChosen()) return 0;
-#endif
+    /* Squad Strike too (player request, 1.0.20): its picks still record the exact kind, Zelda or Sheik,
+     * that the icon and the selector chose. */
     return mu_slippi_menus_enabled() && zelda_sheik;
 }
 unsigned mu_slippi_online_load_count(void) { return online_loads; }
@@ -1337,6 +1338,12 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
             const int right = (buttons & MenuInput_Right) || (pressed & 0x0020);   /* mapped GameCube R */
             if (left != right) pages_unranked_step(right ? 1 : -1);
         }
+        /* The same on Ranked: Ranked | Ranked Doubles (owner 11-23: "put it under Ranked"). Z stays the page turn. */
+        if (mn_804A04F0.hovered_selection == pages_ranked_row() && !agent_copy) {
+            const int left = (buttons & MenuInput_Left) || (pressed & 0x0040);
+            const int right = (buttons & MenuInput_Right) || (pressed & 0x0020);
+            if (left != right) pages_doubles_step(right ? 1 : -1);
+        }
     }
     selected_row = mn_804A04F0.hovered_selection;
     selected_option = mu_slippi_menu_option(selected_row);
@@ -1349,10 +1356,12 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxForward();
         mu_slippi_tournament_notice(gp, tournament_text);
 #ifdef MELEE_DOUBLES
-    } else if ((buttons & MenuInput_Confirm) && friends_visible && selected_option == MU_SLP_OPT_DOUBLES) {
+    } else if ((buttons & MenuInput_Confirm) && friends_visible &&
+               (selected_option == MU_SLP_OPT_DOUBLES || pages_ranked_doubles(selected_option))) {
         /* The Doubles row opens the 2-seat Doubles home's select (G2: the Friends lobby on its Doubles
-         * profile, E6 value 16). The 4-seat md:1 console home (value 12) stays for md:1 invites. */
-        u8 open_doubles = 16;
+         * profile, E6 value 16). The Ranked row with its slider on Ranked Doubles opens the same home on
+         * the ranked queue (17). The 4-seat md:1 console home (value 12) stays for md:1 invites. */
+        u8 open_doubles = (u8) (pages_ranked_doubles(selected_option) ? 17 : 16);
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &open_doubles, 1, NULL, 0, NULL);
         mn_804D6BC8.cooldown = 5;
         sfxForward();
@@ -1432,11 +1441,11 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         }
 #ifdef MELEE_DOUBLES
     } else if ((buttons & MenuInput_Confirm) && split_layout() && !slippi_submenu && !yougame_soon() &&
-               selected_option == MU_SLP_OPT_DOUBLES) {
+               (selected_option == MU_SLP_OPT_DOUBLES || pages_ranked_doubles(selected_option))) {
         /* Under the launcher the Doubles row opens the same 2-seat Doubles home (E6 value 16): the host
          * holds the home through the launcher's bridge, named by YouGame's own record of this release
          * (launcher_yougame.cpp listed_build_id). The pick tells the host this is a YouGame row. */
-        u8 open_doubles = 16;
+        u8 open_doubles = (u8) (pages_ranked_doubles(selected_option) ? 17 : 16);
         yg_pick = 1;
         pages_last_option = selected_option;
         pages_last_page = 0;
@@ -1444,7 +1453,8 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &open_doubles, 1, NULL, 0, NULL);
         mn_804D6BC8.cooldown = 5;
         sfxForward();
-        OSReport("online menu: row %d opens the Doubles home\n", mn_804A04F0.hovered_selection);
+        OSReport("online menu: row %d opens the Doubles home (%s)\n", mn_804A04F0.hovered_selection,
+                 open_doubles == 17 ? "ranked" : "unranked");
 #endif
     } else if ((buttons & MenuInput_Confirm) && yougame_soon() && !pick_slippi()) {
         /* Ranked, Unranked or Friends while YouGame is not connected: the host runs YouGame's start
@@ -2052,11 +2062,7 @@ static void online_on_load(void)
     lobby_open();
     mu_ranked_set_reset();
     gmMainLib_804D3EE0->vs.unk_530.x6 = gm_801677F0();   /* the 1P port for the event CSS slot */
-    zelda_sheik = 1;                                       /* the Zelda icon picks Sheik */
-#if MU_SQUAD
-    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
-    if (gmSquad_OnlineChosen()) zelda_sheik = 0; /* keep the picker's exact Zelda/Sheik kinds */
-#endif
+    zelda_sheik = 1;   /* the Zelda icon picks Sheik, Squad Strike included; the Zelda/Sheik selector picks Zelda */
     online_loads++;
 }
 

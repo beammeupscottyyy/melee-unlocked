@@ -1,130 +1,214 @@
-/* Online CSS RankInfo, adapted from project-slippi/slippi-ssbm-c
- * Scenes/CSS/RankInfo/RankInfo.c:25-188 and Scenes/CSS/Main.c (GPL-3.0).
- * YouGame supplies the standing, words and badge; no Slippi art or server IO.
- * This panel only reads UI state. The post-set reveal belongs to Track C.
+/* Online CSS rank panel, laid out exactly as Slippi Dolphin's: project-slippi/slippi-ssbm-c
+ * Scenes/CSS/RankInfo/RankInfo.c and RankInfo.h (GPL-3.0). The same "Rank" label, rank name, rating
+ * and rating change at the same positions, sizes and colors, Slippi's own rank icon art from slpCSS
+ * (its rank_icons, frame = rank), and the same count-up of the rating with its sounds after a set.
+ * YouGame supplies the standing; its four divisions show as Slippi's three (yougame_ranked.h
+ * rank_enum). No Slippi server IO.
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mu_native.h>
-#include <mu_rank_badge.h>
+#include <mu_ranked_setup_online.h>
 #include "mu_rank_text.h"
 #include <stdio.h>
 #include <string.h>
+#include <melee/gm/gm_1601.h>
+#include <melee/sc/types.h>
+#include <melee/lb/lbaudio_ax.h>
+#include <sysdolphin/baselib/aobj.h>
 #include <sysdolphin/baselib/gobj.h>
+#include <sysdolphin/baselib/gobjgxlink.h>
+#include <sysdolphin/baselib/gobjobject.h>
 #include <sysdolphin/baselib/gobjuserdata.h>
+#include <sysdolphin/baselib/jobj.h>
 #include <sysdolphin/baselib/sislib.h>
 
-/* CSS already draws the full division/practice label beside the art. */
-void mu_rank_badge_art_only(MuRankBadge*);
+/* RankInfo.h */
+static const char* const RANK_STRINGS[] = {
+    "PENDING", "BRONZE 1", "BRONZE 2", "BRONZE 3", "SILVER 1", "SILVER 2", "SILVER 3", "GOLD 1", "GOLD 2",
+    "GOLD 3", "PLATINUM 1", "PLATINUM 2", "PLATINUM 3", "DIAMOND 1", "DIAMOND 2", "DIAMOND 3", "MASTER 1",
+    "MASTER 2", "MASTER 3", "GRANDMASTER",
+};
+enum { PLACEMENT_THRESHOLD = 5, RATING_CHANGE_LEN = 60, RANK_CHANGE_LEN = 10, RATING_NOTIFICATION_LEN = 200 };
+#define LOW_RATING_THRESHOLD 10.f
+#define MED_RATING_THRESHOLD 20.f
+enum { RANK_UP_SMALL = 0xAA, RANK_DOWN_SMALL = 0xBE, RATING_INCREASE = 0x69, RATING_DECREASE = 0x19E,
+       TICK_UP = 0xBB, TICK_DOWN = 0xEA, TICK_UP_VOL = 150, TICK_DOWN_VOL = 100 };
+static const GXColor white = {255, 255, 255, 255};
+static const GXColor gray = {142, 145, 150, 255};
+static const GXColor red = {255, 0, 0, 255};
+static const GXColor yellow = {255, 200, 0, 255};
+static const GXColor green = {3, 252, 28, 255};
+static const GXColor light_gray = {170, 173, 178, 255};
 
-enum { LOCAL_TITLE, LOCAL_DETAIL, OPP_TITLE, OPP_DETAIL, SET_SCORE,
-       LOCAL_LABEL, OPP_LABEL, LINE_COUNT };
+/* slpCSS's rank_icons (mu_slippi_chat.c SlpCssChat, slot 5 after the chat window, the chat message,
+ * the mode and the connect help). */
+typedef struct SlpCssRank {
+    DISC_PTR(void) chat_window;
+    DISC_PTR(void) chat_message;
+    DISC_PTR(void) mode;
+    DISC_PTR(void) connect_help;
+    DISC_PTR(DynamicModelDesc) rank_icons;
+} DISC_STRUCT SlpCssRank;
+
+enum { RANK_LABEL, RANK_NAME, RATING, CHANGE, SET_SCORE, LINE_COUNT };
 static struct {
     HSD_Text* text;
-    MuRankBadge* badges[2];
-    float badge_x[2];
-    MuYgRank shown[2];
-    char lines[LINE_COUNT][64];
+    HSD_JObj* icon;
+    char lines[LINE_COUNT][40];
     unsigned frames;
     int matched;
-    MuYgU8 left_status, left;   /* the room's final for a set it gave by a leave, else 0 */
+    int anim;                 /* a rating change is playing */
+    unsigned timer, change_len;
+    float from, to;           /* rating, tenths/10 */
+    int rank_from, rank_to;
+    int placed;
+    MuYgU8 left_status, left;
 } panel;
-static const GXColor white = { 255, 255, 255, 255 };
-static const GXColor gray = { 160, 165, 175, 255 };
-
-/* CSS subtexts are relative to (0,0), in tenths of a world unit, y down.
- * Badges take world coordinates; use the same origin and font-size factor. */
-static float panel_x(float x) { return x * 0.1f; }
-static float panel_y(float y) { return y * 0.1f; }
+/* The last result shown: a result is played once, however often the CSS comes back. */
+static MuYgI32 shown_before = -1, shown_after = -1;
+static MuYgU16 shown_matches = 0xFFFF;
 
 static int active(void)
 {
     return mu_slippi_css_online() && mu_slippi_state()->mode == MU_SLP_MODE_RANKED;
 }
 
-static void line(int id, const char* value)
+/* yougame_ranked.h rank_enum: challenger is Grandmaster; YouGame's division 1 is a tier's top. */
+static int slippi_rank(const MuYgRank* r)
 {
+    if (!r->known || !r->placed) return 0;
+    if (r->tier == 6) return 19;
+    if (r->tier < 1 || r->tier > 5 || r->division < 1 || r->division > 4) return 0;
+    return 1 + 3 * (r->tier - 1) + (r->division == 1 ? 2 : r->division == 2 ? 1 : 0);
+}
+
+static void line(int id, const char* value, const GXColor* color)
+{
+    if (color) HSD_SisLib_803A74F0(panel.text, id, (GXColor*) color);
     if (strcmp(panel.lines[id], value) == 0) return;
-    /* All callers supply bounded local strings, never a host format string. */
-    strcpy(panel.lines[id], value);
+    strncpy(panel.lines[id], value, sizeof panel.lines[id] - 1);
     HSD_SisLib_803A70A0(panel.text, id, "%s", value);
 }
 
-/* A long note shrinks to stay clear of the opponent column at x 70. */
+/* SetRankIcon: the icon's texture animation at frame = rank. */
+static void set_icon(int rank)
+{
+    if (!panel.icon) return;
+    HSD_ForeachAnim(panel.icon, JOBJ_TYPE, TOBJ_MASK, HSD_AObjReqAnim, AOBJ_ARG_AF, (f32) rank);
+    HSD_JObjAnimAll(panel.icon);
+    HSD_ForeachAnim(panel.icon, JOBJ_TYPE, TOBJ_MASK, HSD_AObjStopAnim, AOBJ_ARG_AOV, NULL, NULL);
+}
+
+/* SetRankText */
+static void set_text(int rank, float rating, unsigned matches, int fetching)
+{
+    char rating_text[24];
+    line(RANK_NAME, RANK_STRINGS[rank], &white);
+    if (fetching && rank == 0) {
+        line(RATING, "\x81\x48\x81\x48\x81\x48\x81\x48", &gray);   /* "????" */
+        return;
+    }
+    if (matches >= PLACEMENT_THRESHOLD) sprintf(rating_text, "%0.1f", rating);
+    else sprintf(rating_text, "%u SETS REQUIRED", PLACEMENT_THRESHOLD - matches);
+    line(RATING, rating_text, &light_gray);
+}
+
+/* This port's set line under Slippi's panel; a long note shrinks to stay inside the panel. */
 static void score_line(const char* value)
 {
-    float width = (float) strlen(value) * 20.5f, scale = 0.4f;
+    float width = (float) strlen(value) * 20.5f, scale = 0.3f;
     if (strcmp(panel.lines[SET_SCORE], value) == 0) return;
     if (width * scale > 180.0f) scale = 180.0f / width;
     HSD_SisLib_803A7548(panel.text, SET_SCORE, scale, scale);
-    line(SET_SCORE, value);
+    line(SET_SCORE, value, &light_gray);
 }
 
 static void free_panel(void* unused)
 {
     (void) unused;
-    mu_rank_badge_free(panel.badges[0]);
-    mu_rank_badge_free(panel.badges[1]);
     if (panel.text) HSD_SisLib_803A5CC4(panel.text);
     memset(&panel, 0, sizeof panel);
 }
 
-static void rank_panel(int player, const MuYgRank* rank, int status)
+/* InitRankIcon */
+static void init_icon(int rank)
 {
-    char detail[64], label[32], rating[24];
-    MuYgRank display = *rank;
-    int id = player ? OPP_DETAIL : LOCAL_DETAIL;
-    if (!rank->known) {
-        const char* state = status == 0 ? "Loading..." : status == 2 ? "Rank unavailable" : "Unknown";
-        strcpy(detail, state);
-    } else if (!rank->placed) {
-        mu_rank_text_label(label, rank);
-        strcpy(display.label, label);
-        mu_rank_number(rating, rank->rating);
-        sprintf(detail, mu_ranked_practice() ? "Practice rating %s" : "Rating %s", rating);
-    } else {
-        /* Preserve YouGame's label, including IV and Challenger. No E3 enum is
-         * used for art or words: it compresses YouGame's four divisions. */
-        display.label[sizeof display.label - 1] = 0;
-        mu_rank_number(rating, rank->rating);
-        sprintf(detail, mu_ranked_practice() ? "Practice rating %s" : "Rating %s", rating);
+    SlpCssRank* css = (SlpCssRank*) mu_slippi_css_slpcss();
+    DynamicModelDesc* desc = css ? DP(css->rank_icons) : NULL;
+    HSD_GObj* gobj;
+    if (!desc || !DP(desc->joint)) return;
+    gobj = GObj_Create(4, 5, 0x80);
+    if (!gobj) return;
+    panel.icon = HSD_JObjLoadJoint(DP(desc->joint));
+    if (!panel.icon) return;
+    panel.icon->translate.x = -9.f;
+    panel.icon->translate.y = -12.5f;
+    panel.icon->scale.x = 2.f;
+    panel.icon->scale.y = 2.f;
+    HSD_JObjSetMtxDirtySub(panel.icon);
+    gm_8016895C(panel.icon, desc, 0);
+    HSD_JObjReqAnimAll(panel.icon, 0.0f);
+    set_icon(rank);
+    /* The bob animation at its first frame, as Slippi leaves it. */
+    HSD_ForeachAnim(panel.icon, JOBJ_TYPE, JOBJ_MASK, HSD_AObjReqAnim, AOBJ_ARG_AF, 0.f);
+    HSD_JObjAnimAll(panel.icon);
+    HSD_ForeachAnim(panel.icon, JOBJ_TYPE, JOBJ_MASK, HSD_AObjStopAnim, AOBJ_ARG_AOV, NULL, NULL);
+    HSD_GObjObject_80390A70(gobj, HSD_GObj_JObjKind, panel.icon);
+    GObj_SetupGXLink(gobj, HSD_GObj_JObjCallback, 1, 129);
+}
+
+static void start_change(const MuYgResult* r)
+{
+    float change = (float) (r->after - r->before) / 10.f, size = change < 0 ? -change : change;
+    panel.anim = 1;
+    panel.timer = 0;
+    panel.change_len = size < LOW_RATING_THRESHOLD ? RATING_CHANGE_LEN / 4 :
+                       size < MED_RATING_THRESHOLD ? RATING_CHANGE_LEN / 2 : RATING_CHANGE_LEN;
+    panel.from = (float) r->before / 10.f;
+    panel.to = (float) r->after / 10.f;
+    panel.rank_from = slippi_rank(&r->rank_before);
+    panel.rank_to = slippi_rank(&r->rank_after);
+    panel.placed = r->rank_after.matches >= PLACEMENT_THRESHOLD || r->rank_after.placed;
+    set_icon(panel.rank_from);
+    set_text(panel.rank_from, panel.from, r->rank_after.matches, 0);
+    shown_before = r->before; shown_after = r->after; shown_matches = r->rank_after.matches;
+}
+
+/* UpdateRatingChange / UpdateRankChangeAnim */
+static void step_change(const MuYgResult* r)
+{
+    float change = panel.to - panel.from;
+    char text[24];
+    if (!panel.placed) { panel.anim = 0; mu_ranked_update_result_shown(); return; }
+    if (panel.timer % 2 == 1 && panel.timer < panel.change_len) {
+        sprintf(text, "%0.1f", panel.from + change * ((float) panel.timer / (float) panel.change_len));
+        line(RATING, text, NULL);
+        lbAudioAx_800237A8(change > 0 ? TICK_UP : change < 0 ? TICK_DOWN : 0xD0,
+                           change > 0 ? TICK_UP_VOL : change < 0 ? TICK_DOWN_VOL : 0, 64);
+    } else if (panel.timer == panel.change_len) {
+        sprintf(text, "%0.1f", panel.to);
+        line(RATING, text, NULL);
     }
-    if (!player && status == 0 && rank->known) strcat(detail, " - Loading...");
-    if (!player && status == 2) strcpy(detail, "Rank unavailable");
-    {
-        /* The full label carries the division beside the CSS art. */
-        int label_id = player ? OPP_LABEL : LOCAL_LABEL;
-        const char* value = rank->known ? display.label : "";
-        /* Measured advance: 20.5 CSS units at scale 1. Fit all wire labels,
-         * including Practice Platinum IV and placement totals up to 255. */
-        float width = (float)strlen(value) * 20.5f;
-        float available = player ? 156.0f : 148.0f;
-        float scale = width > available / .5f ? available / width : .5f;
-        /* 25.2 CSS units square on the title's line, four units after the wider of the title
-         * ("Your rank") and the label, and never past x 40 / 230 (local art stays below x 70).
-         * At a fixed x 40 it floated next to "Character selected", away from "Gold IV" (build 37). */
-        float left = player ? 70.0f : -112.0f;
-        float end = left + (float)strlen(panel.lines[player ? OPP_TITLE : LOCAL_TITLE]) * 20.5f * .4f;
-        float x = left + width * scale;
-        if (x < end) x = end;
-        x += 4;
-        if (x > (player ? 230.0f : 40.0f)) x = player ? 230.0f : 40.0f;
-        if (panel.badges[player] && panel.badge_x[player] != x) {
-            mu_rank_badge_free(panel.badges[player]);
-            panel.badges[player] = NULL;
+    if (panel.timer == panel.change_len + RANK_CHANGE_LEN && panel.rank_to != panel.rank_from)
+        lbAudioAx_800237A8(panel.rank_to > panel.rank_from ? RANK_UP_SMALL : RANK_DOWN_SMALL, 255, 64);
+    if (panel.timer == panel.change_len + RANK_CHANGE_LEN / 2 + 1) {
+        if (r->after != r->before) {
+            sprintf(text, "%s%0.1f", change > 0 ? "\x81\x7B" : "\x81\x7C", change < 0 ? -change : change);
+            line(CHANGE, text, change > 0 ? &green : &red);
+            lbAudioAx_800237A8(change > 0 ? RATING_INCREASE : RATING_DECREASE, 255, 64);
+        } else {
+            line(CHANGE, "result pending", &yellow);
         }
-        if (!panel.badges[player]) {
-            panel.badges[player] = mu_rank_badge_create(NULL, panel_x(x),
-                panel_y(player ? 189.4f : 76.4f), 0.105f, &display);
-            mu_rank_badge_art_only(panel.badges[player]);
-            panel.badge_x[player] = x;
-            panel.shown[player] = display;
-        } else if (memcmp(&panel.shown[player], &display, sizeof display) != 0) {
-            mu_rank_badge_set(panel.badges[player], &display);
-            panel.shown[player] = display;
+        if (panel.rank_to != panel.rank_from) {
+            set_icon(panel.rank_to);
+            set_text(panel.rank_to, panel.to, r->rank_after.matches, 0);
         }
-        HSD_SisLib_803A7548(panel.text, label_id, scale, scale);
-        line(label_id, value);
     }
-    line(id, detail);
+    if (panel.timer == panel.change_len + RANK_CHANGE_LEN + RATING_NOTIFICATION_LEN - 1) {
+        line(CHANGE, "", NULL);
+        panel.anim = 0;
+        mu_ranked_update_result_shown();
+    }
+    panel.timer++;
 }
 
 static void refresh(void)
@@ -132,70 +216,68 @@ static void refresh(void)
     MuYgRanks ranks;
     MuYgU8 e3[16];
     unsigned got = 0;
-    int status = 1;
-    int ok = mu_ranked_read_ranks(&ranks);
-    line(LOCAL_TITLE, mu_ranked_practice() ? "Practice - not rated" : "Your rank");
+    int ok = mu_ranked_read_ranks(&ranks), fetching = 1;
     const MuMatchState* ms = mu_slippi_css_msrb();
-    int matched = ms->connection_state == MU_SLP_MM_OPPONENT_CONNECTING ||
-                  ms->connection_state == MU_SLP_MM_CONNECTION_SUCCESS;
+    panel.matched = ms->connection_state == MU_SLP_MM_OPPONENT_CONNECTING ||
+                    ms->connection_state == MU_SLP_MM_CONNECTION_SUCCESS;
     panel.left = ok && (ranks.result.reason == MU_YG_REASON_FORFEIT_WON ||
                         ranks.result.reason == MU_YG_REASON_FORFEIT_LOST) ? ranks.result.reason : 0;
     panel.left_status = panel.left ? ranks.result.status : 0;
-    if (!ok) status = 2;
-    else {
-        if (mu_slippi_cmd(0xE3, NULL, 0, e3, sizeof e3, &got) == 0 && got == sizeof e3)
-            status = e3[1] <= 2 ? e3[1] : 2;
-        else status = 2;
+    if (ok && mu_slippi_cmd(0xE3, NULL, 0, e3, sizeof e3, &got) == 0 && got == sizeof e3) fetching = e3[1] == 0;
+    if (!ok) {
+        line(RANK_NAME, "Error", &white);
+        line(RATING, "Failed to get rank", &red);
+        return;
     }
-    rank_panel(0, &ranks.self, status);
-    if (matched) {
-        line(OPP_TITLE, mu_ranked_practice() ? "CPU practice rank" : "Opponent rank");
-        /* A missing roster standing is unknown, not an invented placement or
-         * a loader that can never finish. A failed record read is an error. */
-        rank_panel(1, &ranks.opponent, ok ? 1 : 2);
-    } else {
-        line(OPP_TITLE, "");
-        line(OPP_DETAIL, "");
-        line(OPP_LABEL, "");
-        mu_rank_badge_free(panel.badges[1]);
-        panel.badges[1] = NULL;
-        memset(&panel.shown[1], 0, sizeof panel.shown[1]);
+    if (panel.anim) return;
+    if (!mu_ranked_practice() && ranks.result.status == MU_YG_RESULT_RECORDED &&
+        (ranks.result.before != shown_before || ranks.result.after != shown_after ||
+         ranks.result.rank_after.matches != shown_matches)) {
+        start_change(&ranks.result);
+        return;
     }
-    panel.matched = matched;
+    set_icon(slippi_rank(&ranks.self));
+    set_text(slippi_rank(&ranks.self), (float) ranks.self.rating / 10.f, ranks.self.matches,
+             fetching && !ranks.self.known);
 }
 
 void mu_ranked_rank_enter(void)
 {
     HSD_GObj* owner;
-    int i;
-    static const float ys[LINE_COUNT] = { 65, 105, 178, 218, 115, 85, 198 };
-    /* Like SlippiCSS's chat hooks: the scene arena is discarded on transition,
-     * even when destructors aren't run. Never free last scene's stale pointers. */
+    MuYgRanks ranks;
+    int rank = 0;
     memset(&panel, 0, sizeof panel);
     if (!active()) return;
+    if (mu_ranked_read_ranks(&ranks)) rank = slippi_rank(&ranks.self);
+    init_icon(rank);
     panel.text = mu_rank_text_create();
     if (!panel.text) return;
+    /* InitRankInfoText: kerning 1, left aligned, scale 0.01 (here: font 0.1 with positions in tenths
+     * of a world unit, so Slippi's x/10 and scale/10). */
     panel.text->default_kerning = 1;
+    panel.text->default_alignment = 0;
     panel.text->pos_x = 0;
     panel.text->pos_y = 0;
     panel.text->font_size.x = panel.text->font_size.y = 0.1f;
-    for (i = 0; i < LINE_COUNT; ++i) {
-        int local = i == LOCAL_TITLE || i == LOCAL_LABEL || i == LOCAL_DETAIL;
-        int label = i == LOCAL_LABEL || i == OPP_LABEL;
-        float scale = label ? 0.5f : 0.4f;
-        int id = HSD_SisLib_803A6B98(panel.text,
-            local ? -112.0f : 70.0f, ys[i], "%s", "");
-        HSD_SisLib_803A7548(panel.text, id, scale, scale);
-        HSD_SisLib_803A74F0(panel.text, id,
-            (GXColor*) (label || i == SET_SCORE ? &white : &gray));
+    {
+        static const float pos[LINE_COUNT][3] = {
+            {-111.0f, 85.0f, .4f},     /* "Rank" (-1110, 850) x4 */
+            {-64.0f, 110.0f, .4f},     /* rank   (-640, 1100) x4 */
+            {-64.0f, 125.0f, .35f},    /* rating (-640, 1250) x3.5 */
+            {-22.5f, 126.0f, .3f},     /* change (-225, 1260) x3 */
+            {-111.0f, 142.0f, .3f},    /* this port's set line, under Slippi's panel */
+        };
+        int i;
+        for (i = 0; i < LINE_COUNT; ++i) {
+            int id = HSD_SisLib_803A6B98(panel.text, pos[i][0], pos[i][1], "%s", "");
+            HSD_SisLib_803A7548(panel.text, id, pos[i][2], pos[i][2]);
+        }
     }
     owner = GObj_Create(4, 5, 0x80);
     if (!owner) { free_panel(NULL); return; }
     GObj_InitUserData(owner, 4, free_panel, NULL);
-    line(LOCAL_TITLE, "Your rank");
-    line(LOCAL_DETAIL, "Loading...");
-    /* E4 is host-local (YouGame's result already arrives through its room).
-     * As RankInfo does, request it only on return from a game, not menu entry. */
+    line(RANK_LABEL, "Rank", &gray);
+    set_text(rank, 0, 0, 1);
     if (mu_ranked_set()->cur_game > 1 || mu_ranked_set()->score[0] || mu_ranked_set()->score[1])
         mu_slippi_cmd(0xE4, NULL, 0, NULL, 0, NULL);
     refresh();
@@ -206,38 +288,34 @@ void mu_ranked_rank_frame(void)
     char score[64] = "";
     const MuRankedSet* set;
     const MuMatchState* ms;
-    int matched;
+    MuYgRanks ranks;
     if (!active() || mu_slippi_css_scene_request()) return;
-    /* Scene assets can become ready after OnEnter. Badges retry in refresh(). */
     if (!panel.text) mu_ranked_rank_enter();
     if (!panel.text) return;
-    ms = mu_slippi_css_msrb();
-    matched = ms->connection_state == MU_SLP_MM_OPPONENT_CONNECTING ||
-              ms->connection_state == MU_SLP_MM_CONNECTION_SUCCESS;
-    /* Cheap cached commands; poll at 4 Hz and immediately on match/disconnect. */
-    if (matched != panel.matched || ++panel.frames >= 15) {
+    if (panel.anim) {
+        if (mu_ranked_read_ranks(&ranks)) step_change(&ranks.result);
+        else panel.anim = 0;
+    }
+    if (++panel.frames >= 15) {
         panel.frames = 0;
         refresh();
     }
+    ms = mu_slippi_css_msrb();
+    /* Every frame, not only at the refresh: a new search clears the set line at once. */
+    panel.matched = ms->connection_state == MU_SLP_MM_OPPONENT_CONNECTING ||
+                    ms->connection_state == MU_SLP_MM_CONNECTION_SUCCESS;
     set = mu_ranked_set();
     if (panel.left && ms->connection_state == MU_SLP_MM_IDLE && !mu_ranked_practice()) {
-        /* The room gave the set by a leave. A leave in game 1 has no score line below, so this
-         * is the only word of it on the CSS; it stays until START, like the score. */
         if (panel.left == MU_YG_REASON_FORFEIT_WON) strcpy(score, "Opponent left: you win");
         else strcpy(score, panel.left_status == MU_YG_RESULT_RECORDED ?
                     "You left: counted as a loss" : "You left the set");
     } else if (set->cur_game > 1 && set->max_games &&
-        (ms->connection_state == MU_SLP_MM_IDLE || matched)) {
-        /* By port in the set; the local player's count first, as on the setup screen. */
+               (ms->connection_state == MU_SLP_MM_IDLE || panel.matched)) {
         const unsigned me = (ms->local_index & 3) == 1, need = (set->max_games + 1u) / 2u;
         const unsigned mine = set->score[me], theirs = set->score[!me];
-        /* Build 30 (11-01): a finished set read "Game 2 - 2:0", as if game 2 were next.
-         * START resets the set, so this shows only on the CSS the set returned to. */
         if (mine >= need || theirs >= need)
             sprintf(score, "Set %s %u:%u", mine >= need ? "won" : "lost", mine, theirs);
         else if (ms->connection_state == MU_SLP_MM_IDLE)
-            /* CTO 11-01: between games a set goes to the setup scene, never this CSS, so an
-             * idle CSS below the win count means a player left or the link dropped. */
             sprintf(score, "Set ended early %u:%u", mine, theirs);
         else
             sprintf(score, "Game %u - %u:%u", (unsigned) set->cur_game, mine, theirs);

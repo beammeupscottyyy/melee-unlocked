@@ -150,6 +150,51 @@ int main() {
     // Start omits stage and inputDelay; cancel carries no rev.
     const json st = doubles_start_frame(7);
     CHECK(st["op"] == "start" && st["rev"] == 7 && !st.count("stage") && !st.count("inputDelay") && !frame_text(st).empty());
+    // The ranked ask is one more key; an unranked start is the frame it always was.
+    CHECK(doubles_start_frame(7, false) == st);
+    const json rst = doubles_start_frame(7, true);
+    CHECK(rst["queue"] == "ranked" && rst["rev"] == 7 && !rst.count("stage") && !frame_text(rst).empty());
+    json bad_queue = rst; bad_queue["queue"] = "casual";
+    CHECK(frame_text(bad_queue).empty());
+    bad_queue = rst; bad_queue["stage"] = 3;               // a Friends start never names a queue
+    CHECK(frame_text(bad_queue).empty());
+    // The home's queue, when Rooms' state names it (a guest learns the host's choice from it).
+    json queued = home(3, {seat_human(0, "a"), seat_open(1)}); queued["queue"] = "ranked";
+    in = decode(queued, Profile::Doubles);
+    CHECK(!in.why && in.state.ranked_shown && in.state.ranked);
+    queued["queue"] = "casual";
+    in = decode(queued, Profile::Doubles);
+    CHECK(!in.why && in.state.ranked_shown && !in.state.ranked);
+    queued["queue"] = "private";                          // not a queue this build knows: as if absent
+    in = decode(queued, Profile::Doubles);
+    CHECK(!in.why && !in.state.ranked_shown);
+    {
+      // The session: the host's choice rides Start; a CPU or second-controller partner blocks a ranked Start;
+      // a refusal of the ranked ask (by name, or as a key Rooms does not know) reads as unranked_only.
+      Session::Options o; o.me = "a"; o.profile = Profile::Doubles; o.ranked = true;
+      Session s(o);
+      json picked = home(4, {seat_human(0, "a"), seat_open(1)}); picked["seats"][0]["pick"] = {{"char", 2}, {"color", 0}, {"team", 0}};
+      CHECK(s.receive(picked) && s.ranked() && s.can_start() == StartBlock::None);
+      (void) s.due(1);
+      CHECK(s.start(0));
+      const auto sent = s.due(2);
+      CHECK(!sent.empty() && sent.back()["op"] == "start" && sent.back()["queue"] == "ranked");
+      json refused = picked; refused["error"] = "shape"; refused["action"] = "start";
+      CHECK(s.receive(refused) && s.ranked_refused() && s.refusal() == "unranked_only");
+      CHECK(refusal_hint(s.refusal(), s.refusal_action()) == MU_LOBBY_HINT_UNRANKED_ONLY);
+      json cpu = picked; cpu["rev"] = 5; cpu["seats"][1] = seat_cpu(1, 5);
+      CHECK(s.receive(cpu) && s.can_start() == StartBlock::RankedHumans && !s.start(0));
+      // Rooms' word wins over this player's own choice (a guest in a friend's unranked home).
+      json casual = picked; casual["rev"] = 6; casual["queue"] = "casual";
+      CHECK(s.receive(casual) && !s.ranked());
+      Session::Options u; u.me = "a"; u.profile = Profile::Doubles;
+      Session plain(u);
+      CHECK(plain.receive(picked) && !plain.ranked() && plain.start(0));
+      const auto plain_sent = plain.due(2);
+      CHECK(!plain_sent.empty() && plain_sent.back() == doubles_start_frame(4));
+      json guest_ranked = picked; guest_ranked["queue"] = "ranked";
+      CHECK(plain.receive(guest_ranked) && plain.ranked());
+    }
     const json c = cancel_frame();
     CHECK(c["op"] == "cancel" && !c.count("rev") && !frame_text(c).empty());
     json extra = c; extra["stage"] = 3;                 // cancel is {t, v, op} (a rev Rooms ignores)
@@ -337,6 +382,16 @@ int main() {
           admit["ranked"] == false && admit["lobby"] == json({{"version", 1}, {"minPlayers", 4}, {"maxLocalPlayers", 1},
                                                               {"compatibility", key}}));
     for (const char* field : {"room", "party", "party_room", "partySearch", "hold"}) CHECK(!admit.count(field));
+    // Ranked Doubles: the same tickets on the ranked queue, people only (no local partner). Unranked's are unchanged.
+    CHECK(doubles_queue_ticket(key, "abcdefghjkmn", "gen-1", 1, false) == solo);
+    CHECK(doubles_match_ticket(key, false) == admit);
+    const json rsolo = doubles_queue_ticket(key, "abcdefghjkmn", "gen-1", 1, true);
+    CHECK(rsolo["ranked"] == true && rsolo["queue"] == "ranked" && !rsolo.count("local_partner") && !rsolo.count("party") &&
+          rsolo["partySearch"] == "gen-1" && rsolo["party_room"] == "abcdefghjkmn" && rsolo["lobby"] == solo["lobby"]);
+    const json rpair = doubles_queue_ticket(key, "abcdefghjkmn", "gen-1", 2, true);
+    CHECK(rpair["party"] == json({{"id", "gen-1"}, {"n", 2}}) && rpair["queue"] == "ranked");
+    const json radmit = doubles_match_ticket(key, true);
+    CHECK(radmit["ranked"] == true && !radmit.count("local_partner") && !radmit.count("queue") && radmit["lobby"] == admit["lobby"]);
     threw = false;
     try { doubles_match_ticket("friends-lobby-1:mu"); } catch (const std::exception&) { threw = true; }
     CHECK(threw);
@@ -698,6 +753,9 @@ int main() {
     CHECK(playing_report["queue"] == "casual" && playing_report["size"] == 4 && playing_report["roomEpoch"] == e2 &&
           playing_report["nativeTeams"] == json({{"v", 1}, {"kind", "match"}, {"home", "abcdefghjkmn"}, {"phase", "playing"}}));
     CHECK(doubles_room_report("abcdefghjkmn", "abcdefghjkmn", false, e1, people, "a", 4, true)["nativeTeams"]["phase"] == "home");
+    // A ranked home's match reports the ranked queue; the home itself stays private.
+    CHECK(doubles_room_report("match-room", "abcdefghjkmn", true, e2, people, "a", 1, false, true)["queue"] == "ranked");
+    CHECK(doubles_room_report("abcdefghjkmn", "abcdefghjkmn", false, e1, people, "a", 4, false, true)["queue"] == "private");
     // A placed match waits past Rooms' 60 s arrival and 90 s late-player hold before giving up on its setup.
     CHECK(kDoublesSetupMs > 150000);
   }

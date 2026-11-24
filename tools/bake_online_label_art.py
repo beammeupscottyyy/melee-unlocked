@@ -24,6 +24,11 @@ SQUAD_INK, SQUAD_TRACKING, SQUAD_SHIFT = 194, -0.6, 12
 UNRANKED_INK, UNRANKED_TRACKING, UNRANKED_BASE = 186, -0.6, 24
 # 11-21: the YouGame page's rows drop the "YouGame" prefix, the page's heading already says YouGame.
 UNRANKED = [('un_yougame', '', 'Unranked'), ('un_both', 'Both', 'Unranked'), ('un_slippi', 'Slippi', 'Unranked')]
+# Doubles' slider (11-23): "Ranked Doubles" beside the plain "Doubles" row (unranked). Set as Unranked's
+# values are (the same scale, baseline and wide label), its letter gaps tightened only as far as it takes to
+# fit the same ink ("Unranked Doubles" cannot fit at this letter height).
+DOUBLES = [('dbl_ranked', 'Ranked', 'Doubles')]
+DOUBLES_TRACKING_MIN = -1.2
 # The YouGame page's other rows, set at the same scale as every other row (one letter height on both pages).
 YOUGAME_ROWS = {'yougame_ranked': 'Ranked', 'yougame_friends': 'Friends', 'yougame_doubles': 'Doubles'}
 PAGE = [('page_slippi_direct', 'Slippi', 'Direct'), ('page_slippi_teams', 'Slippi', 'Teams'),
@@ -54,16 +59,21 @@ def unranked_set(st):
         m = round(m - 0.01, 2)
     w = rs.width_for(max(inks, key=lambda t: t[0])[1])
     out = []
-    for sym, prefix, word in UNRANKED + PAGE:
-        trio = sym.startswith('un_')
-        F, A = one_line(rs, st, f'{prefix} {word}'.strip(), m, UNRANKED_TRACKING if trio else 0.0)
+    for sym, prefix, word in UNRANKED + DOUBLES + PAGE:
+        trio = sym.startswith(('un_', 'dbl_'))
+        tracking = UNRANKED_TRACKING if trio else 0.0
+        F, A = one_line(rs, st, f'{prefix} {word}'.strip(), m, tracking)
         x0, x1 = rs.ink_cols(A)
+        while sym.startswith('dbl_') and x1 - x0 > UNRANKED_INK and tracking > DOUBLES_TRACKING_MIN:
+            tracking = round(tracking - 0.1, 1)
+            F, A = one_line(rs, st, f'{prefix} {word}'.strip(), m, tracking)
+            x0, x1 = rs.ink_cols(A)
         width = w if trio else rs.bl.W
         assert x1 - x0 <= (UNRANKED_INK if trio else rs.USABLE), (sym, x1 - x0)
         Fc, Ac = rs.place(F, A, width)
         a, l = rs.bl.to_ia4(Fc, Ac)
         out.append((sym, f'{prefix} {word}'.strip(), rs.tiled(a, l, width), width,
-                    f'scaled {m:.2f}, tracking {UNRANKED_TRACKING if trio else 0.0}, {x1 - x0} ink columns, {width} texels'))
+                    f'scaled {m:.2f}, tracking {tracking}, {x1 - x0} ink columns, {width} texels'))
     return out, w, m
 
 
@@ -127,7 +137,7 @@ def main():
         print(f'{sym:16s} {text:22s} {how}')
     lines.append(f'#define MU_SST_UNRANKED_W {w}   /* texels; the game widens the Unranked label quad to match */')
     for sym, text, data, width, how in rows:
-        size = 'MU_SST_UNRANKED_W * 32' if width == w and sym.startswith('un_') else 'MU_LABEL_BYTES'
+        size = 'MU_SST_UNRANKED_W * 32' if width == w and sym.startswith(('un_', 'dbl_')) else 'MU_LABEL_BYTES'
         lines.append(f'/* "{text}" ({how}) */')
         lines.append(f'static const unsigned char mu_sst_{sym}[{size}] __attribute__((aligned(32), unused)) = {{')
         lines.extend('    ' + ','.join(f'0x{v:02x}' for v in data[i:i + 32]) + ',' for i in range(0, len(data), 32))

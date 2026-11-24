@@ -4966,7 +4966,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   if (lobby_route) request = json::object();   // set with the ticket below (lobby_hold or lobby_ticket)
   // The queue's ticket admits this player to the match room; a renewal there asks for a match-admission
   // ticket (Teams, teamsLobby 1, 4 players, casual, the same key; no room, party or partySearch).
-  if (doubles_room) request = friends::doubles_match_ticket(lobby_key);
+  if (doubles_room) request = friends::doubles_match_ticket(lobby_key, search.doubles_match.ranked);
 #ifdef MELEE_DOUBLES
   if (doubles_match) request = doubles::ticket(compat, team_room, 4);
   else
@@ -5544,6 +5544,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   // socket for it, and the match room matchmaking names. The match room: when this search reached it, and
   // its room reports.
   lobby::DoublesParty party;
+  bool queue_ranked = false;   // the queue this home's running search is in
   std::unique_ptr<Socket> queue_socket;
   std::string queue_generation, queue_url, queue_pass, matched_room;
   const uint64_t doubles_since = now_ms();
@@ -5723,6 +5724,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
                       ranked::log_text(lobby_me, 12).c_str(), ranked::log_text(room->me, 12).c_str());
             lobby::Session::Options o;
             o.me = lobby_me; o.connection_id = room->me; o.profile = lobby_profile;
+            o.ranked = doubles_home && search.lobby_control && search.lobby_control->ranked_choice();
             // The Doubles match room takes only the setup: no hello (the home sent it), nothing to call off.
             if (!doubles_room) {
               o.settings_digest = lobby_settings; o.card_digest = lobby_card;
@@ -5874,7 +5876,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         if (!doubles_epoch) doubles_epoch = lobby::next_room_epoch();
         try {
           bridge(lobby::doubles_room_report(room_code, search.doubles_match.home, true, doubles_epoch, room->participants,
-                                            lobby_me, room->revision, lobby_plan != nullptr), 1000);
+                                            lobby_me, room->revision, lobby_plan != nullptr, search.doubles_match.ranked), 1000);
         } catch (const update::Required&) { throw; } catch (...) {}
       }
       if (!lobby_plan && now_ms() - doubles_since > lobby::kDoublesSetupMs) {
@@ -5920,7 +5922,9 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         if (lobby_session->searching() && !queue_socket && !party.generation.empty() && party.generation != queue_generation) {
           queue_generation = party.generation;
           try {
-            const json queue_request = friends::doubles_queue_ticket(lobby_key, room_code, queue_generation, lobby_session->owns_local() ? 1 : party.humans);
+            queue_ranked = lobby_session->ranked();
+            const json queue_request = friends::doubles_queue_ticket(lobby_key, room_code, queue_generation,
+                                                                     lobby_session->owns_local() ? 1 : party.humans, queue_ranked);
             const json qt = ticket_bridge(queue_request, 15000);
             queue_url = qt.value("url", "");
             queue_pass = qt.value("ticket", "");
@@ -5930,7 +5934,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
               throw std::runtime_error("YouGame did not return a Doubles search ticket");
             if (!qs->open_session(queue_url, queue_pass, "", &queue_error, 10000, cancelled)) throw std::runtime_error(queue_error);
             queue_socket = std::move(qs);
-            host::log("doubles: searching for %s", party.humans == 2 ? "opponents" : "a team");
+            host::log("doubles: searching for %s (%s)", party.humans == 2 ? "opponents" : "a team", queue_ranked ? "ranked" : "unranked");
           } catch (const update::Required&) { throw; }
           catch (const std::exception& e) {
             if (cancelled()) return fail("Cancelled");
@@ -5987,6 +5991,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
           next.doubles_match.ticket = queue_pass;
           next.doubles_match.room = matched_room;
           next.doubles_match.home = room_code;
+          next.doubles_match.ranked = queue_ranked;
           lobby_leave.handed_off = true;
           room->lobby_session = std::move(lobby_session);
           room->lobby_me = lobby_me;

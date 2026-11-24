@@ -93,6 +93,7 @@ uint64_t g_frame_sequence = 0;
 bool g_discontinuity = false;   // simulation thread only, like the rest of this file's state
 bool g_hard_cut = false;        // the pending discontinuity includes one that was not an online rollback
 std::atomic<int> g_stock_hud_scale{100}, g_damage_hud_scale{100};
+std::atomic<bool> g_hide_percents{false};   // Damage percents: Hidden (Source Port, bit 16 of hud_scales)
 std::atomic<bool> g_pal_stock_hud{false};
 std::atomic<bool> g_code_pal_stock{false};   // a PAL Stock Icons Gecko code is on (set_code_pal_stock)
 std::atomic<bool> g_low_poly_fighters{false};
@@ -1400,8 +1401,10 @@ void set_native_hud_combo(int slot, int link, float percent, bool stunned) {
 uint32_t hud_scales_packed() {
   const auto clamp_percent = [](int p) { return (uint32_t)std::clamp(p, 75, 175); };
   return clamp_percent(g_stock_hud_scale.load(std::memory_order_relaxed)) |
-         clamp_percent(g_damage_hud_scale.load(std::memory_order_relaxed)) << 8;
+         clamp_percent(g_damage_hud_scale.load(std::memory_order_relaxed)) << 8 |
+         (g_hide_percents.load(std::memory_order_relaxed) ? 1u << 16 : 0u);
 }
+void set_hide_percents(bool on) { g_hide_percents.store(on, std::memory_order_relaxed); }
 
 bool supports_game_reset() { return !g_backend || g_backend->supports_game_reset(); }
 

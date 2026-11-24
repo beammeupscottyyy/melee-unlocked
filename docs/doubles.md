@@ -50,6 +50,33 @@ the simulation checks the menu, console, Slippi and replay gates again before bo
 Engine-end notifications are match-ended commands, ignored outside admission/play.
 Ending Doubles clears g_console_boot so ordinary Friends can reset/join again.
 
+## Queue choice: Doubles and Ranked Doubles (the 2-seat home, 11-23)
+
+This section is about the 2-seat Doubles home (`yougame_lobby.h`, `Profile::Doubles`), the route the Doubles
+row opens today. The rest of this file describes the older console home.
+
+The Online menu's Ranked row is a slider: `Ranked | Ranked Doubles` (left / right, d-pad, L / R; every
+session starts on Ranked). On Ranked Doubles its press sends E6 value 17 and opens the Doubles home on the
+ranked queue; the Doubles row sends 16 (unranked). Only the player who opens a home chooses its queue, and a
+guest takes the home's.
+
+| Piece | Unranked | Ranked |
+| --- | --- | --- |
+| Home's `start` frame | `{rev}` | `{rev, queue: "ranked"}` |
+| Queue ticket | `ranked: false`, `queue: "casual"`, `local_partner` | `ranked: true`, `queue: "ranked"`, no `local_partner` |
+| Match admission ticket | `ranked: false`, `local_partner` | `ranked: true`, no `local_partner` |
+| Match room report to the app | `queue: "casual"` | `queue: "ranked"` |
+| Partner seat | friend, CPU, Player 2, or found online | friend or found online only |
+| Match | one game | one game for now (best of 3 is not wired) |
+
+A home's state may name its queue (`queue: "ranked"` or `"casual"`); when it does, that wins over the local
+choice. A refusal of the ranked ask (`unranked_only`, or `shape` / `fixed_rules` from a room that does not know
+the key) reads "Ranked is not open yet" on the select and is never sent again as unranked by itself.
+
+**Open with YouGame (not confirmed by its developer):** the name and place of the ranked ask (this build sends
+`queue: "ranked"` on `start`), whether a ranked teams room settles a best of 3 from per-game reports, and
+whether the site's Doubles ticket check accepts `ranked: true`.
+
 ## Rules
 
 `yougame_doubles.h::digest` is shared by begin and Start validation. Its default

@@ -28,6 +28,7 @@ inline unsigned block_hint(const Control::View& v, bool armed) {
       case StartBlock::MatchActive: return MU_LOBBY_HINT_IN_MATCH;
       case StartBlock::PickRequired: return MU_LOBBY_HINT_PICK;
       case StartBlock::NotReady: return MU_LOBBY_HINT_NOT_READY;
+      case StartBlock::RankedHumans: return MU_LOBBY_HINT_RANKED_HUMANS;
       default: return MU_LOBBY_HINT_OPENING;
     }
   }
@@ -50,6 +51,7 @@ inline unsigned block_hint(const Control::View& v, bool armed) {
     case StartBlock::TeamsRequired: return MU_LOBBY_HINT_TEAMS;
     case StartBlock::HumansRequired: return MU_LOBBY_HINT_HUMANS;
     case StartBlock::Searching: return MU_LOBBY_HINT_SEARCHING;
+    case StartBlock::RankedHumans: return MU_LOBBY_HINT_RANKED_HUMANS;
   }
   return MU_LOBBY_HINT_NONE;
 }
@@ -142,6 +144,7 @@ inline MuLobbyView screen_view(const Control::View& v, const ScreenFlags& f) {
   out.note_seq = f.note_seq;
   if (f.armed && !v.started) screen_text(f.note, out.note);
   if (doubles && v.owns_local) out.mode |= MU_LOBBY_M_LOCAL_OWNER;
+  if (doubles && v.ranked) out.mode |= MU_LOBBY_M_RANKED;
   const Rules& r = v.state.rules;
   out.rules = {(unsigned char)r.teams, (unsigned char)r.friendly_fire, (unsigned char)r.time,
                (unsigned char)r.stocks, (unsigned char)r.minutes, (unsigned char)r.pause};

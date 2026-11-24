@@ -2590,6 +2590,25 @@ Result frame(int style, const Frame& f) {
     adjust_end();   // the menu shut some other way: put the small window down
     draw_warmup(dl, f);
     draw_offer(dl, f);
+    {
+      // A stronger Pro AI just finished downloading: it plays from the next match, so say how to get it
+      // now (owner 11-24: players kept fighting the lighter AI and judged the pros by it). Six seconds.
+      static int seen = 0;
+      static double since = -1.0;
+      const int now = phillip_ai::installed_this_session();
+      if (now != seen) {
+        seen = now;
+        since = f.time;
+        host::log("practice menu: stronger Pro AI downloaded; told the player to back out and come back in");
+      }
+      if (since >= 0.0 && f.time - since < 6.0) {
+        Notice n;
+        n.title = "STRONGER PRO AI DOWNLOADED";
+        n.detail = "Back out of this match and come back in to play it.";
+        n.shown_ms = (uint32_t)((f.time - since) * 1000.0);
+        draw_notice(n, f.display_w, f.display_h, f.game_x0, f.game_y0, f.game_x1, f.game_y1, 0.236f);
+      }
+    }
     draw_intro(dl, f);   // its corner hint stays in every Training match, the warm-up's included
     switch (style) {
       case kBars: draw_bars_closed(dl, f); break;

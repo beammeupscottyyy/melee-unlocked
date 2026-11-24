@@ -236,6 +236,7 @@ std::set<std::string> g_fetch_tried;
 std::set<std::string> g_fetch_pending;
 struct Fetch { std::string url, sha, file, dest; };
 std::deque<Fetch> g_fetch_queue;
+std::atomic<int> g_installed{0};   // policies installed since the game started
 
 void fetch_worker() {
   for (;;) {
@@ -248,7 +249,10 @@ void fetch_worker() {
     }
     host::log("pro ai: downloading %s", f.file.c_str());
     std::string why;
-    if (host::updater::fetch_verified(f.url, f.sha, f.dest, &why)) host::log("pro ai: %s installed; it plays from the next match", f.file.c_str());
+    if (host::updater::fetch_verified(f.url, f.sha, f.dest, &why)) {
+      host::log("pro ai: %s installed; it plays from the next match", f.file.c_str());
+      g_installed.fetch_add(1);
+    }
     else host::log("pro ai: %s not downloaded (%s); the character's own policy plays", f.file.c_str(), why.c_str());
     std::lock_guard<std::mutex> lk(g_fetch_mutex);
     g_fetch_pending.erase(f.file);
@@ -1079,6 +1083,8 @@ StrongerStatus stronger_status(int pro) {
   s.downloading = g_fetching.load();
   return s;
 }
+
+int installed_this_session() { return g_installed.load(); }
 
 void download_stronger(int pro) {
   std::lock_guard<std::mutex> catalog_lock(g_mutex);

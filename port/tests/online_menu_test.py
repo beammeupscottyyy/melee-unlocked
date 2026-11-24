@@ -953,7 +953,7 @@ for (int row=0;row<4;++row) {
         host = (ROOT / 'port/runtime/hle/slippi_online.cpp').read_text()
         case = host.split('    case CMD_YOUGAME_FRIENDS_MENU:', 1)[1].split('    case CMD_YOUGAME_DATA:', 1)[0]
         query = ('static User* g_user; static bool g_online_menu_visible; static std::atomic<bool> g_friends_css;\n'
-                 'static std::atomic<bool> g_doubles_lobby_request;\n'
+                 'static std::atomic<bool> g_doubles_lobby_request, g_doubles_lobby_ranked;\n'
                  'bool query_menu(const unsigned char* payload, std::vector<unsigned char>& q) {' + case + '}\n')
         self.compile_fixture('query', '#include <functional>\n#include <atomic>\n' + ROUTE_STUBS + grant +
                              'static void reset() { reads = compatibility = prepared = yg_calls = tickets = 0; }\n' + query + QUERY_CASES)

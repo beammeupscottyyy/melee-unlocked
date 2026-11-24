@@ -2329,6 +2329,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   options.freeze_fd = false;
   options.hide_ko_explosions = false;
   options.hide_hud_emblems = false;
+  options.hide_percents = false;
   options.community_codes = 0;
   options.pro_ai_stronger = 0;   // a file without the key: ask
   options.pro_ai_extra_delay = 0;
@@ -2517,7 +2518,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       // so a new key lets every player start from today's default (off; on for agent runs) once.
       else if (key == "showfps_yougame2") saved_showfps_yougame = value == "1";
       else if (key == "showvram") options.show_vram = value == "1";
-      else if (key == "showping") options.show_ping = value == "1";
+      else if (key == "showping" || key == "liveping") (key == "showping" ? options.show_ping : options.live_ping) = value == "1";
       else if (key == "netoverlay") net_overlay::set_enabled(value == "1");
       // Diagnostic, off unless someone is hunting a one-frame glitch: see RenderOptions::flicker_scan.
       // Settings-file only rather than a control in the panel, because it costs a readback on every
@@ -2628,7 +2629,8 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "cpu_20xx") options.cpu_20xx = value == "1";
       else if (key == "freeze_fd") options.freeze_fd = value == "1";
       else if (key == "hide_ko_explosions") options.hide_ko_explosions = value == "1";
-      else if (key == "hide_hud_emblems") options.hide_hud_emblems = value == "1";
+      else if (key == "hide_hud_emblems" || key == "hide_percents")
+        (key == "hide_percents" ? options.hide_percents : options.hide_hud_emblems) = value == "1";
       else if (key == "proaistronger") options.pro_ai_stronger = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "community_codes") options.community_codes = (uint32_t)std::strtoul(value.c_str(), nullptr, 16) & (MU_DISPLAY_OPTION_CODES_ALL | MU_DISPLAY_OPTION_OFFLINE_CODES);
       else if (key == "unlock_all") options.unlock_all = value != "0";
@@ -2921,6 +2923,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);
   host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);
   host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
+  gx::set_hide_percents(options.hide_percents);
   host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
   phillip_ai::set_stronger_choice(options.pro_ai_stronger);
   host::settings_shortcut::practice_chord().store((uint16_t)options.practice_chord, std::memory_order_relaxed);
@@ -5213,7 +5216,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nshowfps " << (g_display_keys.yougame ? g_display_keys.show_fps : options.show_fps)
        << (g_display_keys.yougame ? std::string("\nshowfps_yougame2 ") + (options.show_fps ? "1" : "0")
            : g_display_keys.saved_showfps_yougame >= 0 ? "\nshowfps_yougame2 " + std::to_string(g_display_keys.saved_showfps_yougame) : std::string())
-       << "\nshowvram " << (options.show_vram ? 1 : 0) << "\nshowping " << options.show_ping
+       << "\nshowvram " << (options.show_vram ? 1 : 0) << "\nshowping " << options.show_ping << "\nliveping " << (options.live_ping ? 1 : 0)
        << "\nnetoverlay " << (net_overlay::enabled() ? 1 : 0)
        << "\ndlss " << options.dlss_mode << "\nframegen " << options.frame_generation_mode
        << "\nfgmax " << options.fg_cached_max << "\nfgdynamic " << (options.fg_cached_dynamic ? 1 : 0)
@@ -5360,6 +5363,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nfreeze_fd " << (options.freeze_fd ? 1 : 0)
        << "\nhide_ko_explosions " << (options.hide_ko_explosions ? 1 : 0)
        << "\nhide_hud_emblems " << (options.hide_hud_emblems ? 1 : 0)
+       << "\nhide_percents " << (options.hide_percents ? 1 : 0)
        << "\ncommunity_codes " << std::hex << options.community_codes << std::dec
        << "\nproaistronger " << options.pro_ai_stronger
        << "\nproaireaction " << options.pro_ai_extra_delay
@@ -10704,7 +10708,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       }
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Applies from the next online match. Higher delay can reduce rollbacks.\n"
-                          "Auto picks 2 to 6 frames from ping at match start and holds it for that match.\n"
+                          "Auto picks 2 to 4 frames from ping at match start and holds it for that match.\n"
                           "Without a ping measurement, Auto uses the last manual online value (%d frames).",
                           slippi::online::config().delay);
       if (online == 1)
@@ -11236,13 +11240,22 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("No burst of colour when a fighter is KO'd off the side, top or bottom.\n"
                         "The match is exactly the same, so it also works online and in replays.\n"
                         "Picture only, yours alone. Both engines. Takes effect from the next KO.");
-    if (settings_toggle("Hide emblems behind percents", &options.hide_hud_emblems)) {
-      host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
-      changed = true;
+    {
+      // One row (owner 11-24: no more rows): the emblem switch, and UnclePunch's Hide HUD as "Hidden".
+      static const char* const kPercents[] = {"Shown", "Without emblems", "Hidden"};
+      int percents = options.hide_percents ? 2 : options.hide_hud_emblems ? 1 : 0;
+      if (settings_combo("Damage percents", &percents, kPercents, 3)) {
+        options.hide_hud_emblems = percents == 1;
+        options.hide_percents = percents == 2;
+        host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
+        gx::set_hide_percents(options.hide_percents);
+        changed = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Without emblems: no character emblem behind each player's damage percent (both engines).\n"
+                          "Hidden: no damage percents at all, as UnclePunch's Hide HUD code (Source Port).\n"
+                          "Picture only, yours alone: the match is the same, online and in replays too.");
     }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("No character emblem behind each player's damage percent.\n"
-                        "Picture only, yours alone: the match is the same, online and in replays too. Both engines.");
 
     // Community codes: players' favourite Gecko codes, built in (shim/mu_code_features.c). Picture and
     // sound only, so each is yours alone, online and in replays too.
@@ -12106,7 +12119,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     changed |= settings_toggle("Performance overlay", &options.performance_overlay);
     changed |= settings_toggle("FPS counter (top left)", &options.show_fps);
     // VRAM has its own line in the Video tab, right by the settings that move it; no overlay needed.
-    changed |= settings_toggle("Ping while online (under the FPS)", &options.show_ping);
+    {
+      // One row (owner 11-24: no more rows): off, the ping held a second at a time, or every reading.
+      static const char* const kPing[] = {"Off", "Once a second", "Live"};
+      int ping = !options.show_ping ? 0 : options.live_ping ? 2 : 1;
+      if (settings_combo("Ping while online (under the FPS)", &ping, kPing, 3)) {
+        options.show_ping = ping != 0;
+        if (ping) options.live_ping = ping == 2;
+        changed = true;
+      }
+    }
     {
       bool net = net_overlay::enabled();
       if (settings_toggle("Network and timing", &net)) { net_overlay::set_enabled(net); changed = true; }
@@ -12745,8 +12767,17 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           std::snprintf(lines[n++], sizeof lines[0], "FPS: %.0f", ImGui::GetIO().Framerate);
       }
       if (ping_line) {
-        // Teams: each other player's ping, in port order, as Slippi shows them.
-        const std::vector<int> pings = slippi::online::remote_pings_ms();
+        // Teams: each other player's ping, in port order, as Slippi shows them. The numbers are read once a
+        // second and held (lemon / owner 11-24: they changed several times a second and could not be read).
+        static std::vector<int> pings;
+        static int single_ping = 0;
+        static double read_at = -1.0;
+        const double now = ImGui::GetTime();
+        if (options.live_ping || read_at < 0.0 || now - read_at >= 1.0 || now < read_at) {
+          pings = slippi::online::remote_pings_ms();
+          single_ping = slippi::online::ping_ms();
+          read_at = now;
+        }
         if (pings.size() > 1) {
           int used = std::snprintf(lines[n], sizeof lines[0], "Ping:");
           for (size_t i = 0; i < pings.size() && used > 0 && used < (int)sizeof lines[0]; ++i)
@@ -12754,7 +12785,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           if (used > 0 && used < (int)sizeof lines[0]) std::snprintf(lines[n] + used, sizeof lines[0] - used, " ms");
           ++n;
         } else {
-          std::snprintf(lines[n++], sizeof lines[0], "Ping: %d ms", slippi::online::ping_ms());
+          std::snprintf(lines[n++], sizeof lines[0], "Ping: %d ms", single_ping);
         }
       }
       if (options.reflex_stats && streamline::reflex_latency_ms() > 0.0f && n < 3)

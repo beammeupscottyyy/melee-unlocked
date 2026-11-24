@@ -827,8 +827,9 @@ bool should_advance_online_frame(int32_t frame) {
   return false;
 }
 
-// The input delay this match uses. Auto: enough frames to cover half the round trip plus 4 ms of
-// jitter, never under Slippi's default 2 nor over 6; with no ping measured yet, the set value. The
+// The input delay this match uses. Auto: a quarter of the round trip in frames, never under Slippi's
+// default 2 nor over 4 (subframe rollback covers the rest: it used to cover half the round trip, 6 frames
+// at 166 ms, more than players choose by hand, owner 11-24); with no ping measured yet, the set value. The
 // game asks for it twice while a match is set up (CMD_GET_DELAY, then the match start block), so the
 // value is latched on the first ask and held until the match ends: both asks must agree.
 static int g_latched_delay = 0;
@@ -858,7 +859,7 @@ static int effective_delay() {
     host::log("slippi: auto delay: no ping from this opponent, using the set delay %d", g_latched_delay);
     return g_latched_delay;
   }
-  g_latched_delay = std::clamp((int)std::ceil((ping / 2.0 + 4.0) / 16.683), 2, 6);
+  g_latched_delay = std::clamp((int)std::lround(ping / 4.0 / 16.683), 2, 4);
   host::log("slippi: auto delay: %s ping %d ms, %d frames", match_ping > 0 ? "match" : "pre-match", ping, g_latched_delay);
   return g_latched_delay;
 }
@@ -2811,10 +2812,12 @@ bool native_start_match(int mode, const std::string& connect_code, uint8_t chara
 
 // The Doubles row's press (CMD_YOUGAME_FRIENDS_MENU 16), taken once by native_practice's tick.
 std::atomic<bool> g_doubles_lobby_request{false};
+std::atomic<bool> g_doubles_lobby_ranked{false};   // the queue of the last Doubles row press (its slider)
 bool take_doubles_lobby_request() { return g_doubles_lobby_request.exchange(false); }
+bool doubles_lobby_ranked() { return g_doubles_lobby_ranked.load(); }
 
 void arm_friends_lobby(const std::string& room) { arm_friends_lobby(room, yougame::lobby::Profile::Friends4); }
-void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile) {
+void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile, bool ranked) {
   auto& lobby = g_friends_lobby;
   if (lobby.invite_stop) lobby.invite_stop->store(true);
   lobby = FriendsLobby{};
@@ -2823,11 +2826,13 @@ void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile)
   lobby.guest = !room.empty();
   lobby.room = room;
   lobby.profile = profile;
-  lobby.control = std::make_shared<yougame::lobby::Control>(profile);
+  // Only the player who opens a home chooses its queue; a guest takes the home's (Rooms' state says).
+  lobby.control = std::make_shared<yougame::lobby::Control>(profile, ranked && room.empty());
   const bool doubles = profile == yougame::lobby::Profile::Doubles;
   host::log("%s: %s", doubles ? "doubles" : "friends lobby",
             lobby.guest ? (doubles ? "joining a friend's Doubles home" : "joining a friend's lobby")
-                        : (doubles ? "opening a Doubles home" : "opening a lobby"));
+                        : (doubles ? (lobby.control->ranked_choice() ? "opening a Ranked Doubles home" : "opening a Doubles home")
+                                   : "opening a lobby"));
   if (!start_lobby_search() && !g_forced_error.empty()) {
     host::log("friends lobby: the search can't start (%s)", g_forced_error.c_str());
     lobby.closed = true;
@@ -3652,8 +3657,9 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
         return true;
       }
 #endif
-      if (payload[0] == 16) { // the Doubles row (G2): open the 2-seat Doubles home's select (native_practice arms it)
-        if (yougame::session()) g_doubles_lobby_request = true;   // the app's layout, and the launcher's Doubles row
+      if (payload[0] == 16 || payload[0] == 17) { // the Doubles row (G2): open the 2-seat Doubles home's select (native_practice arms it)
+        // 17: the row's slider says Ranked Doubles. Stored before the request so its taker reads this press's choice.
+        if (yougame::session()) { g_doubles_lobby_ranked = payload[0] == 17; g_doubles_lobby_request = true; }
         return true;
       }
       if (payload[0] == 8) {

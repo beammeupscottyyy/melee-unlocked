@@ -2053,6 +2053,9 @@ void install_costume_texture_anims() {
   const bool frame = ppc::redirect_to_host(0x80070458u, costume_texture_frame);
   const bool fighter_frame = ppc::redirect_to_host(0x800704F0u, fighter_texture_frame);
   if (!list || !setup || !frame || !fighter_frame) log("fighters: the costume texture setup keeps the game's own code");
+  // A mod disc's own copy of the setup (Akaneia) replaces these and keeps the game's stop: a costume skin
+  // missing a texture animation is then served as the disc's own costume (cosmetic_mods.cpp).
+  host::cosmetics::set_strict_texture_anims([] { return ppc::runs_from_ram(0x80070200u) || ppc::runs_from_ram(0x80070308u); });
 }
 // MELEE_TEST_ADVENTURE_SCENE=<decimal scene id> (tests only, Static Recomp): Adventure starts at
 // that scene (stage * 8 + part: 25 is the Zelda fight, 33 the Kirby team), as the Source Port's hook

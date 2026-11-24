@@ -1,6 +1,15 @@
 // The installed YouGame app as the launcher's sign-in (launcher_yougame_app.h).
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdlib>
+#include <cwchar>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
 #include "launcher_yougame_app.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace launcher::yougame::app {
 
@@ -73,6 +82,8 @@ namespace {
 namespace channel = ::yougame::channel;
 
 bool find(bool staging, channel::Candidate* out, std::string* why) {
+  // Test runs only (MELEE_LAUNCHER_TEST_NO_APP): as if the YouGame app were closed.
+  if (std::getenv("MELEE_LAUNCHER_TEST") && std::getenv("MELEE_LAUNCHER_TEST_NO_APP")) { if (why) *why = "test run: no app"; return false; }
   for (const auto& c : channel::candidates(why))
     if (c.staging == staging) { *out = c; return true; }
   return false;
@@ -181,7 +192,10 @@ bool start(bool staging, int wait_ms) {
 }
 #endif
 
-Answer ask(bool staging, const std::string& version, int timeout_ms) {
+// Opens the app's channel, says hello as this game, then (signed in or not) lets `more` make its own requests on the
+// same connection before it closes. ask() and social() are its two uses.
+using Request = std::function<json(json, int)>;
+static Answer run(bool staging, const std::string& version, int timeout_ms, const std::function<void(const Request&, Answer&)>& more) {
   Answer out;
   channel::Candidate where;
   std::string why;
@@ -222,7 +236,7 @@ Answer ask(bool staging, const std::string& version, int timeout_ms) {
     const std::string line = channel::request_line(body);
     if (line.empty() || !conn->write_line(line)) return json();
     std::unique_lock<std::mutex> lock(box->m);
-    const auto until = std::min(end, std::chrono::steady_clock::now() + std::chrono::milliseconds(ms));
+    const auto until = (std::min)(end, std::chrono::steady_clock::now() + std::chrono::milliseconds(ms));
     box->cv.wait_until(lock, until, [&] { return box->answers.count(id) || box->eof; });
     if (!box->answers.count(id)) return json();
     json j = std::move(box->answers[id]);
@@ -239,7 +253,7 @@ Answer ask(bool staging, const std::string& version, int timeout_ms) {
     if (!pending) break;
     {
       std::unique_lock<std::mutex> lock(box->m);
-      box->cv.wait_until(lock, std::min(end, std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms)),
+      box->cv.wait_until(lock, (std::min)(end, std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms)),
                          [&] { return box->arrived || box->eof; });
       box->arrived = false;
     }
@@ -248,27 +262,126 @@ Answer ask(bool staging, const std::string& version, int timeout_ms) {
   }
   if (pending) { out.state = Answer::kNoAnswer; out.why = "the app's player did not arrive"; }
   if (out.state == Answer::kNoAnswer && out.why.empty()) out.why = "no hello";
-  if (out.state == Answer::kSignedIn) {
-    // The connect code, asked as the game asks it; accountSwitching: again after its retryAfter, twice at most.
-    for (int attempt = 0; attempt < 3; ++attempt) {
-      const json code = request({{"type", "mpCode"}}, 8000);
-      if (code.is_object() && code.value("ok", false)) {
-        const json r = code.count("result") && code["result"].is_object() ? code["result"] : json::object();
-        if (r.count("code") && r["code"].is_string()) out.code = r["code"];
-        break;
-      }
-      const std::string c = code.is_object() && code.count("code") && code["code"].is_string() ? code["code"].get<std::string>() : "";
-      if (c == "signedOut") { out = Answer{}; out.state = Answer::kSignedOut; break; }
-      if (c != "accountSwitching") break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(channel::retry_after_ms(code)));
-    }
-    if (out.state == Answer::kSignedIn && out.name.empty())
-      out.name = out.code.empty() ? std::string("Player") : out.code.substr(0, out.code.find('#'));
-  }
+  if (more) more(request, out);
   conn->close();
   reader.join();
   return out;
 }
 
+#ifdef _WIN32
+namespace {
+json answer_json(const Answer& a) { return {{"state", (int)a.state}, {"player_id", a.player_id}, {"name", a.name}, {"code", a.code}, {"why", a.why}}; }
+Answer answer_from(const json& j) {
+  Answer a; if (!j.is_object()) { a.state = Answer::kNoAnswer; a.why = "no answer from the channel helper"; return a; }
+  a.state = (Answer::State)j.value("state", (int)Answer::kNoAnswer); a.player_id = j.value("player_id", std::string());
+  a.name = j.value("name", std::string()); a.code = j.value("code", std::string()); a.why = j.value("why", std::string()); return a;
+}
+// Runs `job` ({op, staging, version, timeout, requests}) in the hidden copy and returns what it printed (one JSON).
+json in_helper(const json& job, int timeout_ms) {
+  wchar_t exe[MAX_PATH] = {}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE}; HANDLE in_r = nullptr, in_w = nullptr, out_r = nullptr, out_w = nullptr;
+  if (!CreatePipe(&in_r, &in_w, &sa, 0)) return {};
+  if (!CreatePipe(&out_r, &out_w, &sa, 0)) { CloseHandle(in_r); CloseHandle(in_w); return {}; }
+  SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0); SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOW si{sizeof si}; si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+  si.hStdInput = in_r; si.hStdOutput = out_w; si.hStdError = out_w;
+  std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --yougame-channel";
+  PROCESS_INFORMATION pi{};
+  const BOOL ok = CreateProcessW(exe, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS, nullptr, nullptr, &si, &pi);
+  CloseHandle(in_r); CloseHandle(out_w);
+  if (!ok) { CloseHandle(in_w); CloseHandle(out_r); return {}; }
+  const std::string text = job.dump() + "\n"; DWORD wrote = 0; WriteFile(in_w, text.data(), (DWORD)text.size(), &wrote, nullptr); CloseHandle(in_w);
+  std::string got; char buf[4096]; DWORD n = 0;
+  const ULONGLONG until = GetTickCount64() + (ULONGLONG)timeout_ms + 5000;
+  for (;;) {   // read until the copy ends or the time is up
+    DWORD avail = 0;
+    if (PeekNamedPipe(out_r, nullptr, 0, nullptr, &avail, nullptr) && avail) { if (ReadFile(out_r, buf, sizeof buf, &n, nullptr) && n) got.append(buf, n); continue; }
+    if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) { while (ReadFile(out_r, buf, sizeof buf, &n, nullptr) && n) got.append(buf, n); break; }
+    if (GetTickCount64() > until) { TerminateProcess(pi.hProcess, 1); break; }   // only that copy, by its own handle
+  }
+  CloseHandle(out_r); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  const size_t at = got.rfind("\nYGHELPER "); const size_t from = got.rfind("YGHELPER ", 0) == 0 ? 0 : at == std::string::npos ? std::string::npos : at + 1;
+  if (from == std::string::npos) return {};
+  return json::parse(got.substr(from + 9), nullptr, false);
+}
+bool is_helper = false;
+}  // namespace
+#endif
+Answer ask_direct(bool staging, const std::string& version, int timeout_ms);
+Social social_direct(bool staging, const std::string& version, const std::vector<json>& requests, int timeout_ms);
+Answer ask(bool staging, const std::string& version, int timeout_ms) {
+#ifdef _WIN32
+  if (!is_helper) return answer_from(in_helper({{"op", "ask"}, {"staging", staging}, {"version", version}, {"timeout", timeout_ms}}, timeout_ms).value("hello", json()));
+#endif
+  return ask_direct(staging, version, timeout_ms);
+}
+Answer ask_direct(bool staging, const std::string& version, int timeout_ms) {
+  return run(staging, version, timeout_ms, [](const Request& request, Answer& out) {
+    if (out.state == Answer::kSignedIn) {
+      // The connect code, asked as the game asks it; accountSwitching: again after its retryAfter, twice at most.
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        const json code = request({{"type", "mpCode"}}, 8000);
+        if (code.is_object() && code.value("ok", false)) {
+          const json r = code.count("result") && code["result"].is_object() ? code["result"] : json::object();
+          if (r.count("code") && r["code"].is_string()) out.code = r["code"];
+          break;
+        }
+        const std::string c = code.is_object() && code.count("code") && code["code"].is_string() ? code["code"].get<std::string>() : "";
+        if (c == "signedOut") { out = Answer{}; out.state = Answer::kSignedOut; break; }
+        if (c != "accountSwitching") break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(channel::retry_after_ms(code)));
+      }
+      if (out.state == Answer::kSignedIn && out.name.empty())
+        out.name = out.code.empty() ? std::string("Player") : out.code.substr(0, out.code.find('#'));
+    }
+  });
+}
+
+Social social(bool staging, const std::string& version, const std::vector<json>& requests, int timeout_ms) {
+#ifdef _WIN32
+  if (!is_helper) {
+    const json r = in_helper({{"op", "social"}, {"staging", staging}, {"version", version}, {"timeout", timeout_ms}, {"requests", requests}}, timeout_ms);
+    Social got; got.hello = answer_from(r.value("hello", json()));
+    if (r.is_object() && r.count("answers") && r["answers"].is_object()) for (auto it = r["answers"].begin(); it != r["answers"].end(); ++it) got.answers[it.key()] = it.value();
+    return got;
+  }
+#endif
+  return social_direct(staging, version, requests, timeout_ms);
+}
+Social social_direct(bool staging, const std::string& version, const std::vector<json>& requests, int timeout_ms) {
+  Social got;
+  got.hello = run(staging, version, timeout_ms, [&](const Request& request, Answer& out) {
+    for (const json& body : requests) {
+      const std::string type = body.value("type", std::string());
+      got.answers[type] = request(body, 8000);
+    }
+    (void)out;
+  });
+  return got;
+}
+
+#ifdef _WIN32
+bool helper_main(const wchar_t* command_line, int* code) {
+  if (!command_line || !std::wcsstr(command_line, L"--yougame-channel")) return false;
+  is_helper = true; *code = 0;
+  std::string text; char buf[4096]; DWORD n = 0; HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+  while (ReadFile(in, buf, sizeof buf, &n, nullptr) && n) { text.append(buf, n); if (text.find('\n') != std::string::npos) break; }
+  const json job = json::parse(text, nullptr, false);
+  json out;
+  if (job.is_object()) {
+    const bool staging = job.value("staging", false); const std::string version = job.value("version", std::string());
+    const int timeout = job.value("timeout", 15000);
+    if (job.value("op", std::string()) == "ask") out["hello"] = answer_json(ask_direct(staging, version, timeout));
+    else {
+      std::vector<json> requests; if (job.count("requests") && job["requests"].is_array()) for (const auto& q : job["requests"]) requests.push_back(q);
+      const Social s = social_direct(staging, version, requests, timeout);
+      out["hello"] = answer_json(s.hello); out["answers"] = json::object(); for (const auto& [k, v] : s.answers) out["answers"][k] = v;
+    }
+  }
+  const std::string line = "YGHELPER " + out.dump() + "\n"; DWORD wrote = 0;
+  WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line.data(), (DWORD)line.size(), &wrote, nullptr);
+  return true;
+}
+#endif
 }  // namespace launcher::yougame::app
 #endif

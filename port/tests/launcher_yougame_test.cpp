@@ -303,7 +303,7 @@ int main(int argc, char** argv) {
     CHECK(lobby["ok"] == true);
     sent = json::parse(f.last_ticket);
     CHECK(sent["mode"] == "singles" && !sent.count("teams_lobby") && sent["players"] == 4 && sent["queue"] == "private" &&
-          sent["lobby"]["minPlayers"] == 1);
+          sent["lobby"]["minPlayers"] == 2);
     CHECK(call(f, post(R"({"type":"mpFriend","hold":true,"players":3,"compatibility":"x"})"))["ok"] == false);
     CHECK(call(f, post(R"({"type":"mpRoom","code":"abcdefghjkmn","players":[]})"))["ok"] == true);
     // A ticket for a room named by its code is private; a search stays in its queue.

@@ -120,7 +120,7 @@ def main() -> None:
                          "priority 2 (above the published imitation), trained as every pro they name")
     ap.add_argument("--extra-opponents", type=Path,
                     help="JSON {file: [opponent, ...]} (libmelee names) for --extra policies fine-tuned for a matchup: "
-                         "listed as self-play, priority 4 (above Phillip's matchup policies), only against those opponents")
+                         "listed as self-play, priority 5 (above all of Phillip's matchup policies, his larger d21 ones too), only against those opponents")
     ap.add_argument("--likeness", type=Path,
                     help="JSON {file: true} of policies the likeness measurements cleared (catalog likeness_ok)")
     ap.add_argument("--temperature", type=Path,
@@ -229,7 +229,7 @@ def main() -> None:
             models.append({"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                            "kind": "rl" if matchup else "imitation", "character": character, "opponents": matchup,
                            "delay": int(m["config"]["policy"]["delay"]), "names": names,
-                           "priority": 4 if matchup else 2, "heavy": False, "source": "", "size": path.stat().st_size,
+                           "priority": 5 if matchup else 2, "heavy": False, "source": "", "size": path.stat().st_size,
                            "trained_as": [n for n in m["name_map"] if str(m["name_map"][n]) in {str(c) for c in names.values()}][:4],
                            "pro_trained": {pro: True for pro in names}, "likeness_ok": False,
                            "temperature": float(temperatures.get(path.name, 1.0))})

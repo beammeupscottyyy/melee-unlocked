@@ -66,7 +66,19 @@ void mu_ranked_setup_think(void)
     /* Publish half-filled strikes and dialog costumes BEFORE a timeout tick. */
     if (view.step == model->step && model->status == MU_SETUP_ACTIVE)
         mu_ranked_setup_set_draft(&view.draft);
-    mu_ranked_setup_frame();
+    {
+        /* The step that was the opponent's before this frame (a strike, a stage or a character pick). */
+        const MuRankedSetupStep* before = mu_ranked_setup_current(model);
+        const unsigned step_before = model->step;
+        const int theirs = before && before->player != model->local_player && model->status == MU_SETUP_ACTIVE;
+        mu_ranked_setup_frame();
+        /* The opponent finished their step: the confirm sound, as for the player's own, so a player
+         * looking away hears that it is their turn (player request, 1.0.20). */
+        if (theirs && model->step != step_before && model->status == MU_SETUP_ACTIVE) {
+            lbAudioAx_80024030(1);
+            OSReport("ranked setup: the opponent finished step %u (sound)\n", step_before);
+        }
+    }
     mu_ranked_view_sync(&view, model);
     step = mu_ranked_setup_current(model);
     if (step && step->player == model->local_player && panic_step != model->step &&

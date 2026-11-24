@@ -27,6 +27,9 @@ void restart_after_match();
 // identity key, as the Play page shows them. Empty name: none chosen yet.
 void p2p_player(std::string& name, std::string& code);
 void set_account(const std::string& name, const std::string& code);
+// The Profile page's mains (lobby-profile.json "mains", up to 3, the first is the player's picture). Empty: none chosen.
+std::vector<int> saved_mains();
+void save_mains(const std::vector<int>& mains);
 // The Multiplayer Lobby page is set aside (owner, 2026-11-22): the nav button asks "Open YouGame?"
 // instead, YouGame's lobbies will go on that page, and this lobby moves to a page of its own later.
 // While it is set aside the lobby never goes online (no presence, no requests nobody can answer),

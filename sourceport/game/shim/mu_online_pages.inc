@@ -91,7 +91,8 @@ static int pick_slippi(void)
 static int pages_label_of(int option, int page)
 {
     switch (option) {
-    case MU_SLP_MODE_RANKED: return MP_L_YG_RANKED;   /* YouGame's only: no Slippi Ranked in this build */
+    case MU_SLP_MODE_RANKED:   /* YouGame's only: no Slippi Ranked in this build. Its slider: Ranked | Ranked Doubles */
+        return pages_ranked_doubles(option) ? MP_L_YG_DOUBLES_RANKED : MP_L_YG_RANKED;
     case MU_SLP_MODE_UNRANKED:
         (void) page;
         switch (pages_unranked_value()) {
@@ -277,6 +278,37 @@ static void pages_notice_show(const char* text)
     pages_notice_row = mn_804A04F0.hovered_selection;
 }
 
+/* The Ranked row on the page shown when it can slide to Ranked Doubles (YouGame's page, a build with the
+ * Doubles row), or -1. */
+static int pages_ranked_row(void)
+{
+#ifdef MELEE_DOUBLES
+    int row;
+    if (!pages() || slippi_submenu || mn_804A04F0.cur_menu != MENU_KIND_8) return -1;
+    row = mu_online_menu_row(pages(), 0, MU_SLP_OPT_DOUBLES);
+    if (mu_online_menu_option(pages(), 0, row) != MU_SLP_OPT_DOUBLES) return -1;   /* no Doubles in this menu */
+    row = mu_online_menu_row(pages(), 0, MU_SLP_MODE_RANKED);
+    return mu_online_menu_option(pages(), 0, row) == MU_SLP_MODE_RANKED ? row : -1;
+#else
+    return -1;
+#endif
+}
+/* The Ranked row is on Ranked Doubles: its press opens the Doubles home on the ranked queue. */
+static int pages_ranked_doubles(int option)
+{
+    return option == MU_SLP_MODE_RANKED && doubles_ranked && !agent_copy && pages() && !slippi_submenu;
+}
+/* Left / right on Ranked: Ranked | Ranked Doubles (owner 11-23). Every session starts on Ranked. */
+static void pages_doubles_step(int dir)
+{
+    const int want = dir > 0;   /* right: Ranked Doubles */
+    if (want == doubles_ranked) return;
+    doubles_ranked = want;
+    OSReport("online menu: Ranked slider: %s\n", want ? "Ranked Doubles" : "Ranked");
+    pages_refresh = 1;
+    sfxMove();
+}
+
 /* The slider's arrows are the game's own value arrows from the Rules menu (MenMainCursorRl_Top in
  * MnMaAll: parts 15 and 14, the chevrons beside a rule's value, with their model, material and
  * animation). One copy is parented to the hovered Unranked plate's own joint, so the arrows sit in the
@@ -365,8 +397,9 @@ static HSD_JObj* pages_arrows_load(HSD_JObj* plate)
     }
     return j;
 }
-/* v: Unranked's value (0 YouGame, 1 Both, 2 Slippi); a chevron shows on a side that has another value. */
-static void pages_arrows_place(HSD_JObj* j, int v)
+/* v: the slider's value, 0 to last (Unranked: 0 YouGame, 1 Both, 2 Slippi; Doubles: 0 Ranked Doubles,
+ * 1 Doubles); a chevron shows on a side that has another value. */
+static void pages_arrows_place(HSD_JObj* j, int v, int last)
 {
     HSD_JObj* part;
     /* UI audit previews C1 (about 1.6x) and C2 (about 2x): larger chevrons of equal height, still a
@@ -401,39 +434,47 @@ static void pages_arrows_place(HSD_JObj* j, int v)
         HSD_JObjSetTranslateY(part, PAGES_ARROW_Y + ya + PAGES_ARROW_K * s);
         HSD_JObjSetTranslateZ(part, PAGES_ARROW_Z);
         HSD_JObjSetScaleX(part, s); HSD_JObjSetScaleY(part, s);
-        if (v < 2) HSD_JObjClearFlagsAll(part, JOBJ_HIDDEN); else HSD_JObjSetFlagsAll(part, JOBJ_HIDDEN);
+        if (v < last) HSD_JObjClearFlagsAll(part, JOBJ_HIDDEN); else HSD_JObjSetFlagsAll(part, JOBJ_HIDDEN);
     }
 }
 /* data: the menu object running now (its tree is alive). show: the arrows on its Unranked row; any
  * other copy in its rows is hidden (all of them when the object is leaving: after a page turn
  * slippi_submenu already names the new page, whose Unranked row may be another row of this one). */
-static void pages_arrows_show(MainMenuData* data, int show)
+static void pages_arrows_on(HSD_JObj* plate, int row, int v, int last, const char* name)
 {
-    HSD_JObj *plate = NULL, *arrows;
-    int row = -1, i;
-    if (data == NULL || data->menu_kind != MENU_KIND_8) return;
-    if (show) {
-        row = mu_online_menu_row(pages(), slippi_submenu, MU_SLP_MODE_UNRANKED);
-        /* Hang from joint 1 (the plate group), appended after its own children so the cursor's
-         * depth-first part indices (labels, highlight) stay what the menu expects. */
-        plate = pages_row_group(data, row);
-    }
-    for (i = 0; i < 10; ++i) {   /* every row slot of this object (its own page's rows) */
-        HSD_JObj *slot = data->tree[4 + i], *group = NULL;
-        if (slot == NULL || slot->child == NULL) continue;
-        lb_80011E24(slot->child, &group, 1, -1);
-        if (group == NULL || group == plate || (arrows = pages_arrows_of(group)) == NULL) continue;
-        HSD_JObjSetFlagsAll(arrows, JOBJ_HIDDEN);
-    }
+    HSD_JObj* arrows;
     if (plate == NULL) return;
     arrows = pages_arrows_of(plate);
     if (arrows == NULL) {
         /* A new menu build: the copy is made with the rows' plate and freed with it. */
         arrows = pages_arrows_load(plate);
         if (arrows == NULL) return;
-        OSReport("online menu: Unranked slider arrows: the Rules menu's value arrows on row %d\n", row);
+        OSReport("online menu: %s slider arrows: the Rules menu's value arrows on row %d\n", name, row);
     }
-    pages_arrows_place(arrows, pages_unranked_value());
+    pages_arrows_place(arrows, v, last);
+}
+static void pages_arrows_show(MainMenuData* data, int show)
+{
+    HSD_JObj *plate = NULL, *doubles_plate = NULL, *arrows;
+    int row = -1, doubles_row = -1, i;
+    if (data == NULL || data->menu_kind != MENU_KIND_8) return;
+    if (show) {
+        row = mu_online_menu_row(pages(), slippi_submenu, MU_SLP_MODE_UNRANKED);
+        /* Hang from joint 1 (the plate group), appended after its own children so the cursor's
+         * depth-first part indices (labels, highlight) stay what the menu expects. */
+        plate = pages_row_group(data, row);
+        doubles_row = pages_ranked_row();
+        if (doubles_row >= 0) doubles_plate = pages_row_group(data, doubles_row);
+    }
+    for (i = 0; i < 10; ++i) {   /* every row slot of this object (its own page's rows) */
+        HSD_JObj *slot = data->tree[4 + i], *group = NULL;
+        if (slot == NULL || slot->child == NULL) continue;
+        lb_80011E24(slot->child, &group, 1, -1);
+        if (group == NULL || group == plate || group == doubles_plate || (arrows = pages_arrows_of(group)) == NULL) continue;
+        HSD_JObjSetFlagsAll(arrows, JOBJ_HIDDEN);
+    }
+    pages_arrows_on(plate, row, pages_unranked_value(), 2, "Unranked");
+    pages_arrows_on(doubles_plate, doubles_row, doubles_ranked ? 1 : 0, 1, "Ranked");
 }
 
 /* The description box. mu_mnmain_install_online_menu gives Friends, Doubles and Squad Strike the
@@ -474,12 +515,13 @@ static const char* pages_row_words(int option)
         default: break;
         }
     }
+    if (pages_ranked_doubles(option)) return "Ranked 2v2, alone or with a friend.";
     if (ranked_supported || slippi_submenu) return NULL;
     switch (option) {
     /* Over the local channel (split_friends) Friends is the app's friend flow, with the app's words. */
     case MU_SLP_OPT_FRIENDS: return split_friends() ? "Invite a friend to play." : "Play a friend by code.";
 #ifdef MELEE_DOUBLES
-    case MU_SLP_OPT_DOUBLES: return "Play 2v2 with a friend.";   /* the Doubles home opens through the launcher too */
+    case MU_SLP_OPT_DOUBLES: return "Play 2v2, alone or with a friend.";
 #endif
 #if MU_SQUAD
     case MU_SLP_OPT_SQUAD: return "Play with 4 fighters each.";

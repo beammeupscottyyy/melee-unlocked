@@ -86,6 +86,7 @@ struct RenderOptions {
   bool pc_settings = false, settings_open = false, performance_overlay = false;
   bool show_vram = false;
   bool show_fps = false, show_ping = true;
+  bool live_ping = false;   // the ping line shows every reading, not one a second (owner 11-24)
   // The "Settings: F1" reminder in the corner. On for a new player, off for anyone who knows the
   // key and does not want it in a recording.
   bool settings_hint = false;   // the corner reminder is off by default; Overlays can turn it on
@@ -256,6 +257,8 @@ struct RenderOptions {
   // "Hide emblems behind percents" (Video tab, ini key hide_hud_emblems, both engines): the character
   // emblem behind each damage percent is not drawn (host::g_hide_hud_emblems). Picture only.
   bool hide_hud_emblems = false;
+  // Damage percents: Hidden (owner 11-24, UnclePunch's Hide HUD code): no percents at all. Source Port.
+  bool hide_percents = false;
   // "Community codes" (HUD tab, ini key community_codes, Source Port): MU_DISPLAY_OPTION_CODES_ALL
   // bits, the native versions of players' Gecko codes (host::g_community_codes). Picture and sound.
   uint32_t community_codes = 0;

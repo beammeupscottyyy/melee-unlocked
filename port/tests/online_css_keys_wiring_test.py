@@ -168,7 +168,7 @@ class KeyboardKeysOnTheOnlineScreensTest(unittest.TestCase):
         at = panel.index("mu_f4_panel_text(v, hint, noted, mu_lobby_partner_want(), note, &p);")
         keys = panel.index("mu_f4_panel_keys(&p, b_key, start_key);")
         self.assertLess(at, keys)
-        self.assertLess(keys, panel.index('mu_f4_panel_put(MU_F4_ST_HEADER, "Doubles", &mu_f4_white);'))
+        self.assertLess(keys, panel.index('mu_f4_panel_put(MU_F4_ST_HEADER, v && (v->mode & MU_LOBBY_M_RANKED) ? "Ranked Doubles" : "Doubles", &mu_f4_white);'))
         self.assertIn("mu_host_button_label(port, HSD_PAD_B, b_key, sizeof b_key);", panel)
         self.assertIn("mu_host_button_label(port, HSD_PAD_START, start_key, sizeof start_key);", panel)
 

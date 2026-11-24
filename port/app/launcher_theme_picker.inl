@@ -3,6 +3,7 @@ HWND g_theme_picker=nullptr, g_theme_hex=nullptr;
 COLORREF g_theme_before{}, g_theme_preview{};
 double g_theme_h=268, g_theme_s=.65, g_theme_v=.93;
 bool g_theme_drag=false;
+bool g_theme_for_skin=false; COLORREF g_theme_classic{};   // opened in the Brawl Online look: Classic's accent, kept
 constexpr int THEME_W=268, THEME_H=324, THEME_CX=134, THEME_CY=156, THEME_RADIUS=78;
 std::wstring theme_hex(COLORREF color) {
   wchar_t out[16]{}; swprintf_s(out,L"#%02X%02X%02X",GetRValue(color),GetGValue(color),GetBValue(color)); return out;
@@ -21,8 +22,8 @@ bool theme_parse_hex(COLORREF& out) {
   out=RGB((rgb>>16)&255,(rgb>>8)&255,rgb&255); return true;
 }
 void theme_refresh() {
-  InvalidateRect(g_main,nullptr,FALSE);
-  for(HWND h:g_play) if(h) InvalidateRect(h,nullptr,FALSE);
+  if(g_theme_for_skin) { g_skin_color=launcher::theme::accent; launcher::skin::set_color(g_skin_color); }   // the look takes it, live
+  else { InvalidateRect(g_main,nullptr,FALSE); for(HWND h:g_play) if(h) InvalidateRect(h,nullptr,FALSE); }
   launcher::lobby::refresh_theme();
 }
 void theme_preview_color(COLORREF color) {
@@ -67,8 +68,16 @@ void theme_wheel(HDC dc,int center_x,int center_y,int radius,bool compact=false)
   }
   if(image) DeleteObject(image);DeleteDC(mem);
 }
-void theme_paint_picker(HWND hwnd) {
-  PAINTSTRUCT ps{}; HDC dc=BeginPaint(hwnd,&ps);
+void theme_paint_picker_to(HDC dc);
+void theme_paint_picker(HWND hwnd) {   // off screen, then one copy: no flicker while a colour is dragged
+  PAINTSTRUCT ps{}; HDC screen=BeginPaint(hwnd,&ps);
+  HDC md=CreateCompatibleDC(screen); HBITMAP bm=CreateCompatibleBitmap(screen,S(THEME_W),S(THEME_H)); HGDIOBJ old=SelectObject(md,bm);
+  theme_paint_picker_to(md);
+  BitBlt(screen,0,0,S(THEME_W),S(THEME_H),md,0,0,SRCCOPY);
+  SelectObject(md,old); DeleteObject(bm); DeleteDC(md);
+  EndPaint(hwnd,&ps);
+}
+void theme_paint_picker_to(HDC dc) {
   RECT all{0,0,S(THEME_W),S(THEME_H)}; fill(dc,all,C_CONTENT_BOT);
   round_rect(dc,LR(1,1,THEME_W-2,THEME_H-2),12,C_FIELD,C_FIELD,C_FIELD_BORDER);
   draw_text(dc,L"Launcher color",LR(20,15,180,24),g_font_nav,C_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -85,7 +94,6 @@ void theme_paint_picker(HWND hwnd) {
   round_rect(dc,LR(20,272,105,30),6,C_FIELD,C_FIELD,C_FIELD_BORDER);
   round_rect(dc,LR(137,268,109,35),7,launcher::theme::top(),launcher::theme::bottom(),NO_FILL);
   draw_text(dc,L"Apply",LR(137,268,109,35),g_font,launcher::theme::on_accent(),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-  EndPaint(hwnd,&ps);
 }
 LRESULT CALLBACK theme_picker_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
   switch(msg) {
@@ -94,6 +102,7 @@ LRESULT CALLBACK theme_picker_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
                                    S(30),S(277),S(85),S(20),hwnd,(HMENU)1,GetModuleHandleW(nullptr),nullptr);
       SendMessageW(g_theme_hex,WM_SETFONT,(WPARAM)g_font,TRUE); SetWindowTheme(g_theme_hex,L"DarkMode_Explorer",nullptr);
       return 0;
+    case WM_ERASEBKGND: return 1;
     case WM_PAINT: theme_paint_picker(hwnd); return 0;
     case WM_CTLCOLOREDIT:
       SetTextColor((HDC)wp,C_TEXT); SetBkColor((HDC)wp,C_FIELD); return (LRESULT)g_br_field;
@@ -101,7 +110,11 @@ LRESULT CALLBACK theme_picker_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
       int x=MulDiv(GET_X_LPARAM(lp),96,g_dpi),y=MulDiv(GET_Y_LPARAM(lp),96,g_dpi);
       if(x>=137&&x<=246&&y>=268&&y<=303) {
         COLORREF entered{};
-        if(theme_parse_hex(entered)) { launcher::theme::accent=entered; save_ini(); theme_refresh(); g_theme_before=entered; DestroyWindow(hwnd); }
+        if(theme_parse_hex(entered)) {
+          launcher::theme::accent=entered; theme_refresh(); g_theme_before=entered;
+          if(g_theme_for_skin) launcher::theme::accent=g_theme_classic;   // Classic keeps its own; skincolor= is the look's
+          save_ini(); DestroyWindow(hwnd);
+        }
         else { MessageBeep(MB_ICONWARNING); SetFocus(g_theme_hex); }
       } else { theme_pick_at(x,y); g_theme_drag=true; SetCapture(hwnd); }
       return 0;
@@ -114,7 +127,9 @@ LRESULT CALLBACK theme_picker_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
     case WM_ACTIVATE: if(LOWORD(wp)==WA_INACTIVE) {DestroyWindow(hwnd);return 0;} break;
     case WM_DESTROY:
-      launcher::theme::accent=g_theme_before; theme_refresh(); g_theme_picker=nullptr;g_theme_hex=nullptr;g_theme_drag=false;
+      launcher::theme::accent=g_theme_before; theme_refresh();
+      if(g_theme_for_skin) { launcher::theme::accent=g_theme_classic; g_theme_for_skin=false; }
+      g_theme_picker=nullptr;g_theme_hex=nullptr;g_theme_drag=false;
       return 0;
   }
   return DefWindowProcW(hwnd,msg,wp,lp);
@@ -127,10 +142,13 @@ void open_theme_picker() {
     wc.lpszClassName=L"MeleeUnlockedThemePicker";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     registered=RegisterClassW(&wc)!=0 || GetLastError()==ERROR_CLASS_ALREADY_EXISTS;
   }
+  g_theme_for_skin=launcher::skin::shown(); g_theme_classic=launcher::theme::accent;
+  if(g_theme_for_skin) launcher::theme::accent=g_skin_color;   // the Brawl Online look's own colour to start from
   g_theme_before=g_theme_preview=launcher::theme::accent;
   launcher::theme::to_hsv(g_theme_preview,g_theme_h,g_theme_s,g_theme_v);
   RECT anchor{};GetWindowRect(g_play[6],&anchor);
   RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);
+  if(launcher::skin::shown()) { POINT c{}; GetCursorPos(&c); anchor=RECT{c.x,c.y-S(12),c.x+S(THEME_W),c.y}; }   // by the palette tool
   int px=std::clamp(int(anchor.right-S(THEME_W)),int(work.left),int(work.right-S(THEME_W)));
   int py=std::clamp(int(anchor.top-S(THEME_H)-S(8)),int(work.top),int(work.bottom-S(THEME_H)));
   g_theme_picker=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"MeleeUnlockedThemePicker",L"Theme",

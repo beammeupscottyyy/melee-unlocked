@@ -13,7 +13,7 @@
 enum MuPagesLabel {
     MP_L_NONE, MP_L_YG_RANKED, MP_L_YG_UNRANKED, MP_L_YG_FRIENDS, MP_L_YG_DOUBLES, MP_L_YG_SQUAD,
     MP_L_SLP_UNRANKED, MP_L_SLP_DIRECT, MP_L_SLP_TEAMS, MP_L_SLP_PARTY, MP_L_BOTH_UNRANKED,
-    MP_L_TOURNAMENT, MP_L_END
+    MP_L_TOURNAMENT, MP_L_YG_DOUBLES_RANKED, MP_L_END
 };
 
 int mu_slippi_online_pages(void);            /* the online menu is the two pages (launcher or app) */

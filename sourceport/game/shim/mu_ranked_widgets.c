@@ -400,6 +400,7 @@ static void selector_draw(Selector* s, float x, float y, unsigned mat, unsigned 
     visibility(&s->check,visible && selected && !strike);
     if (s->cross.root) tint(s->cross.root,1,disabled ? (GXColor){135,135,135,255} : (GXColor){255,0,0,255});
 }
+void mu_rank_badge_art_only(MuRankBadge*);   /* mu_rank_badge.c: the art without the numeral */
 static HSD_Text* text_create(MuRankedWidgets* w, float x, float y, float scale)
 {
     /* Editable text (803A6754): the static constructor (803A5ACC) leaves alloc_data NULL, and the
@@ -459,7 +460,9 @@ static void header_text(MuRankedWidgets* w, const MuRankedSetupModel* m, const M
         for (i=7; i<9; ++i) HSD_SisLib_803A7548(w->text,i,.45f,.45f);
     }
     for (i=0; i<2; ++i) {
-        w->names[i]=text_create(w,i ? 575 : 65,39,.35f);
+        /* Slippi GameSetup.c InitPlayerInfo: the name at scale 5 and the code 2 units under it at scale 3,
+         * gray, both 3.55 units in from x 28 to leave room for the rank icon (10 px a unit here). */
+        w->names[i]=text_create(w,i ? 564.5f : 75.5f,39,.7f*5.f/6.f);
         if (w->names[i]) {
             unsigned player=i ? !m->local_player : m->local_player;
             char name[31], code[10];
@@ -467,7 +470,12 @@ static void header_text(MuRankedWidgets* w, const MuRankedSetupModel* m, const M
             memcpy(code,ms->codes[player],9); code[9]=0;
             w->names[i]->default_alignment=i ? 2 : 0;
             text_set(w->names[i],0,name);
-            HSD_SisLib_803A6B98(w->names[i],0,40,"%s",code);
+            {
+                const GXColor code_gray={128,128,128,255};
+                const int sub=HSD_SisLib_803A6B98(w->names[i],0,20.f/(.7f*5.f/6.f),"%s",code);
+                HSD_SisLib_803A7548(w->names[i],sub,.6f,.6f);
+                HSD_SisLib_803A74F0(w->names[i],sub,(GXColor*)&code_gray);
+            }
         }
     }
 }
@@ -491,8 +499,11 @@ static void header_ranks(MuRankedWidgets* w, const MuRankedSetupModel* m)
     r[m->local_player]=&ranks.self; r[!m->local_player]=&ranks.opponent;
     for (seat=0; seat<2; ++seat) {
         unsigned side=seat == m->local_player ? 0 : 1;
-        if (!w->badges[seat]) w->badges[seat]=mu_rank_badge_create(NULL,side ? 584 : 28,52,1.4f,r[seat]);
-        else mu_rank_badge_set(w->badges[seat],r[seat]);
+        /* Slippi's rank icon spot (x +-27.5, y 17.85 world: pixel 320 -+ 275, 54.5), art only as its icons. */
+        if (!w->badges[seat]) {
+            w->badges[seat]=mu_rank_badge_create(NULL,side ? 595.f : 45.f,54.5f,1.4f,r[seat]);
+            mu_rank_badge_art_only(w->badges[seat]);
+        } else mu_rank_badge_set(w->badges[seat],r[seat]);
     }
 }
 /* The room gave this player the set because the opponent left (CTO 11-01): its lines replace

@@ -53359,7 +53359,7 @@ index 64ba6ce21..eec263b13 100644
                      {
                          continue;
 diff --git a/src/melee/ft/ft_07C6.c b/src/melee/ft/ft_07C6.c
-index 917d69ac4..f635c8ffd 100644
+index 917d69ac4..1259f8697 100644
 --- a/src/melee/ft/ft_07C6.c
 +++ b/src/melee/ft/ft_07C6.c
 @@ -21,11 +21,12 @@ void ft_8007C630(Fighter_GObj* gobj)
@@ -53409,8 +53409,29 @@ index 917d69ac4..f635c8ffd 100644
          if (a == b) {
              var_r0 = 0;
          } else {
-@@ -104,19 +106,19 @@ void ft_8007C77C(Fighter_GObj* gobj)
+@@ -102,21 +104,49 @@ void ft_8007C77C(Fighter_GObj* gobj)
+             var_r29 = 1;
+         }
          if (!var_r29) {
++#ifdef MU_NATIVE
++            {
++                /* MELEE_TEST_COIN_LOG (tests only): a coin this fighter touches but may not collect, with
++                 * the coin's own flag byte (0x80 anyone may, 0x40 its owner may). */
++                extern const char* mu_test_getenv(const char* name);
++                static int log_refused = -1;
++                if (log_refused < 0) log_refused = mu_test_getenv("MELEE_TEST_COIN_LOG") != NULL;
++                if (log_refused) {
++                    Fighter_x1614_t probe = ip->xDD4_itemVar.unk4.xDF0;
++                    for (i = 0; i < 2; i++) {
++                        if (lbColl_80007B78(&probe, &fp->x1614[i], ip->scl, fp->x34_scale.y)) {
++                            OSReport("[coin] P%d touched a coin it may not collect (flags %02X, own %d)\n", fp->player_idx + 1,
++                                     (unsigned) ((u8*) &ip->xDD4_itemVar)[0x18], ftLib_80086FD4(gobj, ip->owner) != 0);
++                            break;
++                        }
++                    }
++                }
++            }
++#endif
              continue;
          }
 -        temp_r26 = ip->xDD4_itemVar.unk4.xDF0;
@@ -53429,6 +53450,15 @@ index 917d69ac4..f635c8ffd 100644
 -                                         Player_GetTotalCoins(fp->player_id));
 +                                         Player_GetTotalCoins(fp->player_idx));
                  lbAudioAx_80023870(0x93, 0x7F, 0x40, 0x1A);
++#ifdef MU_NATIVE
++                {
++                    /* MELEE_TEST_COIN_LOG (tests only): each coin a fighter collects. */
++                    extern const char* mu_test_getenv(const char* name);
++                    static int log_coins = -1;
++                    if (log_coins < 0) log_coins = mu_test_getenv("MELEE_TEST_COIN_LOG") != NULL;
++                    if (log_coins) OSReport("[coin] P%d collected %d (now %d)\n", fp->player_idx + 1, (int) temp_r29, Player_GetCoins(fp->player_idx));
++                }
++#endif
                  sp18 = 1.0f;
 -                efSync_Spawn(0x432, NULL, temp_r26[2], &sp18);
 +                efSync_Spawn(0x432, NULL, &temp_r26->x20, &sp18);
@@ -100763,7 +100793,7 @@ index bdc4d71b6..9df736bdd 100644
  typedef struct ChallengerData ChallengerData;
  typedef struct MatchEnd MatchEnd;
 diff --git a/src/melee/gm/gm_1601.c b/src/melee/gm/gm_1601.c
-index 7ad706ec1..40a270487 100644
+index 7ad706ec1..273c04e6a 100644
 --- a/src/melee/gm/gm_1601.c
 +++ b/src/melee/gm/gm_1601.c
 @@ -1,3 +1,7 @@
@@ -101921,7 +101951,7 @@ index 7ad706ec1..40a270487 100644
      if ((rules->score_display != 0) && (rules->mode == 0)) {
          vs_data->start.rules.x3_0 = 1;
          return;
-@@ -3715,6 +3907,16 @@ void gm_80167FC4(SSSData* arg0)
+@@ -3715,6 +3907,25 @@ void gm_80167FC4(SSSData* arg0)
      PAD_STACK(8);
  
      temp_r3 = gmMainLib_GetGameRules();
@@ -101929,6 +101959,15 @@ index 7ad706ec1..40a270487 100644
 +    {
 +        /* Test runs only: straight to the stage MELEE_TEST_VS_STAGE names. */
 +        const int test_stage = mu_test_vs_stage();
++        {
++            /* MELEE_TEST_VS_MODE=<0-3> (tests only): the VS rules' mode (0 time, 1 stock, 2 coin,
++             * 3 bonus), so a hidden run plays a Coin battle. */
++            extern const char* mu_test_getenv(const char* name);
++            const char* m = mu_test_getenv("MELEE_TEST_VS_MODE");
++            if (m != NULL && *m >= '0' && *m <= '3') {
++                temp_r3->mode = (u8) (*m - '0');
++            }
++        }
 +        if (test_stage >= 0) {
 +            arg0->force_stage_id = test_stage;
 +            return;
@@ -101938,7 +101977,7 @@ index 7ad706ec1..40a270487 100644
      if (temp_r3->stage_sel == 1) {
          arg0->force_stage_id = mnSelStageRandom();
          return;
-@@ -3850,54 +4052,69 @@ int gm_80168940(MatchEnd* match_end)
+@@ -3850,54 +4061,69 @@ int gm_80168940(MatchEnd* match_end)
  
  void gm_8016895C(HSD_JObj* arg0, DynamicModelDesc* arg1, int idx)
  {
@@ -102028,7 +102067,7 @@ index 7ad706ec1..40a270487 100644
      if (ckind == CKind_GKoops) {
          return 58.0F;
      }
-@@ -3930,11 +4147,51 @@ float gm_80168BF8(int arg0)
+@@ -3930,11 +4156,51 @@ float gm_80168BF8(int arg0)
  {
      CharacterKind ckind = Player_GetPlayerCharacter(arg0);
      u32 costume = Player_GetCostumeId(arg0);
@@ -102081,7 +102120,7 @@ index 7ad706ec1..40a270487 100644
      switch (arg0) {
      case 0:
          lbAudioAx_800243F4(0x7C830);
-@@ -4164,14 +4421,32 @@ u8 gm_GetNumCostumesForCKind(u8 ckind)
+@@ -4164,14 +4430,32 @@ u8 gm_GetNumCostumesForCKind(u8 ckind)
          HSD_Randi(0);
          HSD_Randi(0);
      }
@@ -102114,7 +102153,7 @@ index 7ad706ec1..40a270487 100644
      if (ckind >= ARRAY_SIZE(lbl_803D51A0)) {
          return 0;
      }
-@@ -4180,6 +4455,11 @@ u8 gm_80169264(u8 ckind)
+@@ -4180,6 +4464,11 @@ u8 gm_80169264(u8 ckind)
  
  u8 gm_80169290(u8 ckind)
  {
@@ -102126,7 +102165,7 @@ index 7ad706ec1..40a270487 100644
      if (ckind >= ARRAY_SIZE(lbl_803D51A0)) {
          return 0;
      }
-@@ -4188,6 +4468,11 @@ u8 gm_80169290(u8 ckind)
+@@ -4188,6 +4477,11 @@ u8 gm_80169290(u8 ckind)
  
  u8 gm_801692BC(u8 ckind)
  {
@@ -145462,7 +145501,7 @@ index 8020cdad3..413b811a1 100644
          HSD_SisLib_803A62A0(2, "SdPrize.usd", "SIS_PrizeData");
      } else {
 diff --git a/src/melee/if/ifstatus.c b/src/melee/if/ifstatus.c
-index a6068103c..d612b4a8f 100644
+index a6068103c..c6e8250d2 100644
 --- a/src/melee/if/ifstatus.c
 +++ b/src/melee/if/ifstatus.c
 @@ -26,29 +26,9 @@
@@ -145698,13 +145737,18 @@ index a6068103c..d612b4a8f 100644
                  ifStatus_802F6948((s8) p->player_slot);
              }
          }
-@@ -639,9 +615,12 @@ static inline IfDamageState* getPlayerByHUDParent(HSD_GObj* parent)
+@@ -639,9 +615,17 @@ static inline IfDamageState* getPlayerByHUDParent(HSD_GObj* parent)
      return NULL;
  }
  
 -void ifStatus_802F5DE0(HSD_GObj* player, s32 arg1)
 +void ifStatus_802F5DE0(HSD_GObj* player, intptr_t arg1)
  {
++#ifdef MU_NATIVE
++    if (mu_hud_percents_hidden()) {   /* Damage percents: Hidden (only the draw) */
++        return;
++    }
++#endif
      if (!getPlayerByHUDParent(player)->flags.hide_all_digits) {
 +#ifdef MU_NATIVE
 +        mu_hud_scale(player, 0);   /* damage number size (settings panel) */
@@ -145712,7 +145756,7 @@ index a6068103c..d612b4a8f 100644
          HSD_GObj_JObjCallback(player, arg1);
      }
  }
-@@ -657,9 +636,17 @@ static inline IfDamageState* getPlayerByNext(HSD_GObj* gobj)
+@@ -657,9 +641,17 @@ static inline IfDamageState* getPlayerByNext(HSD_GObj* gobj)
      return NULL;
  }
  
@@ -145723,7 +145767,7 @@ index a6068103c..d612b4a8f 100644
 +#ifdef MU_NATIVE
 +    /* "Hide emblems behind percents": only the draw is left out; the emblem is still made and
 +     * animated, so nothing else in the game changes. */
-+    if (mu_hud_emblems_hidden()) {
++    if (mu_hud_emblems_hidden() || mu_hud_percents_hidden()) {
 +        return;
 +    }
 +    mu_hud_fade(gobj);   /* HUD Transparency (community code) */
@@ -145731,7 +145775,7 @@ index a6068103c..d612b4a8f 100644
      if (!player->flags.hide_all_digits) {
          HSD_GObj_JObjCallback(gobj, arg1);
      }
-@@ -667,19 +654,19 @@ void ifStatus_802F5E50(HSD_GObj* gobj, s32 arg1)
+@@ -667,19 +659,19 @@ void ifStatus_802F5E50(HSD_GObj* gobj, s32 arg1)
  
  static inline HSD_JObj* ifStatus_GetDamageJObj(HSD_JObj* jobj, s32 i)
  {
@@ -145755,7 +145799,7 @@ index a6068103c..d612b4a8f 100644
      HSD_JObj* jobj;
      Vec3* vec;
      HSD_TObj* tobj;
-@@ -690,8 +677,7 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
+@@ -690,8 +682,7 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
          gobj = GObj_Create(0xE, 0xF, 0);
          jobj = ifStatus_LoadDamageJObj(hud);
          HSD_GObjObject_80390A70(gobj, HSD_GObj_JObjKind, jobj);
@@ -145765,7 +145809,7 @@ index a6068103c..d612b4a8f 100644
          HSD_GObj_SetupProc(gobj, ifStatus_802F5B48, 0x11);
          HSD_GObj_SetupProc(gobj, ifStatus_802F4EDC, 0x11);
          state->HUD_parent_entity = gobj;
-@@ -700,10 +686,9 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
+@@ -700,10 +691,9 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
      }
      state->flags.animation_status_id = 0;
      HSD_JObjRemoveAnim(jobj);
@@ -145779,7 +145823,7 @@ index a6068103c..d612b4a8f 100644
      HSD_JObjReqAnimAll(jobj, 0.0f);
      HSD_JObjAnimAll(jobj);
      vec = ifAll_GetPlayerHUDPosition((u8) player_idx);
-@@ -716,8 +701,7 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
+@@ -716,8 +706,7 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
      if (state->jobjs[3] != NULL) {
          tobj = state->jobjs[3]->u.dobj->mobj->tobj;
          HSD_TObjAddAnimAll(
@@ -145789,7 +145833,7 @@ index a6068103c..d612b4a8f 100644
          if (Player_GetMoreFlagsBit2((s8) state->player_slot) != 0) {
              HSD_TObjReqAnimAll(tobj, 1.0f);
          } else {
-@@ -733,11 +717,11 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
+@@ -733,11 +722,11 @@ HSD_GObj* ifStatus_802F5EC0(IfDamageState* state, s32 player_idx)
      return state->HUD_parent_entity;
  }
  
@@ -145805,7 +145849,7 @@ index a6068103c..d612b4a8f 100644
      s32 i;
      if ((node == NULL) || (n < 0)) {
          return NULL;
-@@ -745,32 +729,21 @@ HSD_GObj* ifStatus_802F6194(HSD_GObj* node, s32 n)
+@@ -745,32 +734,21 @@ HSD_GObj* ifStatus_802F6194(HSD_GObj* node, s32 n)
      if (node == NULL) {
          gx_head = NULL;
      } else {
@@ -145847,7 +145891,7 @@ index a6068103c..d612b4a8f 100644
  {
      *gobj = GObj_Create(0xE, 0xF, 0);
  }
-@@ -803,34 +776,55 @@ HSD_GObj* ifStatus_802F61FC(IfDamageState* state, s32 player_idx)
+@@ -803,34 +781,55 @@ HSD_GObj* ifStatus_802F61FC(IfDamageState* state, s32 player_idx)
              HSD_ASSERTREPORT(0x30A, 0,
                               "Error : gobj dont't get (ifAddMark)\n");
          }
@@ -145910,7 +145954,7 @@ index a6068103c..d612b4a8f 100644
      mobj = HSD_JObjGetChild(jobj)->u.dobj->mobj;
      mobj->mat->diffuse.r = color.r;
      mobj->mat->diffuse.g = color.g;
-@@ -885,6 +879,11 @@ void ifStatus_802F665C(int arg0)
+@@ -885,6 +884,11 @@ void ifStatus_802F665C(int arg0)
      for (i = 0; i < 6; i++) {
          ifStatus_802F6508(i);
      }
@@ -145922,7 +145966,7 @@ index a6068103c..d612b4a8f 100644
  }
  
  void ifStatus_802F66A4(void)
-@@ -892,27 +891,27 @@ void ifStatus_802F66A4(void)
+@@ -892,27 +896,27 @@ void ifStatus_802F66A4(void)
      HudIndex* hud = ifStatus_GetHUDInfo();
      s32 pad0;
      s32 pad1;
@@ -145962,7 +146006,7 @@ index a6068103c..d612b4a8f 100644
  #ifdef MUST_MATCH
          }
      }
-@@ -940,8 +939,7 @@ void ifStatus_802F6804(void)
+@@ -940,8 +944,7 @@ void ifStatus_802F6804(void)
      s32 i;
      IfDamageState* v;
  
@@ -145972,7 +146016,7 @@ index a6068103c..d612b4a8f 100644
          v = &ifStatus_GetHUDInfo()->players[i & 0xFF];
          if (v->HUD_parent_entity != NULL) {
              HSD_GObjFree(v->HUD_parent_entity);
-@@ -952,8 +950,7 @@ void ifStatus_802F6804(void)
+@@ -952,8 +955,7 @@ void ifStatus_802F6804(void)
              v->next = NULL;
          }
          ifStock_802FB650((s8) i & 0xFF);
@@ -145982,7 +146026,7 @@ index a6068103c..d612b4a8f 100644
  }
  
  /// Hide Percentage Digits
-@@ -1002,8 +999,8 @@ static inline void ifStatus_TriggerStockLoss(s32 player_idx,
+@@ -1002,8 +1004,8 @@ static inline void ifStatus_TriggerStockLoss(s32 player_idx,
      struct StartMeleeRules* small_thing;
      IfDamageFlags* hud_player_flags;
  
@@ -145993,7 +146037,7 @@ index a6068103c..d612b4a8f 100644
      small_thing = gm_GetStartMeleeRules();
      hud_player = &ifStatus_GetHUDInfo()->players[player_idx];
      hud_player_flags = &hud_player->flags;
-@@ -1033,7 +1030,7 @@ void ifStatus_802F69C0(s32 player_idx, s32 arg1)
+@@ -1033,7 +1035,7 @@ void ifStatus_802F69C0(s32 player_idx, s32 arg1)
  {
      VsSceneController* big_thing;
  
@@ -150104,7 +150148,7 @@ index 4dfb2105f..61a5cfcfa 100644
  {
      ip->entered_hitlag = efLib_PauseAll;
 diff --git a/src/melee/it/itCharItems.h b/src/melee/it/itCharItems.h
-index 3650dc522..a448a82be 100644
+index 3650dc522..2bbbbe7c5 100644
 --- a/src/melee/it/itCharItems.h
 +++ b/src/melee/it/itCharItems.h
 @@ -10,6 +10,7 @@
@@ -150412,7 +150456,7 @@ index 3650dc522..a448a82be 100644
  ASSERT_SIZE(struct itSeakChain_Attrs, 0x6C);
  
  typedef struct itClimbersString_ItemVars {
-@@ -827,13 +828,13 @@ typedef struct itZeldaDinFireExplodeAttributes {
+@@ -827,13 +828,18 @@ typedef struct itZeldaDinFireExplodeAttributes {
      /* +8 */ f32 x8;
      /* +C */ f32 xC;
      /* +10 */ f32 x10;
@@ -150421,14 +150465,21 @@ index 3650dc522..a448a82be 100644
  
  typedef struct itUnk4_ItemVars {
      /*  +0 ip+DD4 */ u8 pad[0x18];
-     /*  +18 ip+DEC */ u8 xDEC_b0 : 1;
-     /*  +18 ip+DEC */ u8 xDEC_b1 : 1;
+-    /*  +18 ip+DEC */ u8 xDEC_b0 : 1;
+-    /*  +18 ip+DEC */ u8 xDEC_b1 : 1;
 -    /*  +1C ip+DF0 */ Mtx xDF0;
++    /* The coin's own code writes these two through UnkFlagStruct (it_2E5A_ItemVars.x18), whose bits
++     * are laid out as on the console. Declared plainly here, a PC build put them at the other end
++     * of the byte: a fighter never saw a coin as collectable (Coin Mode, the Spare Change event). */
++    struct {
++        /*  +18 ip+DEC */ u8 xDEC_b0 : 1;
++        /*  +18 ip+DEC */ u8 xDEC_b1 : 1;
++    } DISC_STRUCT;
 +    /*  +1C ip+DF0 */ Fighter_x1614_t xDF0;
  } itUnk4_ItemVars;
  
  typedef struct itGamewatchchef_ItemVars {
-@@ -847,19 +848,19 @@ typedef struct itGamewatchchefAttrEntry {
+@@ -847,19 +853,19 @@ typedef struct itGamewatchchefAttrEntry {
      /* +8 */ f32 x8;
      /* +C */ f32 xC;
      /* +10 */ f32 x10;
@@ -150453,7 +150504,7 @@ index 3650dc522..a448a82be 100644
  
  typedef struct itHinoarashi_ItemVars {
      /* xDD4 */ u8 _0[0x60 - 0x0];
-@@ -878,7 +879,7 @@ typedef struct itHinoarashiAttributes {
+@@ -878,7 +884,7 @@ typedef struct itHinoarashiAttributes {
      /* +C */ u8 _pad[0x10 - 0xC];
      /* +10 */ f32 x10;
      /* +14 */ f32 x14;
@@ -150462,7 +150513,7 @@ index 3650dc522..a448a82be 100644
  
  typedef struct itTools_ItemVars {
      /* +0 ip+DD4 */ s32 x0;
-@@ -892,7 +893,7 @@ typedef struct itToolsMotionAttrs {
+@@ -892,7 +898,7 @@ typedef struct itToolsMotionAttrs {
      /* +10 */ f32 x10;
      /* +14 */ f32 x14;
      /* +18 */ f32 x18;
@@ -150471,7 +150522,7 @@ index 3650dc522..a448a82be 100644
  
  typedef struct itToolsAttributes {
      /* +00 */ f32 x0;
-@@ -900,7 +901,7 @@ typedef struct itToolsAttributes {
+@@ -900,7 +906,7 @@ typedef struct itToolsAttributes {
      /* +08 */ f32 x8;
      /* +0C */ s32 xC;
      /* +10 */ itToolsMotionAttrs motions[1];

@@ -63,7 +63,7 @@ class RankedMenuWiringTest(unittest.TestCase):
         self.assertIn('set_text(ST_RANK_OPPONENT + i, "")', css)
         panel = source("sourceport/game/shim/mu_ranked_rank.c")
         self.assertIn("mu_ranked_read_ranks(&ranks)", panel)
-        self.assertIn("mu_rank_badge_create(", panel)
+        self.assertIn("DP(css->rank_icons)", panel)   # Slippi's own rank icon (RankInfo.c InitRankIcon)
         self.assertIn("set = mu_ranked_set()", panel)
         self.assertIn('"Game %u - %u:%u"', panel)
         splash = source("sourceport/game/shim/mu_slippi_splash.c")

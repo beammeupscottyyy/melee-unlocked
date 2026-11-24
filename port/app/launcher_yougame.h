@@ -106,6 +106,11 @@ bool listing_known();   // YouGame's game page was read at least once (listed_cu
 // What Open YouGame opens: the installed YouGame app's link (yougame-staging:// on staging), else the
 // site's download page (<site>/desktop).
 std::string open_target();
+// The YouGame environment in use (production unless launcher.ini or the only app says staging) and its site.
+bool staging_env();
+std::string site_url();
+// A GET with the launcher's own YouGame sign-in (its web view): the HTTP status (0: none) and the body. Never throws.
+int site_get(const std::string& path, std::string* body);
 // The bridge: started once, it answers until the launcher exits. A new launch token per game start;
 // a token stays valid while that game may still be running.
 bool start_bridge(std::string* error);

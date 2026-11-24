@@ -136,6 +136,7 @@ struct RuntimeAsset {
   // replay needs the original's gameplay (its meshes drawn over the original stage, stage_graft.h),
   // the same length as `bytes`. Offline the skin itself is served. Null for everything else.
   std::shared_ptr<const std::vector<uint8_t>> online_bytes;
+  bool lacks_texture_anim = false;   // a costume a mod's own costume setup gets the disc's costume for
 };
 
 constexpr const char* kVoiceKind = "voice_bank";
@@ -1777,6 +1778,70 @@ uint32_t copy_rest_pose(const std::vector<uint8_t>& a, uint32_t asize, uint32_t 
 }
 }  // namespace skeleton
 
+namespace texanims {
+// Which of a costume's textures have an animation, in the order the game counts them: ftParts_80075240
+// walks the fighter's DObjs (the joint tree depth first, each joint's DObjs in order) and each one's
+// TObjs, and ftAnim_80070200 needs the TObj at every index the fighter's data lists to have one. A
+// TObj is animated when its DObj's MatAnim (the _matanim_joint tree, walked alongside) has a TexAnim
+// with the TObj's texture map id and an animation. JObjDesc: flags 0x4, child 0x8, next 0xC, DObj 0x10
+// (unless a particle or spline joint); DObjDesc next 0x4, MObj 0x8; MObjDesc TObj 0x8; TObjDesc next
+// 0x4, id 0x8; MatAnimJoint child 0x0, next 0x4, MatAnim 0x8; MatAnim next 0x0, TexAnim 0x8; TexAnim
+// next 0x0, id 0x4, animation 0x8. Empty when the file has no such trees.
+struct Walk {
+  const std::vector<uint8_t>& b; uint32_t size; const std::vector<uint32_t>& rel;
+  std::vector<bool> out; int budget = 4096;
+  uint32_t ptr(uint32_t at, uint32_t field) const {   // the pointer stored at data offset at+field, or ~0
+    const uint64_t slot = (uint64_t)at + field;
+    if (slot + 4 > size || !skeleton::is_pointer(rel, (uint32_t)slot)) return ~0u;
+    const uint32_t v = be32(b.data() + 0x20 + slot);
+    return v < size ? v : ~0u;
+  }
+  uint32_t word(uint32_t at, uint32_t field) const {
+    const uint64_t slot = (uint64_t)at + field;
+    return slot + 4 <= size ? be32(b.data() + 0x20 + slot) : 0;
+  }
+  bool animated(uint32_t texanim, uint32_t id) {
+    for (int n = 0; texanim != ~0u && n < 64; ++n, texanim = ptr(texanim, 0x0))
+      if (word(texanim, 0x4) == id && ptr(texanim, 0x8) != ~0u) return true;
+    return false;
+  }
+  void joint(uint32_t j, uint32_t mj) {
+    for (; j != ~0u && --budget > 0; j = ptr(j, 0xC), mj = mj == ~0u ? ~0u : ptr(mj, 0x4)) {
+      if (!(word(j, 0x4) & 0x4020)) {
+        uint32_t matanim = mj == ~0u ? ~0u : ptr(mj, 0x8);
+        for (uint32_t d = ptr(j, 0x10); d != ~0u && --budget > 0; d = ptr(d, 0x4)) {
+          const uint32_t mobj = ptr(d, 0x8), texanim = matanim == ~0u ? ~0u : ptr(matanim, 0x8);
+          for (uint32_t t = mobj == ~0u ? ~0u : ptr(mobj, 0x8); t != ~0u && --budget > 0; t = ptr(t, 0x4))
+            out.push_back(animated(texanim, word(t, 0x8)));
+          matanim = matanim == ~0u ? ~0u : ptr(matanim, 0x0);
+        }
+      }
+      joint(ptr(j, 0x8), mj == ~0u ? ~0u : ptr(mj, 0x0));
+    }
+  }
+};
+std::vector<bool> of(const std::vector<uint8_t>& bytes) {
+  uint32_t size = 0, root = 0; std::vector<uint32_t> rel; std::string unused;
+  if (!skeleton::share_joint_root(bytes, &size, &root, &rel, &unused) || size + 0x20ull > bytes.size()) return {};
+  const uint64_t relocations = be32(bytes.data() + 8), roots = be32(bytes.data() + 12), references = be32(bytes.data() + 16);
+  const uint64_t root_table = 0x20ull + size + relocations * 4ull, strings = root_table + (roots + references) * 8ull;
+  uint32_t matanim = ~0u;
+  for (uint64_t i = 0; i < roots && strings <= bytes.size(); ++i) {
+    const uint8_t* record = &bytes[(size_t)(root_table + i * 8)];
+    const uint64_t name = strings + be32(record + 4);
+    if (name >= bytes.size()) continue;
+    const char* t = (const char*)&bytes[(size_t)name];
+    const size_t n = strnlen(t, bytes.size() - (size_t)name);
+    static constexpr char suffix[] = "_matanim_joint";
+    if (n >= sizeof suffix - 1 && std::memcmp(t + n - (sizeof suffix - 1), suffix, sizeof suffix - 1) == 0 && be32(record) < size)
+      matanim = be32(record);
+  }
+  Walk w{bytes, size, rel};
+  w.joint(root, matanim);
+  return w.out;
+}
+}  // namespace texanims
+
 // The served copy of an online-allowed costume skin gets the standard costume's joint rest pose
 // (skeleton::copy_rest_pose). Returns how many joints differed; 0 when nothing had to change.
 uint32_t costume_take_standard_bones(const std::vector<uint8_t>& clean, std::vector<uint8_t>& served) {
@@ -1791,6 +1856,20 @@ uint32_t costume_take_standard_bones(const std::vector<uint8_t>& clean, std::vec
 }
 
 }  // namespace
+
+// Public: the first texture the disc's own costume animates and `candidate` does not (its index as the
+// game counts textures), or -1. The game's own costume setup stops on such a costume ("can't find
+// fighter texture anim!"); both engines' versions of it let that texture stay still instead, but a mod
+// disc's own copy of the setup keeps the stop (Akaneia with Diet Melee 64's Falco, 1.0.19 report).
+int costume_missing_texture_anim(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate) {
+  const std::vector<bool> want = texanims::of(clean), have = texanims::of(candidate);
+  for (size_t i = 0; i < want.size(); ++i)
+    if (want[i] && (i >= have.size() || !have[i])) return (int)i;
+  return -1;
+}
+bool (*g_strict_texture_anims)() = nullptr;
+void set_strict_texture_anims(bool (*fn)()) { g_strict_texture_anims = fn; }
+
 
 // Public: whether the game can draw this costume at all. Offline and online alike, unlike the
 // skeleton comparison below: a file that fails here stops the game on any machine.
@@ -6047,6 +6126,7 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
       std::vector<uint8_t> served = bytes;   // per disc file: the online rule and the length below are per file
       std::vector<uint8_t> online_form;      // a stage skin's online form, when it differs from `served`
       bool online_allowed = true;
+      bool lacks_texture_anim = false;
       std::string online_reason;   // kept for the Mods tab: the verdict is never only in the log
       if (asset->info.kind == "stage_visual") {
         // A selected skin needs readable gameplay tables offline too. An old explicit selection
@@ -6154,13 +6234,17 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
         host::log("cosmetics: costume %s %s online (%s)", disc_file.path.c_str(),
                   online_allowed ? "allowed" : "uses vanilla", validation_error.c_str());
         online_reason = online_reason_short(validation_error);
+        lacks_texture_anim = costume_missing_texture_anim(clean, served) >= 0;
+        if (lacks_texture_anim)
+          host::log("cosmetics: costume %s lacks texture animation %d of the disc's costume; a mod's own costume setup gets the disc's costume",
+                    disc_file.path.c_str(), costume_missing_texture_anim(clean, served));
         // The skin is drawn; the bones the game simulates with are the standard costume's.
         if (online_allowed)
           if (const uint32_t moved = costume_take_standard_bones(clean, served))
             host::log("cosmetics: costume %s: %u joints take the standard costume's rest pose (the skin's differed)",
                       disc_file.path.c_str(), moved);
       }
-      if (!online_allowed) {
+      if (!online_allowed || lacks_texture_anim) {
         // This file is the override offline and the disc's own file online, and the game sees one
         // length for it (the FST is patched once). The game also checks that an archive's own
         // length field equals the file's length (HSD_ArchiveParse) and stops when they differ.
@@ -6187,6 +6271,7 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
       RuntimeAsset active{asset->info.id, asset->info.target_path,
                           std::make_shared<const std::vector<uint8_t>>(std::move(served)),
                           disc_file.size, online_allowed, asset->info.kind, std::move(online_reason)};
+      active.lacks_texture_anim = lacks_texture_anim;
       if (!online_form.empty()) active.online_bytes = std::make_shared<const std::vector<uint8_t>>(std::move(online_form));
       next->by_start[disc_file.start] = std::move(active);
       host::log("cosmetics: %s -> %s at %08X (%u vanilla bytes, %zu override bytes)",
@@ -7128,7 +7213,8 @@ OverrideRead read(uint32_t vanilla_file_start, uint32_t file_offset, void* dst, 
     return OverrideRead::Success;
   }
   const bool online_now = online_active();
-  if (!found->second.online_allowed && online_now) {
+  const bool mod_setup = found->second.lacks_texture_anim && g_strict_texture_anims && g_strict_texture_anims();
+  if ((!found->second.online_allowed && online_now) || mod_setup) {
     const uint32_t vanilla_size = found->second.vanilla_size;
     const uint64_t exposed_size = std::max<size_t>(vanilla_size, found->second.bytes->size());
     if (file_offset > exposed_size || (uint64_t)file_offset + size > exposed_size + 31)

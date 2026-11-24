@@ -30,4 +30,6 @@ StrongerStatus stronger_status(int pro);
 // Downloads every missing stronger policy of that pro (pro < 0: every pro), one after another in the
 // background, each checked against its SHA-256. They play from the next match on.
 void download_stronger(int pro);
+// Stronger policies installed since the game started (the Training notice: back out, come back in).
+int installed_this_session();
 }  // namespace phillip_ai

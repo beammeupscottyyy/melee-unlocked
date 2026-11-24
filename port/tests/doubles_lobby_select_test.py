@@ -46,23 +46,29 @@ class DoublesRowOpensTheHome(unittest.TestCase):
         self.practice = read('port/runtime/hle/native_practice.cpp')
 
     def test_row_sends_value_16_not_the_console_home(self):
-        at = self.menu.index('selected_option == MU_SLP_OPT_DOUBLES) {')
+        at = self.menu.index('(selected_option == MU_SLP_OPT_DOUBLES || pages_ranked_doubles(selected_option))) {')
         press = self.menu[at:self.menu.index('} else if', at)]
-        self.assertIn('u8 open_doubles = 16;', press)
+        # 16 opens the home; 17 the same home on the ranked queue (the row's slider).
+        self.assertIn('u8 open_doubles = (u8) (pages_ranked_doubles(selected_option) ? 17 : 16);', press)
         self.assertNotIn('= 12;', press)
         self.assertIn('mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &open_doubles, 1, NULL, 0, NULL);', press)
         # Still only in a menu that has the Doubles row.
         self.assertGreater(self.menu.rfind('#ifdef MELEE_DOUBLES', 0, at), self.menu.rfind('#endif', 0, at))
 
     def test_value_16_arms_the_doubles_profile(self):
-        self.assertIn('if (payload[0] == 16) {', self.online)
-        menu16 = self.online[self.online.index('if (payload[0] == 16) {'):]
-        self.assertIn('if (yougame::session()) g_doubles_lobby_request = true;', menu16[:300])
-        self.assertLess(self.online.index('if (payload[0] == 16) {'), self.online.index('if (payload[0] == 8'))
+        self.assertIn('if (payload[0] == 16 || payload[0] == 17) {', self.online)
+        menu16 = self.online[self.online.index('if (payload[0] == 16 || payload[0] == 17) {'):]
+        # The queue is stored before the request, so the tick that takes the press reads this press's choice.
+        self.assertIn('if (yougame::session()) { g_doubles_lobby_ranked = payload[0] == 17; g_doubles_lobby_request = true; }',
+                      menu16[:520])
+        self.assertLess(self.online.index('if (payload[0] == 16 || payload[0] == 17) {'), self.online.index('if (payload[0] == 8'))
         self.assertIn('const bool doubles_host = picker_scene && room.empty() && std::exchange(doubles_press, false);',
                       self.practice)
         self.assertIn('slippi::online::arm_friends_lobby(room, doubles ? yougame::lobby::Profile::Doubles : '
-                      'yougame::lobby::Profile::Friends4);', self.practice)
+                      'yougame::lobby::Profile::Friends4,', self.practice)
+        # Only the player who opens a home chooses its queue: a guest's press of the slider never reaches a friend's home.
+        self.assertIn('doubles_host && slippi::online::doubles_lobby_ranked());', self.practice)
+        self.assertIn('std::make_shared<yougame::lobby::Control>(profile, ranked && room.empty());', self.online)
 
     def test_a_press_is_used_this_tick_or_dropped(self):
         # Review G2 #5: the request is taken once per tick, before any early return, so a press that could
@@ -207,7 +213,7 @@ class HomeSearchAndMatchRoom(unittest.TestCase):
         room = room[:room.index('if (lobby_route && lobby_session) {')]
         self.assertIn('if ((room->revision != lobby_reported || (lobby_plan && !doubles_playing_reported)) && !lobby_me.empty()) {', room)
         self.assertIn('doubles_playing_reported = lobby_plan != nullptr;', room)
-        self.assertIn('lobby_me, room->revision, lobby_plan != nullptr), 1000);', room)
+        self.assertIn('lobby_me, room->revision, lobby_plan != nullptr, search.doubles_match.ranked), 1000);', room)
 
     def test_setup_timeout_closes_without_a_leave(self):
         room = self.fm[self.fm.index('if (!lobby_plan && now_ms() - doubles_since > lobby::kDoublesSetupMs) {'):]
@@ -809,8 +815,14 @@ int main(void)
     /* Rules refusals: the error sound only, the steady lines stay. */
     check(&v, MU_LOBBY_HINT_FIXED_RULES, 1, MU_LOBBY_WANT_FIND, "",
           LINES("Character selected", 2, "Press START to search", 1, "Partner: find online", 0), "Tab changes partner", "");
+    /* A ranked search the room did not take: said for the note's time, then START is offered again. */
     check(&v, MU_LOBBY_HINT_UNRANKED_ONLY, 1, MU_LOBBY_WANT_INVITE, "",
+          LINES("Character selected", 2, "Ranked is not open yet", 0, "Partner: invite a friend", 0), "Tab changes partner", "");
+    check(&v, MU_LOBBY_HINT_UNRANKED_ONLY, 0, MU_LOBBY_WANT_INVITE, "",
           LINES("Character selected", 2, "Press START to invite", 1, "Partner: invite a friend", 0), "Tab changes partner", "");
+    /* Ranked is people only: steady while the partner seat is a CPU or a second controller. */
+    check(&v, MU_LOBBY_HINT_RANKED_HUMANS, 0, MU_LOBBY_WANT_FIND, "",
+          LINES("Character selected", 2, "Ranked: no CPU or Player 2", 0, "Partner: find online", 0), "Tab changes partner", "");
     /* Waiting for every game, a player reconnecting. */
     check(&v, MU_LOBBY_HINT_NOT_READY, 0, 0, "",
           LINES("Character selected", 2, "Waiting for players", 1, "Partner: find online", 0), "Tab changes partner", "");
@@ -923,7 +935,7 @@ class HintsInTheMenuFont(unittest.TestCase):
         wire = read(WIRE)
         text = body(wire, 'static inline const char* mu_lobby_hint_text(unsigned hint)')
         for name in ('SEARCHING', 'START_SEARCH', 'START_PARTNER', 'FIXED_RULES', 'UNRANKED_ONLY', 'TEAM_MISMATCH',
-                     'SEARCH_STOPPED'):
+                     'SEARCH_STOPPED', 'RANKED_HUMANS'):
             m = re.search(r'case MU_LOBBY_HINT_%s: return "([^"]*)";' % name, text)
             self.assertIsNotNone(m, name)
             self.assertRegex(m.group(1), r'^[A-Za-z0-9 .]{1,40}$', name)

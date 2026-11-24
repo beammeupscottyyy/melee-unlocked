@@ -2,7 +2,9 @@
 # MinGW separately checks these functions against the real game headers/ABI.
 set(rank_panel_stubs "${CMAKE_CURRENT_BINARY_DIR}/ranked-panel-stubs")
 foreach(header mu_native.h sysdolphin/baselib/gobj.h
-    sysdolphin/baselib/gobjuserdata.h sysdolphin/baselib/sislib.h)
+    sysdolphin/baselib/gobjuserdata.h sysdolphin/baselib/sislib.h
+    sysdolphin/baselib/aobj.h sysdolphin/baselib/gobjgxlink.h sysdolphin/baselib/gobjobject.h
+    sysdolphin/baselib/jobj.h melee/gm/gm_1601.h melee/sc/types.h melee/lb/lbaudio_ax.h)
   file(WRITE "${rank_panel_stubs}/${header}" "/* API facade declared by ranked_panel_test.cpp */\n")
 endforeach()
 set(rank_splash_source "${CMAKE_CURRENT_SOURCE_DIR}/sourceport/game/shim/mu_slippi_splash.c")

@@ -276,10 +276,11 @@ class ReleaseWiringTest(unittest.TestCase):
         self.assertIn('friends::lobby_ticket(lobby_key, lobby_room)', find)
         self.assertIn('friends::doubles_hold(lobby_key)', find)
         self.assertIn('friends::doubles_home_ticket(lobby_key, lobby_room)', find)
-        self.assertIn('friends::doubles_queue_ticket(lobby_key, room_code, queue_generation, lobby_session->owns_local() ? 1 : party.humans)', find)
+        self.assertIn('friends::doubles_queue_ticket(lobby_key, room_code, queue_generation,', find)
+        self.assertIn('lobby_session->owns_local() ? 1 : party.humans, queue_ranked);', find)
         # The match room's admission renewals (review G2 #3): a match-admission ticket on the same key, never
         # the queue's ticket (party_room, partySearch, party).
-        self.assertIn('if (doubles_room) request = friends::doubles_match_ticket(lobby_key);', find)
+        self.assertIn('if (doubles_room) request = friends::doubles_match_ticket(lobby_key, search.doubles_match.ranked);', find)
         self.assertNotIn('doubles_match.request', raw)
         # The lobby searches in one mode, never retries into a new room, and closes its links uncancelled.
         self.assertIn('search.friends_lobby && (search.mode != lobby::kSearchMode', find)

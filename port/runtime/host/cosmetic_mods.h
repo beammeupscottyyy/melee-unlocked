@@ -414,6 +414,11 @@ bool costume_skeleton_matches(const std::vector<uint8_t>& clean, const std::vect
 // Whether the game can draw the costume at all: false when a blended (envelope) mesh names a joint
 // that has no inverse bind matrix, which stops the game on any machine. *detail names the bone.
 bool costume_draw_safe(const std::vector<uint8_t>& candidate, std::string* detail);
+// The first texture the disc's costume animates and the candidate does not, or -1 (cosmetic_mods.cpp).
+int costume_missing_texture_anim(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate);
+// True while a mod's own code runs the game's costume texture setup (the Static Recomp sets it): then a
+// costume lacking a texture animation is served as the disc's own costume instead of stopping the game.
+void set_strict_texture_anims(bool (*fn)());
 // The same for a stage file (its map_head models).
 bool stage_draw_safe(const std::vector<uint8_t>& candidate, std::string* detail);
 // The same verdict in a few words for a status line: "rest pose differs", "61 joints match".

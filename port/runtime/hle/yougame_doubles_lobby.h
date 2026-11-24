@@ -90,9 +90,10 @@ inline uint64_t next_room_epoch() {
 // exactly these (web/src/lib/native-teams.ts acceptNativeTeamsRoom: a party report is the home, private,
 // size 2; a match report another room, casual, size 4).
 inline json doubles_room_report(const std::string& code, const std::string& home, bool match, uint64_t epoch,
-                                const json& participants, const std::string& me, int revision, bool playing = false) {
+                                const json& participants, const std::string& me, int revision, bool playing = false,
+                                bool ranked = false) {
   return {{"type", "mpRoom"}, {"code", code}, {"roomEpoch", epoch}, {"mode", "teams"},
-          {"queue", match ? "casual" : "private"}, {"size", match ? kSeats : kDoublesSeats},
+          {"queue", match ? (ranked ? "ranked" : "casual") : "private"}, {"size", match ? kSeats : kDoublesSeats},
           {"nativeTeams", {{"v", 1}, {"kind", match ? "match" : "party"}, {"home", home},
                            {"phase", match ? (playing ? "playing" : "assembling") : "home"}}},
           {"me", me}, {"players", participants}, {"participants", participants}, {"revision", revision}};

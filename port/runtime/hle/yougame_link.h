@@ -292,6 +292,7 @@ struct Search {
   // ask for a match-admission ticket (friends::doubles_match_ticket), never the queue's.
   struct DoublesMatch {
     std::string url, ticket, room, home;
+    bool ranked = false;   // the home searched the ranked queue: a best of 3, rated
   } doubles_match;
   // An arena game (slippi_arena.cpp under YouGame): the room players of this game, in ring order (ring slot n
   // plays port n+1), found in the arena's own room (arena_room below) instead of a room of their own. 2 or 4.

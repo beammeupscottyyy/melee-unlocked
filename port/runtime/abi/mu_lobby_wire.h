@@ -106,6 +106,7 @@
 #define MU_LOBBY_M_DOUBLES 0x01     /* the 2-seat Doubles home: seat 0 is me or my partner's host, seat 1 the partner */
 #define MU_LOBBY_M_STAGE_SELECT 0x04 /* Friends: the host is on the stage select, and the guests watch it */
 #define MU_LOBBY_M_SEARCHING 0x02   /* Doubles: Start went through, the home searches: the select is locked */
+#define MU_LOBBY_M_RANKED 0x40      /* Doubles: this home searches the ranked queue (best of 3, humans only) */
 #define MU_LOBBY_DOUBLES_SEATS 2
 
 /* seat kinds and flags */
@@ -156,7 +157,8 @@
 #define MU_LOBBY_HINT_SQUAD_BUDGET 28
 #define MU_LOBBY_HINT_SQUAD_RULES 29
 #define MU_LOBBY_HINT_SQUAD_UNAVAILABLE 30
-#define MU_LOBBY_HINT_COUNT 31
+#define MU_LOBBY_HINT_RANKED_HUMANS 31   /* Ranked Doubles: a CPU or second-controller partner can't play ranked */
+#define MU_LOBBY_HINT_COUNT 32
 
 #define MU_LOBBY_RULES_SIZE 6
 #define MU_LOBBY_SEAT_SIZE (3 + 3 + 3 + 3 + MU_LOBBY_NAME + 9)
@@ -228,7 +230,8 @@ static inline const char* mu_lobby_hint_text(unsigned hint)
     case MU_LOBBY_HINT_START_SEARCH: return "Press START to find opponents";
     case MU_LOBBY_HINT_START_PARTNER: return "START finds a partner and opponents";
     case MU_LOBBY_HINT_FIXED_RULES: return "Doubles rules are fixed";
-    case MU_LOBBY_HINT_UNRANKED_ONLY: return "Doubles is unranked for now";
+    case MU_LOBBY_HINT_UNRANKED_ONLY: return "Ranked Doubles is not open yet";
+    case MU_LOBBY_HINT_RANKED_HUMANS: return "Ranked needs a human partner or none";
     case MU_LOBBY_HINT_TEAM_MISMATCH: return "The other team has a different version";
     case MU_LOBBY_HINT_SEARCH_STOPPED: return "Search stopped. Press START to retry";
     default: return "";
@@ -376,7 +379,8 @@ static inline int mu_lobby_view_decode(const unsigned char* b, size_t n, MuLobby
     if ((v->my_seat >= MU_LOBBY_SEATS && v->my_seat != MU_LOBBY_NONE) ||
         (v->host_seat >= MU_LOBBY_SEATS && v->host_seat != MU_LOBBY_NONE) ||
         v->block_hint >= MU_LOBBY_HINT_COUNT || v->refusal_hint >= MU_LOBBY_HINT_COUNT ||
-        (v->mode & ~(MU_LOBBY_M_DOUBLES | MU_LOBBY_M_SEARCHING | MU_LOBBY_M_STAGE_SELECT | MU_LOBBY_M_LOCAL_OWNER | MU_LOBBY_M_SQUAD | MU_LOBBY_M_SQUAD_AVAILABLE)) ||
+        (v->mode & ~(MU_LOBBY_M_DOUBLES | MU_LOBBY_M_SEARCHING | MU_LOBBY_M_STAGE_SELECT | MU_LOBBY_M_LOCAL_OWNER | MU_LOBBY_M_SQUAD | MU_LOBBY_M_SQUAD_AVAILABLE | MU_LOBBY_M_RANKED)) ||
+        ((v->mode & MU_LOBBY_M_RANKED) && !(v->mode & MU_LOBBY_M_DOUBLES)) ||
         ((v->mode & MU_LOBBY_M_LOCAL_OWNER) && (!(v->mode & MU_LOBBY_M_DOUBLES) || v->my_seat != 0)) ||
         ((v->mode & MU_LOBBY_M_STAGE_SELECT) && (v->mode & MU_LOBBY_M_DOUBLES)) ||
         ((v->mode & MU_LOBBY_M_SEARCHING) && !(v->mode & MU_LOBBY_M_DOUBLES)) ||

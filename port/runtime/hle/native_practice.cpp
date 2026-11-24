@@ -2098,7 +2098,7 @@ void tick() {
         g_practice.players[0].character = 0;
         write_event_backup();
         if (g_content_bridge) g_content_bridge(2, true);
-        slippi::online::arm_friends_lobby({}, yougame::lobby::Profile::Doubles);
+        slippi::online::arm_friends_lobby({}, yougame::lobby::Profile::Doubles, slippi::online::doubles_lobby_ranked());
         request_major(kOnlineMajor);   // the online major opens the 4-door select for an armed lobby
         return;
       }
@@ -2231,7 +2231,8 @@ void tick() {
           g_practice.players[0].character = 0;
           write_event_backup();
           if (g_content_bridge) g_content_bridge(2, true);
-          slippi::online::arm_friends_lobby(room, doubles ? yougame::lobby::Profile::Doubles : yougame::lobby::Profile::Friends4);
+          slippi::online::arm_friends_lobby(room, doubles ? yougame::lobby::Profile::Doubles : yougame::lobby::Profile::Friends4,
+                                            doubles_host && slippi::online::doubles_lobby_ranked());
           request_major(kOnlineMajor);   // the online major opens the 4-door select for an armed lobby
           return;
         }

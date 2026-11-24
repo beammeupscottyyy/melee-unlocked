@@ -220,7 +220,7 @@ int main() {
         json({{"type", "mpFriend"}, {"room", "abcdefghjkmn"}, {"players", 4}, {"multi", true}}));
   const json t = lobby_ticket("friends-lobby-1:mu", "abcdefghjkmn");   // held codes are 12 characters
   CHECK(t["type"] == "mpTicket" && t["players"] == 4 && t["room"] == "abcdefghjkmn" && t["ranked"] == false);
-  CHECK(t["lobby"]["compatibility"] == "friends-lobby-1:mu" && t["lobby"]["minPlayers"] == 1);
+  CHECK(t["lobby"]["compatibility"] == "friends-lobby-1:mu" && t["lobby"]["minPlayers"] == 2);
   bool threw = false;
   try { lobby_hold("mu-0.9.105"); } catch (const std::exception&) { threw = true; }
   CHECK(threw);

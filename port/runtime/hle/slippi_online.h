@@ -209,7 +209,9 @@ void native_cleanup_match();
 void arm_friends_lobby(const std::string& room);
 // The same lobby on a profile: Doubles (G2) is the 2-seat home (me and a partner); its Start searches for
 // opponents through Rooms, and the 4-player match runs in its own room while the home stays parked.
-void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile);
+void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile, bool ranked = false);
+// The queue the last Doubles row press chose (the row's slider: Ranked Doubles or Doubles).
+bool doubles_lobby_ranked();
 // The Doubles row asked for a new Doubles home (CMD_YOUGAME_FRIENDS_MENU 16): true once per press.
 bool take_doubles_lobby_request();
 bool friends_lobby_armed();

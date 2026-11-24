@@ -1759,6 +1759,18 @@ void p2p_player(std::string& name,std::string& code) {
   std::lock_guard<std::mutex> lock(mutex);
   name=config.value("name",std::string()); code=account_code;
 }
+std::vector<int> saved_mains() {
+  std::lock_guard<std::mutex> lock(mutex); std::vector<int> v;
+  if(config.count("mains") && config["mains"].is_array())
+    for(const auto& x:config["mains"]) if(x.is_number_integer() && x.get<int>()>=0 && x.get<int>()<26 && v.size()<3) v.push_back(x.get<int>());
+  if(v==std::vector<int>{2,20,9}) v.clear();   // the old Profile page's preselection, never changed
+  return v;
+}
+void save_mains(const std::vector<int>& mains) {
+  std::lock_guard<std::mutex> lock(mutex);
+  config["mains"]=mains; selected_mains=mains;
+  if(!directory.empty()) save(config);
+}
 void init(HWND parent,const std::string& dir) {
   owner=parent; directory=dir;
   try {

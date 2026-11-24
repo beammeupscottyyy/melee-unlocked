@@ -673,6 +673,13 @@ bool resume_web(std::string* why) {
   return true;
 }
 
+// A read with the launcher's own YouGame sign-in (its web view), for the Multiplayer Lobby page. Never throws.
+int site_get(const std::string& path, std::string* body) {
+  try { const Reply r = site("GET", path, ""); if (body) *body = r.body; return r.status; } catch (...) { return 0; }
+}
+bool staging_env() { std::lock_guard<std::mutex> lock(g_mutex); return g_env.id == "staging"; }
+std::string site_url() { std::lock_guard<std::mutex> lock(g_mutex); return g_env.site; }
+
 AppSignIn sign_in_app(bool may_start, const std::string& version, std::string* detail) {
   // Every step goes into *detail ("; " between), for the launcher's log.
   std::string steps;
@@ -1203,7 +1210,7 @@ BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& t
       const std::string code = backend.room_code ? backend.room_code() : new_room_code();
       json body{{"slug", kSlug}, {"player_id", backend.player_id()}, {"name", a.name}, {"anonymous", false},
                 {"players", players}, {"mode", players == 2 ? "teams" : "singles"}, {"queue", "private"}, {"room", code},
-                {"lobby", {{"version", 1}, {"minPlayers", players == 2 ? 2 : 1}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}},
+                {"lobby", {{"version", 1}, {"minPlayers", 2}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}},
                 {"build", parse_or_empty(build_json)}};
       if (const std::string nb = listed_build_id(parse_or_empty(build_json).value("version", std::string())); !nb.empty())
         body["native_build"] = nb;

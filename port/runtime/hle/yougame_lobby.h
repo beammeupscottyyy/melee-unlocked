@@ -48,7 +48,7 @@ inline constexpr int kMaxResends = 3;
 // NotReady: a seated human's game has not sent its hello (Rooms: digest_missing), shown only once Rooms
 // shows `ready` on any seat (a room before hello never does).
 enum class StartBlock { None, NotSeated, NotHost, MatchActive, PickRequired, PlayersRequired, NotReady, TeamsRequired,
-                        HumansRequired, Searching, SquadTwoPlayers, SquadCapability, SquadBudget };
+                        HumansRequired, Searching, SquadTwoPlayers, SquadCapability, SquadBudget, RankedHumans };
 
 // The cross-team digest_mismatch (Rooms' teams-search-error, broadcast to the home after its search
 // found opponents on another version): the session's own name for it, so the screen tells it apart from
@@ -75,6 +75,7 @@ class Session {
     Profile profile = Profile::Friends4;
     std::string settings_digest, card_digest;   // hello's; empty = no hello
     int input_delay = 0;                // start's inputDelay, 0 = never sent
+    bool ranked = false;                // Doubles: the Online menu's queue choice (the host's; Rooms' state wins)
     // A call-off carried from this room's earlier socket (call_off() of the session it replaces): the
     // host's room connection closed after a setup that never began, so this session treats that frozen
     // setup as stale and calls it off once this player is the host.
@@ -235,7 +236,8 @@ class Session {
     if (doubles()) {
       if (can_start() != StartBlock::None) return false;
       start_stage_ = 0; start_rev_ = state_.rev; start_delay_sent_ = 0;
-      return push(doubles_start_frame(state_.rev));
+      start_ranked_ = ranked();
+      return push(doubles_start_frame(state_.rev, start_ranked_));
     }
     if (can_start() != StartBlock::None || (stage != 0 && !stage_ok(stage))) {
       // Nothing goes out and no refusal comes back, so the guests would stay on the stage select.
@@ -280,6 +282,10 @@ class Session {
   bool doubles() const { return opt_.profile == Profile::Doubles; }
   Profile profile() const { return opt_.profile; }
   bool searching() const { return doubles() && state_.searching; }
+  // Doubles: the ranked queue. Rooms' word when its state names the queue, else this player's own choice.
+  bool ranked() const { return doubles() && (state_.ranked_shown ? state_.ranked : opt_.ranked); }
+  // Rooms refused the ranked ask (it has no ranked Doubles yet): START is not offered again on this home.
+  bool ranked_refused() const { return ranked_refused_; }
   bool lobby_open() const { return known_ && state_.setup.is_null() && !has_setup_ && !left_ && !searching(); }
   StartBlock can_start() const {
     if (my_seat() < 0) return StartBlock::NotSeated;
@@ -288,6 +294,10 @@ class Session {
       // then pick_required, and refuses a ranked queue (unranked_only).
       if (searching()) return StartBlock::Searching;
       if (!lobby_open()) return StartBlock::MatchActive;
+      // Ranked is people only: a CPU partner or a second controller can't earn or lose rating.
+      if (ranked())
+        for (int i = 0; i < kDoublesSeats; ++i)
+          if (state_.seats[i].kind == Kind::Cpu || state_.seats[i].kind == Kind::Local) return StartBlock::RankedHumans;
       for (int i = 0; i < kDoublesSeats; ++i)
         if (state_.seats[i].kind != Kind::Open && !state_.seats[i].picked) return StartBlock::PickRequired;
       if (ready_seen_)
@@ -470,6 +480,13 @@ class Session {
       } else hello_supported_ = false;
       return;
     }
+    // The ranked ask, refused: by name (unranked_only), or as a key Rooms does not know yet (shape,
+    // fixed_rules). Never sent again as unranked by itself: the player chose ranked.
+    if (a == "start" && doubles() && start_ranked_ && (e == "unranked_only" || e == "shape" || e == "fixed_rules")) {
+      start_ranked_ = false; ranked_refused_ = true;
+      refusal_ = "unranked_only";
+      return;
+    }
     if (a == "start" && e == "shape" && start_delay_sent_ && !start_squad_) {
       input_delay_supported_ = false;
       start_delay_sent_ = 0;
@@ -560,6 +577,7 @@ class Session {
   int hello_seat_ = -1;
   bool hello_supported_ = true, input_delay_supported_ = true, ready_seen_ = false;
   int start_stage_ = 0, start_delay_sent_ = 0;
+  bool start_ranked_ = false, ranked_refused_ = false;
   int64_t start_rev_ = -1;
   json last_shared_;
   int resends_ = 0;
@@ -580,7 +598,11 @@ class Control {
   using Intent = std::function<void(Session&)>;
   // The view carries the profile from the start: before the session first runs, a Doubles select drew
   // the 4-door Friends layout ("Opening the lobby"), then snapped to 2 doors (staging report e22413bd).
-  explicit Control(Profile p = Profile::Friends4) : profile_(p) { view_.profile = p; }
+  explicit Control(Profile p = Profile::Friends4, bool ranked = false) : profile_(p), ranked_(ranked && p == Profile::Doubles) {
+    view_.profile = p; view_.ranked = ranked_;
+  }
+  // Doubles: the queue the Online menu's slider chose when this home was opened.
+  bool ranked_choice() const { return ranked_; }
   Profile profile() const { return profile_; }
   // Doubles: matchmaking placed the home in a match room (the setup arrives there, not in the home),
   // so the select shows Starting until the match ends and set_matched(false) brings it back.
@@ -592,6 +614,7 @@ class Control {
     bool squad_available = false;
     std::string squad_budget;
     bool searching = false;                // Doubles: Rooms is looking for opponents (and a partner)
+    bool ranked = false;                   // Doubles: the ranked queue
     Profile profile = Profile::Friends4;
     State state;
     int my_seat = -1;
@@ -613,6 +636,7 @@ class Control {
     v.known = s.known(); v.host = s.is_host(); v.unsupported = s.unsupported();
     v.squad_available = s.squad_available(); v.squad_budget = s.squad_budget();
     v.owns_local = s.owns_local(); v.searching = s.searching(); v.profile = profile_;
+    v.ranked = s.ranked();
     v.state = s.state(); v.my_seat = s.my_seat(); v.start = s.can_start();
     v.refusal = s.refusal(); v.refusal_action = s.refusal_action(); v.refusal_count = s.refusal_count();
     v.links = links;
@@ -623,6 +647,7 @@ class Control {
   }
  private:
   Profile profile_;
+  bool ranked_ = false;
   bool matched_ = false;
   mutable std::mutex mutex_;
   std::vector<Intent> intents_;

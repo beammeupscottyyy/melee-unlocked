@@ -185,7 +185,9 @@ inline bool valid_outgoing(const json& v) {
   if (op == "rules") return only_keys(v, {"t", "v", "op", "rev", "rules"}) && v.count("rules") && read_rules(v["rules"], nullptr, true);
   if (op == "start") {
     // Rooms lets stage be absent (Doubles' start: the stage is drawn); a Friends start always sends one.
-    if (!only_keys(v, {"t", "v", "op", "rev", "stage", "inputDelay"})) return false;
+    if (!only_keys(v, {"t", "v", "op", "rev", "stage", "inputDelay", "queue"})) return false;
+    // Doubles only, and only the ranked ask: an unranked start is the frame it always was.
+    if (v.count("queue") && (v["queue"] != "ranked" || v.count("stage") || v.count("inputDelay"))) return false;
     if (v.count("inputDelay") && !integer(v["inputDelay"], kInputDelayMin, kInputDelayMax)) return false;
     if (!v.count("stage")) return true;
     const json& s = v["stage"];
@@ -254,7 +256,13 @@ inline json start_frame(int stage, int64_t rev, int input_delay) {
   return f;
 }
 // Doubles: Start carries the rev only (no stage, no inputDelay: Rooms refuses them as fixed_rules).
-inline json doubles_start_frame(int64_t rev) { json f = envelope("start"); f["rev"] = rev; return f; }
+// A ranked search adds queue "ranked"; a Rooms without ranked Doubles refuses it (unranked_only, or
+// shape before it knew the key) and the select says so.
+inline json doubles_start_frame(int64_t rev, bool ranked = false) {
+  json f = envelope("start"); f["rev"] = rev;
+  if (ranked) f["queue"] = "ranked";
+  return f;
+}
 // Doubles: stop the search. Any seated player may; Rooms refuses it with match_active once placed.
 inline json cancel_frame() { return envelope("cancel"); }
 // Friends: the host went to the stage select, or backed out of it. Rooms keeps the guests watching meanwhile.
@@ -298,6 +306,9 @@ struct State {
   // Doubles: the home is looking for opponents (and a partner when seat 1 is open). Rooms sends it on
   // every Doubles state; searching_shown: the key was there.
   bool searching = false, searching_shown = false;
+  // Doubles: the queue the home searches, when Rooms says (state.queue "ranked" or "casual"). A guest
+  // learns the host's choice from it.
+  bool ranked = false, ranked_shown = false;
   bool stage_select = false;   // Friends: the host is on the stage select (absent = no)
 };
 struct SetupSeat {
@@ -475,6 +486,10 @@ inline Incoming decode(const json& m, Profile profile = Profile::Friends4) {
       if (!m["searching"].is_boolean()) { in.why = "searching"; return in; }
       s.searching_shown = true;
       s.searching = m["searching"].get<bool>();
+    }
+    if (profile == Profile::Doubles && m.count("queue") && m["queue"].is_string()) {
+      const auto& q = m["queue"].get_ref<const std::string&>();
+      if (q == "ranked" || q == "casual") { s.ranked_shown = true; s.ranked = q == "ranked"; }
     }
     if (m.count("stageSelect")) {
       if (!m["stageSelect"].is_boolean()) { in.why = "stageSelect"; return in; }

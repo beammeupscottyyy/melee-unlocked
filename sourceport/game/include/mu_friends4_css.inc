@@ -1661,6 +1661,14 @@ static void mu_f4_panel_text(const MuLobbyView* v, unsigned hint, int noted, int
     } else if (noted && hint == MU_LOBBY_HINT_SEARCH_STOPPED) {
         strcpy(p->line[1], "Search stopped");
         p->spin[1] = 0;
+    } else if (noted && hint == MU_LOBBY_HINT_UNRANKED_ONLY) {
+        /* The room took no ranked search: said for the note's time, where the search's line is. */
+        strcpy(p->line[1], "Ranked is not open yet");
+        p->spin[1] = 0;
+    } else if (hint == MU_LOBBY_HINT_RANKED_HUMANS) {
+        /* Ranked is people only: steady until the partner seat is a friend or open. */
+        strcpy(p->line[1], "Ranked: no CPU or Player 2");
+        p->spin[1] = 0;
     } else if (host && (v->flags & MU_LOBBY_F_INVITING)) {
         strcpy(p->line[1], "Waiting for players");
         p->gray = "Press B to cancel";
@@ -1809,7 +1817,8 @@ static void mu_f4_panel(const MuLobbyView* v, int doubles, unsigned hint, int no
         mu_host_button_label(port, HSD_PAD_START, start_key, sizeof start_key);
         mu_f4_panel_keys(&p, b_key, start_key);
     }
-    mu_f4_panel_put(MU_F4_ST_HEADER, "Doubles", &mu_f4_white);
+    /* The queue this home searches (the Online menu's slider; a guest sees the host's). */
+    mu_f4_panel_put(MU_F4_ST_HEADER, v && (v->mode & MU_LOBBY_M_RANKED) ? "Ranked Doubles" : "Doubles", &mu_f4_white);
     for (i = 0; i < 3; ++i) {
         const int sub = MU_F4_ST_LINE1 + 2 * i;
         mu_f4_panel_put(sub, p.error[0] ? "" : p.line[i], &mu_f4_white);
