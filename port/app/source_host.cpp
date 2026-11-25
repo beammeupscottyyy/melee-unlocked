@@ -1658,6 +1658,7 @@ void h_poll() {
   }
   // A re-simulated frame never waits on the machine; count it if something does.
   if (g_resim) { ++g_resim_polls; rollback_frame_callback(); return; }
+  if (host::tick_redo_active()) return;   // a tick being run again: no time passes, nothing is due
   guarded([] {
     take_console_catch_up();
     host::advance_time(2048);   // time flows in busy waits, as it does for the recompiled build
@@ -1669,7 +1670,10 @@ void h_poll() {
       else g_game.fire_alarms(engine.clock_ticks());
       return;
     }
-    if (host::retrace_due()) host::retrace();
+    if (host::retrace_due()) {
+      if (!host::tick_redo_presleep()) return;   // the controller changed: back to the game's gate, the retrace comes after
+      host::retrace();
+    }
     else g_game.fire_alarms(host::cpu->tb);
   });
 }
@@ -2376,6 +2380,57 @@ constexpr int32_t kLabFrame = -1000000;
 // payload s32 next replay frame (BE), u8 0 ask / 1 restore now. Defined with the replay host below.
 constexpr uint8_t CMD_REPLAY_GATE = 0xFA;
 uint8_t replay_gate(int32_t frame, uint8_t phase);
+// Tick re-run (host.h tick_redo_*, shim/mu_redo.c): op 1 after a drawn frame (keep the state, arm when a
+// match is running), 0 not possible now, 2 the gate's question, 3 go back to the state the current tick
+// started from. Two states matter: the one taken after the previous tick's frame (what the current tick
+// started from, the target of a re-run) and the one taken after the current tick's frame (the next
+// tick's start). Going back drops the second: the re-run's own frame replaces it.
+constexpr uint8_t CMD_TICK_REDO = 0xC7;
+constexpr int32_t kRedoBase = -900000;   // above the Lab's state, below any match frame
+uint8_t tick_redo(uint8_t op) {
+  static int32_t next_id = kRedoBase, start_id = 0, end_id = 0;   // 0: none kept
+  static bool have_start = false, have_end = false;
+  if (!host::tick_redo_enabled()) return 0;
+  if (op == 2) return host::tick_redo_wanted() && have_start ? 1 : 0;
+  if (op == 3) {
+    if (!have_start || !g_savestates.active() || !g_savestates.load_keep(start_id)) {
+      host::log("tick re-run: the tick's starting state is gone; this body runs as a new tick");
+      have_start = have_end = false;
+      host::tick_redo_arm(false);
+      return 0;
+    }
+    have_end = false;   // dropped by the load
+    gx::mark_discontinuity();
+    host::tick_redo_begin();
+    return 1;
+  }
+  if (op == 1) {
+    uint32_t major = 0, minor = 0, match_frame = 0;
+    host::current_scene(&major, &minor, &match_frame);
+    static uint32_t last_match_frame = 0;
+    const bool rerun = host::tick_redo_active();   // this frame is a tick drawn a second time
+    // Not while the match is being recorded or streamed to spectators: a tick run twice would be written twice.
+    static const bool recording = std::getenv("MELEE_SOURCE_RECORD") != nullptr;
+    const bool playing = !recording && major == 2 && minor == 2 && match_frame > 60 && (rerun || match_frame != last_match_frame);
+    last_match_frame = match_frame;
+    if (!playing) { have_start = have_end = false; host::tick_redo_arm(false); return 0; }
+    if (!g_savestates.active()) begin_native_savestates();
+    if (next_id >= -1000) next_id = kRedoBase;   // hours of ticks later
+    // A new tick's frame: its start is what the last frame ended with. A re-run's frame: the start stays.
+    if (!rerun) { have_start = have_end; start_id = end_id; }
+    end_id = next_id++;
+    g_savestates.capture(end_id);
+    have_end = true;
+    static uint64_t captures = 0;
+    if (++captures % 3600 == 1)
+      host::log("tick re-run: state kept each tick, %.2f ms on average, %.2f at most", g_savestates.stats().capture_ms_total / std::max<uint64_t>(1, g_savestates.stats().captures), g_savestates.stats().capture_ms_max);
+    host::tick_redo_arm(have_start);
+    return have_start ? 1 : 0;
+  }
+  have_start = have_end = false;
+  host::tick_redo_arm(false);
+  return 0;
+}
 void lab_save() {
   if (!g_savestates.active()) begin_native_savestates();
   g_savestates.capture(kLabFrame);
@@ -2892,6 +2947,7 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
         if (c == slippi::online::CMD_FIND_OPPONENT) g_online_games = 0;   // replay game numbers restart
         if (c == slippi::online::CMD_LOAD_SAVESTATE) { native_load((int32_t)read_be32(p), p); return true; }
         if (c == CMD_SELFTEST_KEEP && n == 4) { g_savestates.keep_reference((int32_t)read_be32(p)); return true; }
+        if (c == CMD_TICK_REDO && n == 1) { reply.push_back(tick_redo(p[0])); return true; }
         if (c == CMD_LAB_SAVE) { lab_save(); return true; }
         if (c == CMD_LAB_LOAD) { lab_load(); return true; }
         if (c == CMD_REPLAY_GATE && n == 5) { reply.push_back(replay_gate((int32_t)read_be32(p), p[4])); return true; }
@@ -2920,8 +2976,15 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
             cfg.tech_odds[MU_PC_TECH_MISS] = 100;
           }
           cfg.enabled = 1;
-          host::log("replay: the opponent defends (setting %d, aggression %d, techs %d %d %d %d)", defense, cfg.aggression,
-                    cfg.tech_odds[0], cfg.tech_odds[1], cfg.tech_odds[2], cfg.tech_odds[3]);
+          {   // asked every frame: logged when it changes (a session logged it 10,338 times, 11-24)
+            static int last[6] = {-1, -1, -1, -1, -1, -1};
+            const int now[6] = {defense, cfg.aggression, cfg.tech_odds[0], cfg.tech_odds[1], cfg.tech_odds[2], cfg.tech_odds[3]};
+            if (!std::equal(now, now + 6, last)) {
+              std::copy(now, now + 6, last);
+              host::log("replay: the opponent defends (setting %d, aggression %d, techs %d %d %d %d)", defense, cfg.aggression,
+                        cfg.tech_odds[0], cfg.tech_odds[1], cfg.tech_odds[2], cfg.tech_odds[3]);
+            }
+          }
           const auto* bytes = reinterpret_cast<const uint8_t*>(&cfg);
           reply.assign(bytes, bytes + sizeof cfg);
           return true;
@@ -2994,8 +3057,10 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
         }
         if (c == CMD_ARENA_PAIRING && n == 0) {   // shim/mu_slippi_css.c: an arena room's new pairing
           append_be32(reply, slippi::online::arena_pairing());
-          // bit 0: the room locks in a random stage itself (tests); bit 1: this player is in a room now
-          reply.push_back((slippi::arena::locks_in_itself() ? 1 : 0) | (slippi::arena::in_room() ? 2 : 0));
+          // bit 0: the room locks in a random stage itself (tests); bit 1: this player is in a room now;
+          // bit 2: the room's next game is a free-for-all (no team toggle, Start locks in a random stage)
+          reply.push_back((slippi::arena::locks_in_itself() ? 1 : 0) | (slippi::arena::in_room() ? 2 : 0) |
+                          (slippi::arena::css_ffa() ? 4 : 0));
           return true;
         }
         if (c == CMD_VS_PRO) {   // shim/mu_practice_cpu.c: one byte per port, 0xFF for the game's own CPU
@@ -3408,6 +3473,7 @@ void h_vi_wait_retrace() {
 // MELEE_AUDIO_PACING=0 turns it off for comparisons.
 int32_t h_vi_idle_step() {
   if (yougame::console::console_active()) return 0; // wall-time audio pacing cannot schedule game work
+  if (host::tick_redo_active() || host::tick_redo_wanted()) return 0;   // the gate comes first
   take_console_catch_up();
   static const bool enabled = [] { const char* v = std::getenv("MELEE_AUDIO_PACING"); return !(v && *v == '0'); }();
   // MELEE_AUDIO_PACING_TRACE=1: why the idle loop stops, counted and logged every 600 calls.
@@ -4903,6 +4969,56 @@ void* launch_arena_viewer(const std::string& path) {
   host::log("arena: viewer pid %lu", pi.dwProcessId);
   return pi.hProcess;
 }
+#elif !defined(MELEE_NO_SLIPPI) && defined(__linux__)
+// The same viewer on Linux (it was a stub: "viewer did not open", Linux report 11-24): this program again,
+// its path from /proc/self/exe and its arguments from /proc/self/cmdline, started through the compat
+// CreateProcessA (posix_spawn), whose handle the room's viewer_running / close_viewer already read.
+void* launch_arena_viewer(const std::string& path) {
+  std::error_code ec;
+  const std::string exe = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+  if (ec || exe.empty()) { host::log("arena: viewer did not start (no /proc/self/exe)"); return nullptr; }
+  std::vector<std::string> argv;
+  {
+    std::ifstream f("/proc/self/cmdline", std::ios::binary);
+    std::string a;
+    while (std::getline(f, a, '\0')) argv.push_back(a);
+  }
+  auto quote = [](const std::string& a) {
+    std::string q = "\"";
+    for (char c : a) { if (c == '"') q += '\\'; q += c; }
+    return q + "\"";
+  };
+  std::string cmd = quote(exe);
+  bool hidden = false;
+  // Kept and dropped as on Windows: how it looks and runs, never online, a script or the room.
+  static const char* const with_value[] = {"--iso", "--sys-dir", "--settings-path", "--shader-cache", "--backend",
+                                           "--volume", "--mod-base-iso", "--look-iso", "--user-dir"};
+  static const char* const flags[] = {"--load-settings", "--hidden", "--headless", "--no-music"};
+  for (size_t i = 1; i < argv.size(); ++i) {
+    const std::string& a = argv[i];
+    bool kept = false;
+    for (const char* f : flags) if (a == f) { cmd += " " + a; kept = true; if (a != "--load-settings" && a != "--no-music") hidden = true; }
+    for (const char* w : with_value)
+      if (!kept && a == w && i + 1 < argv.size()) { cmd += " " + a + " " + quote(argv[++i]); kept = true; }
+  }
+  const std::filesystem::path live = std::filesystem::u8path(path);
+  cmd += " --replay " + quote(live.u8string());
+  cmd += " --spectate-view " + std::to_string(std::clamp(gx::RenderOptions::live_spectate_view(), 0, 2));
+  cmd += " --replay-dir " + quote((live.parent_path() / "viewer").u8string());
+  if (hidden) cmd += " --log-file " + quote((live.parent_path() / (live.stem().u8string() + ".log")).u8string());
+  STARTUPINFOA si{};
+  si.cb = sizeof si;
+  PROCESS_INFORMATION pi{};
+  std::vector<char> line(cmd.begin(), cmd.end());
+  line.push_back(0);
+  if (!CreateProcessA(exe.c_str(), line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    host::log("arena: viewer did not start (error %lu)", (unsigned long)GetLastError());
+    return nullptr;
+  }
+  if (pi.hThread) CloseHandle(pi.hThread);
+  host::log("arena: viewer pid %lu", (unsigned long)pi.dwProcessId);
+  return pi.hProcess;
+}
 #elif !defined(MELEE_NO_SLIPPI)
 void* launch_arena_viewer(const std::string&) { return nullptr; }
 #endif
@@ -6316,13 +6432,14 @@ int run(void (*shutdown)(int)) {
   if (yougame::mode_policy::mod_sources(yougame::active()).folders)
     if (const char* dll = std::getenv("MELEE_GAME_DLL")) g_dll = dll;
 #ifndef MELEE_NO_SLIPPI
-  // With the spectator server on, offline matches are recorded too, for the broadcast only (no .slp
-  // unless --record-native asked for one): Slippi Dolphin sends every game it records, offline ones
-  // included. Set before the game library loads, so its C runtime sees it.
-  if (!std::getenv("MELEE_SOURCE_RECORD") &&
-      yougame::mode_policy::spectator_allowed(yougame::active(), gx::RenderOptions::live_slippi_spectator())) {
-    _putenv_s("MELEE_SOURCE_RECORD", "2");
-    SetEnvironmentVariableA("MELEE_SOURCE_RECORD", "2");
+  // Offline VS matches are recorded and saved as .slp like online ones, as Slippi Dolphin saves every game it
+  // records (carboncitylights 11-24: "replays from vs mode aren't appearing in the replays list"); the
+  // spectator server broadcasts them as before. Set before the game library loads, so its C runtime sees it.
+  // Not with the experimental tick re-run (off unless MELEE_TICK_REDO=1): it never runs while a match is
+  // recorded, so it would never run.
+  if (!std::getenv("MELEE_SOURCE_RECORD") && !host::tick_redo_enabled()) {
+    _putenv_s("MELEE_SOURCE_RECORD", "1");
+    SetEnvironmentVariableA("MELEE_SOURCE_RECORD", "1");
   }
 #endif
   ghost_ai::enable();   // the pro AI needs the game library's fighters: Source Port only
@@ -6372,7 +6489,16 @@ int run(void (*shutdown)(int)) {
   std::string map_error;
   HMODULE module = sandboxed ? map_game_image(g_dll, &map_error) : LoadLibraryA(g_dll.c_str());
   if (!module && sandboxed) host::die("cannot map %s: %s", g_dll.c_str(), map_error.c_str());
-  if (!module) host::die("cannot load %s (error %lu)", g_dll.c_str(), GetLastError());
+  if (!module) {
+    const DWORD error = GetLastError();
+    // 4551 (ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION): Windows' app control (Smart App Control on Windows 11)
+    // refused the game library itself (two 1.0.22 reports, 11-24). Say what it is and where it is decided.
+    if (error == 4551)
+      host::die("Windows blocked %s (Smart App Control or an app control policy, error 4551), so the game cannot "
+                "start. Windows Security > App & browser control > Smart App Control decides this; on a managed "
+                "PC your administrator does.", g_dll.c_str());
+    host::die("cannot load %s (error %lu)", g_dll.c_str(), error);
+  }
   if (sandboxed) host::log("source port: %s mapped at its base by the host (sandboxed)", g_dll.c_str());
   // Windows can put the library somewhere else although its range is free: Exploit protection's
   // "Force randomization for images" (Mandatory ASLR) relocates every image, and it landed at a new
@@ -6520,6 +6646,12 @@ int run(void (*shutdown)(int)) {
   slippi::spectate::start();   // Slippi Dolphin's spectator server (settings: Spectator server)
   slippi::arena::set_recording_codes(std::vector<uint8_t>(std::begin(native_online_recording_codes), std::end(native_online_recording_codes)));
   slippi::arena::set_viewer_launcher(launch_arena_viewer);
+  // Tests only (hidden runs): MELEE_TEST_ARENA_VIEWER=<live .slp> opens the room's viewer on it at start,
+  // so the viewer launch is proven on each platform without a room (Linux had a stub, report 11-24).
+  if (const char* v = host::test_env::getenv("MELEE_TEST_ARENA_VIEWER"); v && *v) {
+    void* viewer = launch_arena_viewer(v);
+    host::log("arena test: viewer launch on %s %s", v, viewer ? "started" : "failed");
+  }
   slippi::arena::set_friends_exit([] { slippi::native_practice::submit_arena_from_friends(); });
 #endif
 #ifdef __APPLE__

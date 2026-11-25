@@ -2010,16 +2010,10 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
 
 // While closed, the gold look keeps the search on screen as one lit bar at the top right.
 void draw_bars_closed(ImDrawList* dl, const Frame& f) {
-  if (!f.search.searching) return;
-  const float u = (f.game_y1 - f.game_y0) / 720.0f * 0.82f;
-  const float h = 50.0f * u, right = f.game_x1 - 24.0f * u, top = f.game_y0 + 26.0f * u;
-  const std::string v = f.search.elapsed;
-  const float w = text_width(25 * u, f.search.mode.c_str()) + text_width(21 * u, v.c_str()) + 110 * u;
-  draw_bar(dl, right - w, top, right, h, u, true, f.search.mode.c_str(), v, true, 1.0f, false);
-  const float dot = 0.55f + 0.45f * std::sin((float)f.time * 4.0f);
-  dl->AddCircleFilled(ImVec2(right - 20 * u, top + h * 0.5f), 5.5f * u, IM_COL32(40, 170, 70, (int)(255 * dot)), 16);
-  const std::string sub = f.search.opponent.empty() ? host::settings_shortcut::practice_chord_name() + ": menu" : "Found " + f.search.opponent;
-  text(dl, right - w + 4 * u, top + h + 6 * u, 15 * u, IM_COL32(230, 232, 240, 230), sub.c_str());
+  // Never drawn any more (owner 11-24: "I don't ever wanna see that old yellow banner again"): every
+  // search shows the searching banner at the top (draw_search_banner), kept searches and Training's own alike.
+  (void) dl;
+  (void) f;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2319,7 +2313,7 @@ float draw_strip_line(ImDrawList* dl, const Frame& f, float u, float a) {
     if (!tech.empty()) tech[0] = (char)std::tolower((unsigned char)tech[0]);
     parts.push_back({"Tech " + tech, IM_COL32(255, 255, 255, 255)});
   }
-  if (f.search.searching) parts.push_back({f.search.mode + " " + f.search.elapsed, IM_COL32(93, 240, 138, 255)});
+  // The search is the top banner's (owner 11-24), never a part of this strip.
   }
   const float px = 16 * u, h = 40 * u, sep = 24 * u;
   float w = 34 * u;

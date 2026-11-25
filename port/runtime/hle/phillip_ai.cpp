@@ -104,6 +104,37 @@ bool cpu_has_avx() {
 #endif
 }
 
+#ifndef _WIN32
+// Whether an ELF library file holds all it says it has: every loadable segment and the section table.
+// dlopen of a cut-short file (an interrupted download or extraction) maps pages past its end and the
+// process dies with a bus error (Linux report 11-24, B-1423): checked first, so Fight a pro is off instead.
+bool elf_complete(const std::string& path, std::string* why) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) { *why = "missing"; return false; }
+  f.seekg(0, std::ios::end);
+  const uint64_t size = (uint64_t)f.tellg();
+  unsigned char h[64] = {};
+  f.seekg(0);
+  if (size < 64 || !f.read((char*)h, 64) || h[0] != 0x7F || h[1] != 'E' || h[2] != 'L' || h[3] != 'F' || h[4] != 2 || h[5] != 1) {
+    *why = "not a 64-bit ELF library"; return false;
+  }
+  auto u16 = [](const unsigned char* p) { return (uint64_t)p[0] | (uint64_t)p[1] << 8; };
+  auto u64 = [](const unsigned char* p) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | p[i]; return v; };
+  const uint64_t phoff = u64(h + 0x20), shoff = u64(h + 0x28), phent = u16(h + 0x36), phnum = u16(h + 0x38);
+  const uint64_t shent = u16(h + 0x3A), shnum = u16(h + 0x3C);
+  if (phent < 56 || phoff + phent * phnum > size) { *why = "its program headers are cut off"; return false; }
+  if (shoff && shoff + shent * shnum > size) { *why = "it is cut short"; return false; }
+  for (uint64_t i = 0; i < phnum; ++i) {
+    unsigned char p[56] = {};
+    f.seekg((std::streamoff)(phoff + i * phent));
+    if (!f.read((char*)p, 56)) { *why = "unreadable"; return false; }
+    const uint64_t type = (uint64_t)p[0] | (uint64_t)p[1] << 8 | (uint64_t)p[2] << 16 | (uint64_t)p[3] << 24;
+    if (type == 1 && u64(p + 0x08) + u64(p + 0x20) > size) { *why = "it is cut short"; return false; }   // PT_LOAD
+  }
+  return true;
+}
+#endif
+
 bool runtime_ready() {
   if (g_runtime) return g_runtime == 1;
   g_runtime = -1;
@@ -117,8 +148,14 @@ bool runtime_ready() {
 #else
   // The Linux package keeps its libraries in lib/ beside the game.
   std::string path = exe_dir() + "lib/libonnxruntime.so";
+  if (!std::ifstream(path, std::ios::binary)) path = exe_dir() + "libonnxruntime.so";
+  std::string damage;
+  if (std::ifstream(path, std::ios::binary) && !elf_complete(path, &damage)) {
+    host::log("pro ai: %s is damaged (%s); Fight a pro is off. Download Melee Unlocked again and extract all of it.",
+              path.c_str(), damage.c_str());
+    return false;
+  }
   void* dll = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (!dll) dll = dlopen((path = exe_dir() + "libonnxruntime.so").c_str(), RTLD_NOW | RTLD_LOCAL);
   using GetBase = const OrtApiBase* (*)();
   GetBase get_base = dll ? reinterpret_cast<GetBase>(dlsym(dll, "OrtGetApiBase")) : nullptr;
 #endif

@@ -23,6 +23,8 @@ class RemixBridge {
   // Inside the game's window: the picture's rectangle in its client area (follows resizes).
   void place(int x, int y, int w, int h);
   bool started() const { return started_; }
+  // Remix has ray traced a frame (its picture is real): until then a match shows the game's own picture.
+  bool tracing() const;
   // One match frame: the draws of `camera`, `view_to_world` (row major 3x4) and the lights in world space.
   // `layer`: per draw, 1 where the renderer's layer carries it (effects, live screens) and Remix leaves it out.
   void frame(const Frame& f, int camera, const float view_to_world[12], const std::vector<RtxLightRecord>& lights,
@@ -40,6 +42,7 @@ class RemixBridge {
  private:
   struct Impl;
   bool capture_output(const std::string& path, int type);
+  bool traced_once();
   void present_d3d9();
   Impl* impl_ = nullptr;
   bool started_ = false;

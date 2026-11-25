@@ -15,17 +15,32 @@ namespace gx {
 // neutral light. Remix gets that as its texture, so constant-coloured lines and tinted stages keep their
 // colours. Inputs follow GX: only the texmap `own_map` is the given texel (other textures read white),
 // the rasterized colour is `ras` (0..255), comparison modes are passed as plain adds.
-void tev_texel(const DrawCall& d, int own_map, const float texel[4], const float ras[4], float out[4]) {
+int tev_texel(const DrawCall& d, int own_map, const float texel[4], const float ras[4], float out[4], int map2, const float* texel2,
+              bool fighter_surface) {
   const BPMemory& bp = d.bp;
   float reg[4][4];
   for (int r = 0; r < 4; ++r)
     for (int k = 0; k < 4; ++k) reg[r][k] = (float)d.tev_colors[r][k];
   const uint32_t stages = bp.numtevstages() + 1;
   static const float kconst[8] = {255.0f, 223.0f, 191.0f, 159.0f, 128.0f, 96.0f, 64.0f, 32.0f};
+  int run = 0;
+  uint32_t last_c = 0, last_a = 0;
   for (uint32_t n = 0; n < stages && n < 16; ++n) {
     float tex[4] = {255, 255, 255, 255};
     if (bp.order_enable((int)n) && bp.order_texmap((int)n) == own_map)
       for (int k = 0; k < 4; ++k) tex[k] = texel[k];
+    else if (bp.order_enable((int)n) && texel2 && bp.order_texmap((int)n) == map2)
+      for (int k = 0; k < 4; ++k) tex[k] = texel2[k];
+    else if (fighter_surface && bp.order_enable((int)n))
+      continue;   // a texture not given (a sphere map, another coordinate): left out, not read as white
+    if (fighter_surface) {
+      // The lighting starts here (the rasterized colour): the surface colour is what came before.
+      const uint32_t c = bp.tev_color((int)n), a = bp.tev_alpha((int)n);
+      bool reads_ras = false;
+      for (int sh = 0; sh < 16; sh += 4) { const uint32_t sel = (c >> sh) & 15; reads_ras = reads_ras || sel == 10 || sel == 11; }
+      for (int sh = 4; sh < 16; sh += 3) reads_ras = reads_ras || ((a >> sh) & 7) == 5;
+      if (reads_ras) break;
+    }
     float konst[4];
     const int kc = bp.ksel_kc((int)n), ka = bp.ksel_ka((int)n);
     auto kval = [&](int sel, int ch) -> float {
@@ -73,8 +88,11 @@ void tev_texel(const DrawCall& d, int own_map, const float texel[4], const float
     const uint32_t cdest = bits(cc, 22, 2), adest = bits(ac, 22, 2);
     for (int ch = 0; ch < 3; ++ch) reg[cdest][ch] = result[ch];
     reg[adest][3] = result[3];
-    if (n + 1 == stages) for (int k = 0; k < 4; ++k) out[k] = std::clamp(k < 3 ? reg[cdest][k] : reg[adest][3], 0.0f, 255.0f);
+    last_c = cdest; last_a = adest; ++run;
   }
+  if (run == 0) { for (int k = 0; k < 4; ++k) out[k] = texel[k]; return 0; }
+  for (int k = 0; k < 4; ++k) out[k] = std::clamp(k < 3 ? reg[last_c][k] : reg[last_a][3], 0.0f, 255.0f);
+  return run;
 }
 
 bool FxLightCollector::add(const Frame& f, const DrawCall& d, const float vw[12], std::vector<FxLight>& out, int segments) {

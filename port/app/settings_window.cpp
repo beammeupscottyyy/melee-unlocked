@@ -89,7 +89,7 @@ static bool standby_wait(void* hwnd) {
 // The window is 620 by 700 at 96 DPI and the panel is drawn in those units. On a scaled display both
 // grow by dpi/96: the window was 620 by 700 pixels whatever the scaling, so at 250 percent on a 4K
 // monitor it came out at 40 percent of the size of the launcher that opened it, with text to match.
-constexpr int kBaseWidth = 620, kBaseHeight = 700;
+constexpr int kBaseWidth = 860, kBaseHeight = 700;   // 860: the hover descriptions fit (tyler631 11-24: cut off at 620)
 
 // MELEE_TEST_UI_DPI=<dpi> (tests): the window behaves as if its monitor reported that DPI, so the
 // scaled layout can be captured on a display that is not scaled. 192 is 200 percent.

@@ -39,6 +39,12 @@ uint32_t game_tag(const uint8_t* start, size_t size) {
   return h ? h : 1;
 }
 
+int winning_port(const uint8_t* end, size_t size) {
+  if (!end || size < 6 || end[0] < 1 || end[0] > 3) return -1;
+  int first = -1, count = 0;
+  for (int port = 0; port < 4; ++port) if (end[2 + port] == 0) { first = port; ++count; }
+  return count == 1 ? first : -1;
+}
 int my_result(const uint8_t* end, size_t size, int my_port, const uint8_t port_team[4], bool doubles) {
   // Methods 1 time, 2 game and 3 (game, newer recordings) have a result; 7 is a no contest.
   if (!end || size < 6 || end[0] < 1 || end[0] > 3 || my_port < 0 || my_port > 3) return -1;

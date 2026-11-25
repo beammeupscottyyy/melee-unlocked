@@ -318,6 +318,7 @@ struct SetupSeat {
   int local_index = 0;
   Pick pick;
   int level = 0;                        // CPU only
+  int pro = -1;                         // a Pro AI seat: local_index 1, the model plays it on its owner's machine
   int squad_version = 0;
   std::string squad_budget;
   std::vector<Pick> lineup;

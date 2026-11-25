@@ -1013,6 +1013,13 @@ target_compile_definitions(port_mu_net_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
 target_compile_options(port_mu_net_test PRIVATE /EHsc /utf-8)
 target_link_libraries(port_mu_net_test PRIVATE mu_net)
 add_test(NAME port_mu_net COMMAND port_mu_net_test)
+# The online late controller read's wait (runtime/host/late_read.h): header only, no game needed.
+add_executable(port_late_read_test tests/late_read_test.cpp)
+target_include_directories(port_late_read_test PRIVATE runtime/host)
+target_compile_features(port_late_read_test PRIVATE cxx_std_17)
+target_compile_definitions(port_late_read_test PRIVATE NOMINMAX)
+target_compile_options(port_late_read_test PRIVATE /EHsc /utf-8)
+add_test(NAME port_late_read COMMAND port_late_read_test)
 endif()
 
 # WIN32: no console window when the game is double-clicked or started from the launcher. Command-line

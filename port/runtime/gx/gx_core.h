@@ -781,6 +781,12 @@ struct Backend {
   virtual bool display_lag(double& seconds, uint64_t& serial) const { (void)seconds; (void)serial; return false; }
   // Tests (MELEE_TEST_SHOWN_TRACE): the moment of the game the next submitted frame shows, host seconds.
   virtual void note_shown_moment(double) {}
+  // The kind of the next submitted frame (0: the first present of a game frame, 1: a repeated one), and
+  // for the latest measured shown frame how long after the moment it shows it reached the screen
+  // (seconds), with its kind and a serial that changes with every measurement. The presentation loop
+  // levels the two kinds with it. False where it is not measured.
+  virtual void note_shown_kind(int) {}
+  virtual bool shown_lag(double& seconds, int& kind, uint64_t& serial) const { (void)seconds; (void)kind; (void)serial; return false; }
   // What the display side reported since the last call (D3D12: DXGI frame statistics), for the
   // "pacing:" line. Called on the render thread.
   virtual std::string display_timing_line() { return "display statistics not available"; }

@@ -7,6 +7,7 @@
  * its state are ordinary game data here, so savestates and the lab's recordings keep them.
  * Offline Training only: never online, while an online match is pending, or in replay playback. */
 #include <dolphin/os.h>
+#include <dolphin/pad.h>
 #include <melee/ft/fighter.h>
 #include <melee/ft/forward.h>
 #include <melee/ft/types.h>
@@ -371,6 +372,72 @@ int mu_practice_cpu_drive_as(void* fighter, void* opponent, const MuPcConfig* c,
     Fighter* fp = fighter;
     if (fp == NULL || fp->is_sub_fighter || c == NULL || !c->enabled) return 0;
     return pc_drive(fp, opponent, c, out, 0);
+}
+
+/* A Pro AI seat online (an Arena room's bot, a Direct game's added Pro AI, a YouGame Friends seat): the model
+ * plays `port`'s fighter on this machine only, and its controller goes out as this machine's partner pad
+ * (mu_online.c), so every machine plays it from the same confirmed inputs. The model is trained one on one: it
+ * watches the nearest fighter it can hit (another team's in teams, anyone in a free-for-all) with stocks left.
+ * Writes a console pad (sticks in the game's units, so the game reads back what the model asked for). */
+static signed char proai_axis(float v)
+{
+    float r = v * 80.0f;
+    if (r > 127.0f) r = 127.0f;
+    if (r < -127.0f) r = -127.0f;
+    return (signed char) (r < 0.0f ? r - 0.5f : r + 0.5f);
+}
+static unsigned char proai_trigger(float v)
+{
+    float r = v * 140.0f;
+    if (r < 0.0f) r = 0.0f;
+    if (r > 255.0f) r = 255.0f;
+    return (unsigned char) (r + 0.5f);
+}
+int mu_proai_seat_pad(int port, int pro, PADStatus* out)
+{
+    HSD_GObj* g;
+    Fighter* fp;
+    Fighter* opp = NULL;
+    MuPcConfig c;
+    MuLabInput in;
+    float best = 1e30f;
+    int k;
+    const int teams = gm_8016B168();
+    __builtin_memset(out, 0, sizeof *out);
+    if (port < 0 || port > 3 || pro < 0 || pro > 0x7F) return 0;
+    g = Player_GetEntity(port);
+    if (g == NULL || g->user_data == NULL) return 0;
+    fp = g->user_data;
+    for (k = 0; k < 4; k++) {
+        HSD_GObj* o;
+        Fighter* f;
+        float dx, dy, d;
+        if (k == port || Player_GetStocks(k) <= 0) continue;
+        if (teams && Player_GetTeam(k) == Player_GetTeam(port)) continue;
+        o = Player_GetEntity(k);
+        if (o == NULL || o->user_data == NULL) continue;
+        f = o->user_data;
+        dx = f->cur_pos.x - fp->cur_pos.x;
+        dy = f->cur_pos.y - fp->cur_pos.y;
+        d = dx * dx + dy * dy;
+        if (d < best) { best = d; opp = f; }
+    }
+    if (opp == NULL) return 0;
+    __builtin_memset(&c, 0, sizeof c);
+    mu_pc_defaults(&c);
+    c.enabled = 1;
+    c.preset = (mu_pc_u8) MU_PC_PRESET_PRO(pro);
+    __builtin_memset(&in, 0, sizeof in);
+    if (!pc_drive(fp, opp, &c, &in, 0)) return 0;
+    out->button = (u16) (in.buttons & 0x0F7Fu);   /* the pad's buttons, never Start */
+    out->stickX = proai_axis(in.lx);
+    out->stickY = proai_axis(in.ly);
+    out->substickX = proai_axis(in.cx);
+    out->substickY = proai_axis(in.cy);
+    out->triggerLeft = proai_trigger(in.l);
+    out->triggerRight = proai_trigger(in.r);
+    out->err = 0;
+    return 1;
 }
 
 /* ---- the pro AI (mu_ghost_ai.h): the host's network plays, from what a replay would record ---- */

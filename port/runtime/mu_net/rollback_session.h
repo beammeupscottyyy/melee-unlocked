@@ -27,6 +27,13 @@ struct SessionCallbacks {
   std::function<void(const char* line)> log;
   std::function<uint64_t()> now_us;                    // monotonic; a steady clock is used when empty
   std::function<void(double speed)> set_emulation_speed;
+  // Late controller read (host/late_read.h); both empty: never. `late_offer`: whether a match with
+  // this setup delay and ping (0: none measured yet) gives the game one frame less. `late_hold`:
+  // called on the simulation thread from on_inputs with the session unlocked, after a frame's pad
+  // went out; it waits. `early_ms`: how long ago the remote pad for `frame` arrived (negative: still
+  // on its way), when `have_early`.
+  std::function<bool(int delay, uint32_t ping_us)> late_offer;
+  std::function<void(int32_t frame, bool have_early, double early_ms)> late_hold;
 };
 
 struct SessionOptions {

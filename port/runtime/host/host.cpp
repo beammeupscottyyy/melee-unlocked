@@ -45,6 +45,7 @@
 #include "gecko_data.h"
 #include "render_options.h"
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -3436,6 +3437,39 @@ void report_sim_work() {
 }
 double last_sim_frame_work_ms() { return g_last_sim_work_ms; }
 bool last_sim_frame_late() { return g_last_sim_late; }
+// The game thread's work over the last two seconds, menus included, for the online late read's
+// offer: a computer whose frames leave no room for the wait must not start a match that way.
+static std::array<std::atomic<float>, 120> g_recent_work{};
+static std::atomic<unsigned> g_recent_work_count{0};
+static void note_recent_work(double ms) {
+  const unsigned n = g_recent_work_count.load(std::memory_order_relaxed);
+  g_recent_work[n % g_recent_work.size()].store((float)ms, std::memory_order_relaxed);
+  g_recent_work_count.store(n + 1, std::memory_order_relaxed);
+}
+// Which of the last 120 frames missed their place on the 60 Hz schedule: a stall shows here even when
+// most frames are light (measured 11-23: a 63 ms frame in the first second, then frames of 13 to 52 ms).
+static std::array<std::atomic<bool>, 120> g_recent_late{};
+static std::atomic<unsigned> g_recent_late_count{0};
+static void note_recent_late(bool late) {
+  const unsigned n = g_recent_late_count.load(std::memory_order_relaxed);
+  g_recent_late[n % g_recent_late.size()].store(late, std::memory_order_relaxed);
+  g_recent_late_count.store(n + 1, std::memory_order_relaxed);
+}
+bool recent_sim_frames_steady() {
+  const unsigned have = std::min<unsigned>(g_recent_late_count.load(std::memory_order_relaxed), (unsigned)g_recent_late.size());
+  if (have < 60) return false;   // too little seen yet to say
+  unsigned late = 0;
+  for (unsigned i = 0; i < have; ++i) late += g_recent_late[i].load(std::memory_order_relaxed) ? 1u : 0u;
+  return late * 20 <= have;      // at most 1 frame in 20 late
+}
+double recent_sim_frame_work_ms() {
+  const unsigned have = std::min<unsigned>(g_recent_work_count.load(std::memory_order_relaxed), (unsigned)g_recent_work.size());
+  if (!have) return 0.0;
+  std::array<float, 120> sorted{};
+  for (unsigned i = 0; i < have; ++i) sorted[i] = g_recent_work[i].load(std::memory_order_relaxed);
+  std::sort(sorted.begin(), sorted.begin() + have);
+  return sorted[std::min(have - 1, have * 19 / 20)];   // what 19 of 20 frames needed
+}
 
 // MELEE_TEST_EARLY_RNG_SEED="<seed>@<retrace>" (M4 diagnostic, off by default): the recompiled
 // game's seed is written through HSD_RandSeedPtr at the start of that retrace, before the VI
@@ -3551,6 +3585,98 @@ static void wait_for_tick(std::chrono::steady_clock::time_point deadline) {
   }
 }
 
+// ---- Tick re-run (host.h) ----
+static const bool g_redo_on = [] { const char* v = std::getenv("MELEE_TICK_REDO"); return v && *v == '1'; }();
+static bool g_redo_armed = false, g_redo_wanted = false, g_redo_active = false;
+static int g_redo_runs = 0;                       // re-runs of the current tick
+static double g_redo_wanted_at = 0.0;
+static uint64_t g_redo_total = 0, g_redo_ticks = 0;
+bool tick_redo_enabled() { return g_redo_on; }
+// A frame handed to the renderer in the first quarter ms of a tick was drawn in the tick before and
+// held at the game's frame copy until this tick's retrace: the scene loop is waiting inside the copy
+// (no free frame buffer) instead of in its pad wait, and every picture is one game frame late while
+// the latency trace still reads short. Seen 11-21 after a tick was drawn twice; said once if a
+// match ever runs that way for two seconds.
+void note_frame_handover() {
+  static int held = 0; static bool told = false;
+  if (told) return;
+  uint32_t major = 0, minor = 0, match_frame = 0;
+  current_scene(&major, &minor, &match_frame);
+  const double into = now_seconds() - g_frame_time;
+  if (major == 2 && minor == 2 && match_frame > 120 && into >= 0.0 && into < 0.00025) {
+    if (++held == 120) { told = true; log("timing: frames are being handed over %.2f ms into the next tick: the game is holding each drawn frame for a retrace, so the picture is one game frame late", into * 1000.0); }
+  } else held = 0;
+}
+bool tick_redo_active() { return g_redo_active; }
+bool tick_redo_wanted() { return g_redo_wanted; }
+void tick_redo_arm(bool armed) {
+  g_redo_armed = armed && g_redo_on;
+  g_redo_wanted = false;
+  g_redo_active = false;
+}
+void tick_redo_begin() {
+  g_redo_wanted = false; g_redo_active = true; ++g_redo_runs; ++g_redo_total;
+  if (g_redo_total <= 5 || g_redo_total % 200 == 0)
+    log("tick re-run: %llu so far (this one %.2f ms into its tick)", (unsigned long long)g_redo_total, (now_seconds() - g_frame_time) * 1000.0);
+}
+static bool redo_watching() { return (g_redo_on && g_redo_armed && !g_redo_active) || input_midtick_test(); }
+// From the waits between ticks. True: the wait ends now, for a re-run. The window ends 14.5 ms into the
+// tick, so the second run (about 2 ms of game work) is over before the next tick is due. Measured 11-21:
+// a press 13 ms in waited 6.2 ms for its picture without a re-run, against 3.4 to 4.9 ms with one.
+static bool redo_wait_check() {
+  if (g_redo_wanted) {
+    // Asked for but not taken within 1.5 ms (the game is not at its gate): this tick has none.
+    if (now_seconds() - g_redo_wanted_at < 0.0015) return true;
+    g_redo_wanted = false; g_redo_runs = 2;
+    return false;
+  }
+  const bool changed = input_changed_since_poll(g_frame_time);
+  // MELEE_TEST_REDO_EVERY=<n>:<ms> (tests): every n-th tick is run again <ms> in with nothing changed, so
+  // the game after it must be exactly the game without it, whatever sounds and effects that tick started.
+  static const struct Forced {
+    unsigned every = 0; double at = 0.0;
+    Forced() { if (const char* v = host::test_env::getenv("MELEE_TEST_REDO_EVERY")) { double ms = 0; if (std::sscanf(v, "%u:%lf", &every, &ms) == 2) at = ms / 1000.0; else every = 0; } }
+  } forced_test;
+  const bool forced = forced_test.every && g_retraces % forced_test.every == 0 && g_redo_runs == 0 && now_seconds() - g_frame_time >= forced_test.at;
+  if (!g_redo_on || !g_redo_armed || g_redo_active || g_redo_runs >= 2 || !(changed || forced)) return false;
+  if (now_seconds() - g_frame_time > 0.0145) return false;
+  g_redo_wanted = true; g_redo_wanted_at = now_seconds();
+  return true;
+}
+static bool wait_for_tick_watching(std::chrono::steady_clock::time_point deadline) {
+  static const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+  for (;;) {
+    if (redo_wait_check()) return false;
+    const double remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0.0) return true;
+    const double slack = sleep_slack();
+    if (remaining > 0.0006 + slack) {
+      if (!timed_sleep(timer, std::min(remaining - 0.0004 - slack, 0.0003))) YieldProcessor();   // looks at the controller about three times a ms
+    } else {
+      YieldProcessor();
+    }
+  }
+}
+// The wait a retrace would make, made before it so it can end early. It stops 150 us short and the
+// retrace's own wait does the rest, so the frame is not counted as late.
+bool tick_redo_presleep() {
+  if (!redo_watching() || options.fast) return true;
+  const auto deadline = g_next_frame + std::chrono::microseconds((long long)(16667.0 / g_emulation_speed)) - std::chrono::microseconds(150);
+  return wait_for_tick_watching(deadline);
+}
+
+double tick_hold(double seconds) {
+  if (options.fast || seconds <= 0.0) return 0.0;
+  const auto deadline = g_next_frame + std::chrono::microseconds((long long)(seconds * 1e6));
+  const auto before = std::chrono::steady_clock::now();
+  if (deadline <= before) return 0.0;
+  perf::Scope wait_cost(perf::Stage::Wait);
+  wait_for_tick(deadline);
+  const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - before).count();
+  sim_cost_add(SIM_WAIT, waited);
+  return waited;
+}
+
 // How deep the game thread's stack has been: the lowest page Windows has had to commit for it. The
 // game's model loaders call themselves once per joint and per drawn part, each such call is a host
 // call here, and a retrace interrupt that arrives mid-load runs on top of them. With the default
@@ -3629,7 +3755,8 @@ bool wait_until_console_time(uint64_t tb) {
   const auto deadline = g_next_frame + std::chrono::microseconds((long long)(into_frame * 16667.0 / g_emulation_speed));
   const auto before = std::chrono::steady_clock::now();
   if (deadline > before) {
-    wait_for_tick(deadline);
+    if (redo_watching()) { if (!wait_for_tick_watching(deadline)) return false; }   // ended early for a tick re-run
+    else wait_for_tick(deadline);
     const auto after = std::chrono::steady_clock::now();
     sim_cost_add(SIM_WAIT, std::chrono::duration<double>(after - before).count());
     sim_cost_add(SIM_LATE, std::chrono::duration<double>(after - deadline).count());
@@ -3660,6 +3787,7 @@ void retrace() {
     if (g_sim_frame_start > 0.0) {
       g_last_sim_ms = (now - g_sim_frame_start) * 1000.0;
       g_last_sim_work_ms = g_last_sim_ms - g_sim_costs[SIM_WAIT] * 1000.0;
+      note_recent_work(g_last_sim_work_ms);
       g_sim_ms_window += g_last_sim_ms;
       if (g_last_sim_ms > g_sim_ms_worst) g_sim_ms_worst = g_last_sim_ms;
       if (g_last_sim_ms > 20.0) {
@@ -3750,6 +3878,7 @@ void retrace() {
     g_next_frame += std::chrono::microseconds((long long)(16667.0 / g_emulation_speed));
     auto now = std::chrono::steady_clock::now();
     g_last_sim_late = !(g_next_frame > now);   // no time left to wait: the frame finished after its deadline
+    note_recent_late(g_last_sim_late);
     if (g_next_frame > now) wait_for_tick(g_next_frame);
     else if (now - g_next_frame > std::chrono::milliseconds(34)) g_next_frame = now;   // after a stall, resume at 60 Hz instead of sprinting to catch up (audio would crackle)
     g_frame_time = std::chrono::duration<double>(g_next_frame.time_since_epoch()).count();
@@ -3763,6 +3892,8 @@ void retrace() {
   if (sim_times_wanted) QueryThreadCycleTime(GetCurrentThread(), &g_sim_frame_start_cycles);
   // The latency probe's newest press is carried on (tick_timing.h); without the trace it stays 0.
   g_tick_timing.target = g_frame_time; g_tick_timing.wake = g_sim_frame_start;
+  g_redo_runs = 0;
+  if (g_redo_on && ++g_redo_ticks % 3600 == 0) log("tick re-run: %llu re-runs in %llu ticks", (unsigned long long)g_redo_total, (unsigned long long)g_redo_ticks);
   g_tick_timing.pad = 0; g_tick_timing.pad_age = -1;
   if (native_retrace) {
     native_retrace();

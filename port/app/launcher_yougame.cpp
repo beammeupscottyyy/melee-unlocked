@@ -878,8 +878,30 @@ std::vector<ListedBuild> listed_builds(const std::string& page) {
 // build's record: a release YouGame does not list yet names none and meets launcher players only. "" then.
 std::string native_build_from_listing(const std::string& page, const std::string& version, const char* platform) {
   std::string found;
-  for (const ListedBuild& r : listed_builds(page))   // the page lists oldest first: keep the newest
+  const std::vector<ListedBuild> builds = listed_builds(page);
+  for (const ListedBuild& r : builds)   // the page lists oldest first: keep the newest
     if (r.platform == platform && (r.version == version || r.version.rfind(version + "-", 0) == 0)) found = r.id;
+  if (!found.empty() || version.empty()) return found;
+  // From 11-23 the page numbers YouGame's native builds ("103") instead of naming the release; only its newest
+  // release is named ("latest":{..."title":"Melee Unlocked 1.0.19"}). This build is that release: the
+  // platform's highest numbered build is its record. Any other release still names none.
+  std::string b;
+  for (char c : page) if (c != '\\') b += c;
+  static const std::string kLatest = "\"latest\":{", kTitle = "\"title\":\"Melee Unlocked ";
+  const size_t latest = b.find(kLatest);
+  if (latest == std::string::npos) return found;
+  const size_t close = b.find('}', latest), title = b.find(kTitle, latest);
+  if (title == std::string::npos || (close != std::string::npos && title > close)) return found;
+  const size_t v = title + kTitle.size(), v_end = b.find('"', v);
+  if (v_end == std::string::npos || b.compare(v, v_end - v, version) != 0) return found;
+  long best = -1;
+  for (const ListedBuild& r : builds) {
+    if (r.platform != platform || r.version.empty() || r.version.size() > 9 ||
+        r.version.find_first_not_of("0123456789") != std::string::npos)
+      continue;
+    const long n = std::atol(r.version.c_str());
+    if (n > best) { best = n; found = r.id; }
+  }
   return found;
 }
 std::string listed_build_id(const std::string& version) {
@@ -1229,7 +1251,15 @@ BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& t
         // The site's native Doubles check (native-teams.ts, port/tests/doubles_wiring_test.py) names the build as native_build.
         const std::string version = parse_or_empty(build_json).value("version", std::string());
         body["native_build"] = listed_build_id(version);
-        if (body["native_build"].get<std::string>().empty())
+        // Tests only (MELEE_LAUNCHER_TEST=1 with MELEE_LAUNCHER_TEST_DOUBLES_ANY_BUILD=1): ask YouGame anyway, so a hidden pair
+        // still plays a Doubles home while YouGame has not listed this release yet (YouGame then decides).
+        // MELEE_LAUNCHER_TEST_DOUBLES_BUILD_ID=<YouGame build id> names that listed build instead (YouGame refuses a Doubles home
+        // with none: bad_teams_lobby).
+        const bool any_build = std::getenv("MELEE_LAUNCHER_TEST") && std::getenv("MELEE_LAUNCHER_TEST_DOUBLES_ANY_BUILD");
+        const char* test_build = std::getenv("MELEE_LAUNCHER_TEST") ? std::getenv("MELEE_LAUNCHER_TEST_DOUBLES_BUILD_ID") : nullptr;
+        if (test_build && *test_build && body["native_build"].get<std::string>().empty()) body["native_build"] = std::string(test_build);
+        if (any_build && body["native_build"].get<std::string>().empty()) body.erase("native_build");
+        else if (body["native_build"].get<std::string>().empty())
           return reply(200, {{"ok", false}, {"error", "YouGame Doubles opens once YouGame lists Melee Unlocked " + version +
                                                       " (usually within two hours of a release). Try again later."}});
       }

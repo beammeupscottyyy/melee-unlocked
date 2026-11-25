@@ -17,6 +17,8 @@
 #include <thread>
 #include <vector>
 #include "early_input.h"
+#include "late_read.h"
+#include "test_env.h"
 
 namespace source_p2p {
 namespace {
@@ -449,6 +451,36 @@ void start(bool harness) {
   mu_net::SessionCallbacks callbacks;
   callbacks.log = [](const char* line) { host::log("p2p: %s", line); };
   callbacks.set_emulation_speed = [](double speed) { g().speed.store(speed, std::memory_order_relaxed); };
+  // Late controller read (host/late_read.h): only with "Variable online delay" on (or MELEE_ONLINE_LATE_READ=1). Tests:
+  // MELEE_TEST_LATE_READ=1 takes it whatever the ping, MELEE_TEST_LATE_HOLD_MS fixes the wait.
+  static host::late_read::Control late_control;
+  static bool late_soured = false;   // a game played this way went badly: not offered again in this session
+  const bool late_on = host::late_read::enabled();   // read per session: the setting can change between them
+  if (late_on) {
+    callbacks.late_offer = [](int delay, uint32_t ping_us) {
+      static const bool forced = [] { const char* v = host::test_env::getenv("MELEE_TEST_LATE_READ"); return v && *v == '1'; }();
+      if (late_soured) return false;
+      return forced || (ping_us > 0 && host::late_read::has_room(delay, (double)ping_us / 1000.0, host::recent_sim_frame_work_ms()) &&
+                         host::recent_sim_frames_steady());
+    };
+    callbacks.late_hold = [](int32_t frame, bool have_early, double early_ms) {
+      static const double fixed = [] { const char* v = host::test_env::getenv("MELEE_TEST_LATE_HOLD_MS"); return v && *v ? std::atof(v) : -1.0; }();
+      if (frame <= 1) {   // a new game
+        if (late_control.went_badly() && !late_soured) {
+          late_soured = true;
+          host::log("p2p: late controller read: not offered again in this session (%llu pads came after their frame had started, %llu of %llu frames had no room for the wait)",
+                    (unsigned long long)late_control.late_arrivals(), (unsigned long long)late_control.short_frames(), (unsigned long long)late_control.frames());
+        }
+        late_control.reset();
+      }
+      const double wait = late_control.step(frame, have_early, early_ms, host::last_sim_frame_work_ms(), host::last_sim_frame_late(), fixed);
+      const double waited = host::tick_hold(wait / 1000.0) * 1000.0;
+      late_control.note_waited(waited);
+      if (late_control.frames() % 600 == 0)
+        host::log("p2p: late controller read: wait %.1f ms now (%.1f waited this frame), %.1f on average; remote pads at least %.1f ms early without it; work %.1f ms; %.1f ms sooner than the setup's delay",
+                  wait, waited, late_control.average_hold_ms(), late_control.least_early_ms(), late_control.work_ms(), late_control.saved_ms());
+    };
+  }
   // A launcher starts the two games seconds apart and each boots for several more before it gets
   // here, so it asks for a longer wait than two games started by hand at the same moment need.
   mu_net::SessionOptions session_options;

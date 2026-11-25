@@ -143,6 +143,14 @@ class InputTransport {
   uint32_t remote_checksum() const { return remote_checksum_; }
   bool has_ping() const { return has_ping_; }
   uint32_t ping_us() const { return ping_us_; }
+  // Late controller read: how long before `now_us` the remote pad for `frame` arrived, taken from the
+  // newest frame received and the frame rate the pads are sent at (negative: still on its way).
+  // False before any remote frame has arrived.
+  bool remote_early_us(int32_t frame, uint64_t now_us, int64_t* early_us) const {
+    if (newest_remote_seen_ <= 0 || newest_remote_us_ == 0) return false;
+    *early_us = (int64_t)now_us - (int64_t)newest_remote_us_ + (int64_t)frame_us_ * ((int64_t)newest_remote_seen_ - frame);
+    return true;
+  }
   // How far this side's frame clock runs ahead of the peer's, in microseconds (negative: behind).
   // The mean of the middle third of the last kTimeSyncSamples samples.
   int32_t time_offset_us() const;
@@ -160,6 +168,7 @@ class InputTransport {
   int32_t base_ = 0;
   int32_t local_latest_ = 0, remote_latest_ = 0, peer_ack_ = 0, floor_ = 0;
   int32_t newest_remote_seen_ = 0;
+  uint64_t newest_remote_us_ = 0;   // when it arrived
   int32_t checksum_frame_ = 0, remote_checksum_frame_ = 0;
   uint32_t checksum_ = 0, remote_checksum_ = 0;
   bool clock_set_ = false;

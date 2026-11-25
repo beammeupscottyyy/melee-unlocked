@@ -84,7 +84,7 @@ static bool texgen_uv(const DrawCall& d, const Vertex& v, int k, float out[2]) {
 }
 
 // An sRGB RGBA8 DDS (DX10 header), the format Remix reads albedo from.
-bool write_dds(const std::filesystem::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba, bool mips = false) {
+static bool write_dds_file(const std::filesystem::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba, bool mips) {
   std::ofstream f(path, std::ios::binary);
   if (!f) return false;
   uint32_t header[32] = {};
@@ -131,6 +131,17 @@ bool write_dds(const std::filesystem::path& path, uint32_t w, uint32_t h, const 
   }
   return (bool)f;
 }
+// Written whole to a side file, then renamed into place: a crash mid-write (11-24) left two textures
+// cut off at 4096 bytes in the shared cache, and Remix crashed loading them on every run after.
+bool write_dds(const std::filesystem::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgba, bool mips = false) {
+  std::filesystem::path part = path;
+  part += L".part";
+  std::error_code ec;
+  if (!write_dds_file(part, w, h, rgba, mips)) { std::filesystem::remove(part, ec); return false; }
+  std::filesystem::rename(part, path, ec);
+  if (ec) std::filesystem::remove(part, ec);
+  return std::filesystem::exists(path);
+}
 
 LRESULT CALLBACK remix_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) { return DefWindowProcW(hwnd, msg, wp, lp); }
 
@@ -162,10 +173,15 @@ struct RemixBridge::Impl {
   std::vector<uint8_t> hud;
   bool hud_new = false;
   std::string backbuffer_capture;   // D3D9 mode: save the next presented picture here
+  std::string final_capture;        // D3D9 mode: Remix's own picture of that frame, saved after later presents
+  int final_presents = 0;           // presents since that frame
   bool child = false;                // drawing inside the game's window (the renderer setting)
   int shown = -1;                    // the window's visibility as show() last set it (-1 not yet)
   int place_x = -1, place_y = -1;    // where place() last put that window
   int want_w = 0, want_h = 0, want_frames = 0;   // a new picture size, held a few frames before the device is reset
+  // Whether Remix has ray traced a frame (its normals hold a surface), checked every 30 scene frames until it has.
+  bool tracing = false;
+  uint32_t tracing_checks = 0;
   // This frame's bright effects (additive, carried by the layer) as lights.
   std::vector<FxLight> fx_lights;
   FxLightCollector fx;
@@ -215,6 +231,9 @@ bool RemixBridge::start(int width, int height, bool hidden, std::string* error, 
     // exposure drew Battlefield, Stadium and Final Destination 1.8 to 2.4 times as bright as the game;
     // fixed, 1.05 to 1.26). MELEE_REMIX_AUTO_EXPOSURE=1: Remix's automatic exposure.
     std::string text = "rtx.orthographicIsUI = True\n";
+    // More colour after tone mapping (owner 11-24, D2): 1.15 matches the +30% grade of the other two renderers (Remix starts more saturated). MELEE_REMIX_SATURATION overrides (1 = none).
+    { const char* v = std::getenv("MELEE_REMIX_SATURATION");
+      text += std::string("rtx.tonemap.colorGradingEnabled = True\nrtx.tonemap.saturation = ") + (v ? v : "1.15") + "\n"; }
     if (!std::getenv("MELEE_REMIX_AUTO_EXPOSURE"))
       text += "rtx.autoExposure.enabled = False\nrtx.tonemappingMode = 0\nrtx.tonemap.exposureBias = -1\n";
     if (const char* v = std::getenv("MELEE_REMIX_CONF"))
@@ -462,7 +481,16 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
     // MELEE_REMIX_PAINTED: the share of unlit stage art's brightness that it emits; the rest comes from
     // Remix's own lights on its texture, so it takes shadows and highlights. 1 = the 0.9.111 look.
     static const float painted = [] { const char* v = std::getenv("MELEE_REMIX_PAINTED"); return v ? (float)std::atof(v) : 1.0f; }();
-    const float emissive = additive ? 2.0f * emissive_scale : unlit && d.owner_player >= 6 ? emissive_scale * painted
+    // Painted backdrops (unlit stage art that writes no depth: Yoshi's Story's sky) sit far behind the
+    // stage where Remix's sun adds little, so at the stage art's glow (1.3) they showed at about 0.6 of
+    // the game's brightness, a dull grey-blue sky without its streaks. At 6 they measure 0.85 to 1.0 of
+    // the game, as the stage in front does (11-23, Yoshi's Story). MELEE_REMIX_BACKDROP_GLOW, 0 = as before.
+    // (Tried: also far depth-writing art, for Final Destination's nebula; it caught Yoshi's Story's
+    // trees and washed them out, and the nebula overshot.)
+    static const float backdrop_glow = [] { const char* v = std::getenv("MELEE_REMIX_BACKDROP_GLOW"); return v ? (float)std::atof(v) : 6.0f; }();
+    const bool painted_backdrop = unlit && d.owner_player >= 6 && !additive && !((d.bp.zmode() & 1) && (d.bp.zmode() & 0x10)) &&
+                                  d.textures[0].used && backdrop_glow > 0.0f;
+    const float emissive = additive ? 2.0f * emissive_scale : painted_backdrop ? backdrop_glow : unlit && d.owner_player >= 6 ? emissive_scale * painted
                            : gx_specular && d.owner_player >= 6 ? gx_specular_glow : fighter ? fighter_glow : 0.0f;
     m.prim.clear();
     if (d.segment_count) {
@@ -639,7 +667,10 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
     }
     if (!mat_key && !no_textures && t.used && t.data && t.width && t.height && t.width <= 1024 && t.height <= 1024) {
       const uint32_t pad_key = pad_u << 16 | pad_v;
-      mat_key = fnv(&pad_key, 4, fnv(&t.data->hash, 8, fnv(&t.format, 4, fnv(&t.mode0, 4, fnv(&emissive, 4, fnv(&tint_q, 4, fnv(&test_key, 4, cutout ? 0x9E3779B97F4A7C15ull : 1469598103934665603ull)))))));
+      uint64_t second = 0;
+      if (fighter) for (int k = 1; k < 8; ++k) if (d.textures[k].used && d.textures[k].data) second = second * 31 + d.textures[k].data->hash;
+      second ^= 0xF16E7E0Bull;   // fighter surface bake (11-24)
+      mat_key = fnv(&second, 8, fnv(&pad_key, 4, fnv(&t.data->hash, 8, fnv(&t.format, 4, fnv(&t.mode0, 4, fnv(&emissive, 4, fnv(&tint_q, 4, fnv(&test_key, 4, cutout ? 0x9E3779B97F4A7C15ull : 1469598103934665603ull))))))));
       if (!m.materials.count(mat_key)) {
         decode_texture(t.data->image.data(), t.width, t.height, t.format, t.data->palette.empty() ? nullptr : t.data->palette.data(),
                        t.tlut_format, m.rgba);
@@ -654,9 +685,52 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
             if (d.bp.order_enable((int)n) && d.bp.order_texmap((int)n) != own_map) return true;
           return false;
         }();
+        // Fighters: their surface colour is what the combiner makes before it reads the light (Marth's
+        // cape: a dark konst colour lerped toward a pale cloth texture; Yoshi: his belly and eye a second
+        // texture laid over by its alpha), times the material colour. Texture 0 alone (until 11-24) made
+        // dark cloth pale and lost decals. The stages after the light (a blend toward white by a register,
+        // a konst highlight) mean something only with GX lighting: Remix lights them. A second texture
+        // read with the same coordinates as the first comes in; any other is left out.
+        // MELEE_REMIX_FIGHTER_TEXTURE0=1: texture 0 alone, as before.
+        static const bool fighter_tex0 = std::getenv("MELEE_REMIX_FIGHTER_TEXTURE0") != nullptr;
+        if (fighter && !no_tev && !fighter_tex0) {
+          int own_stage = -1, map2 = -1, stage2 = -1;
+          for (uint32_t n = 0; n <= d.bp.numtevstages() && n < 16; ++n) {
+            if (!d.bp.order_enable((int)n)) continue;
+            if (own_stage < 0 && d.bp.order_texmap((int)n) == own_map) own_stage = (int)n;
+            else if (map2 < 0 && d.bp.order_texmap((int)n) != own_map) { map2 = d.bp.order_texmap((int)n); stage2 = (int)n; }
+          }
+          const TextureRef* t2 = map2 >= 0 && map2 < 8 ? &d.textures[map2] : nullptr;
+          const bool same_coords = t2 && own_stage >= 0 && d.bp.order_texcoord(stage2) == d.bp.order_texcoord(own_stage);
+          std::vector<uint8_t> rgba2;
+          // A paletted texture needs its whole palette (decode_texture reads it unchecked: Fountain of Dreams
+          // crashed on one without).
+          const size_t palette_needed = !t2 ? 0 : t2->format == 8 ? 32 : t2->format == 9 ? 512 : t2->format == 10 ? 32768 : 0;
+          if (same_coords && t2->used && t2->data && t2->width && t2->height && t2->width <= 1024 && t2->height <= 1024 &&
+              t2->data->palette.size() >= palette_needed &&
+              t2->data->image.size() >= texture_level_bytes(t2->width, t2->height, t2->format))
+            decode_texture(t2->data->image.data(), t2->width, t2->height, t2->format, t2->data->palette.empty() ? nullptr : t2->data->palette.data(),
+                           t2->tlut_format, rgba2);
+          const float white[4] = {255.0f, 255.0f, 255.0f, 255.0f};
+          for (uint32_t y = 0; y < t.height; ++y)
+            for (uint32_t x = 0; x < t.width; ++x) {
+              const size_t i = ((size_t)y * t.width + x) * 4;
+              if (i + 3 >= m.rgba.size()) break;
+              const float texel[4] = {(float)m.rgba[i], (float)m.rgba[i + 1], (float)m.rgba[i + 2], (float)m.rgba[i + 3]};
+              float texel2[4];
+              const bool have2 = !rgba2.empty();
+              if (have2) {
+                const size_t j = (((size_t)(y * t2->height / t.height)) * t2->width + (size_t)(x * t2->width / t.width)) * 4;
+                for (int k = 0; k < 4; ++k) texel2[k] = rgba2[j + k];
+              }
+              float o[4];
+              tev_texel(d, own_map, texel, white, o, have2 ? map2 : -1, have2 ? texel2 : nullptr, true);
+              for (int k = 0; k < 3; ++k) m.rgba[i + k] = (uint8_t)std::min(255.0f, o[k] * tint[k] + 0.5f);
+            }
+        }
         for (size_t i = 0; i + 3 < m.rgba.size(); i += 4) {
-          // Fighters: texture x material. Their later combiner stages blend toward white by a register
-          // that only means something with GX lighting (baked flat it turns them pastel).
+          if (fighter && !no_tev && !fighter_tex0) break;   // baked above
+          // Fighters (MELEE_REMIX_FIGHTER_TEXTURE0): texture x material.
           if (no_tev || fighter) { for (int k = 0; k < 3; ++k) m.rgba[i + k] = (uint8_t)std::min(255.0f, m.rgba[i + k] * tint[k] + 0.5f); continue; }
           const float texel[4] = {(float)m.rgba[i], (float)m.rgba[i + 1], (float)m.rgba[i + 2], (float)m.rgba[i + 3]};
           float o[4];
@@ -705,6 +779,10 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
         }
         static const float rough_scale = [] { const char* v = std::getenv("MELEE_REMIX_ROUGHNESS"); return v ? (float)std::atof(v) : 1.0f; }();
         rough = std::clamp(rough * rough_scale, 0.02f, 1.0f);
+        // Fighters' cloth and skin read as matte at least this rough (MELEE_REMIX_FIGHTER_ROUGH): glossier,
+        // Remix's bright sky lit them like satin and dark cloth washed to pale blue (Marth's cape).
+        static const float fighter_rough = [] { const char* v = std::getenv("MELEE_REMIX_FIGHTER_ROUGH"); return v ? (float)std::atof(v) : 0.0f; }();
+        if (fighter) rough = std::max(rough, fighter_rough);
         char name[40];
         // DDS with its mip chain (the classic header; the DX10 form made Remix 1.6.1 divide by zero).
         // MELEE_REMIX_PNG=1: PNG, one level.
@@ -749,9 +827,10 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
         mi.emissiveColorConstant = {1.0f, 1.0f, 1.0f};
         mi.filterMode = (uint8_t)((t.mode0 >> 4) & 1);   // the game's magnification filter (0 nearest: pixel-art stages)
         const uint32_t wrap_s = t.mode0 & 3, wrap_t = (t.mode0 >> 2) & 3;
-        // Remix numbers address modes as D3D9 does (remix.h: 1 repeat, 2 mirror, 3 clamp). GX: 0 clamp,
-        // 1 repeat, 2 mirror. (Vulkan's numbering mirrored every clamped texture: Dream Land's logs striped.)
-        static const uint8_t clamp_id = [] { const char* v = std::getenv("MELEE_REMIX_CLAMP_ID"); return (uint8_t)(v ? std::atoi(v) : 3); }();
+        // Remix 1.6.1 hands address modes to Vulkan's sampler as they are: 2 clamps to the edge texel as GX
+        // does; 3 is Vulkan's clamp to a black border (Jigglypuff's face mesh reads its eye texture far past
+        // its edge: a dark disc). GX: 0 clamp, 1 repeat, 2 mirror. MELEE_REMIX_CLAMP_ID: the old 3.
+        static const uint8_t clamp_id = [] { const char* v = std::getenv("MELEE_REMIX_CLAMP_ID"); return (uint8_t)(v ? std::atoi(v) : 2); }();
         mi.wrapModeU = (uint8_t)(wrap_s == 0 ? clamp_id : wrap_s == 2 ? 2 : 1);
         mi.wrapModeV = (uint8_t)(wrap_t == 0 ? clamp_id : wrap_t == 2 ? 2 : 1);
         remixapi_MaterialHandle h = nullptr;
@@ -873,7 +952,7 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
     {
       const uint32_t zm = d.bp.zmode();
       const bool writes_depth = (zm & 1) && ((zm >> 4) & 1);
-      if (in_layer == 2) inst.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;   // shown by the layer; Remix's sky for reflections and light
+      if (in_layer == 2 || in_layer == 5) inst.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;   // 2 shown by the layer; 5 a far backdrop plane, unlit as drawn
       else if (blended && !additive && !writes_depth && d.owner_player >= 6) inst.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
     }
     m.api.DrawInstance(&inst);
@@ -929,6 +1008,22 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
       li.pNext = &sph;
       li.radiance = {l.radiance[0] * 400.0f * scale, l.radiance[1] * 400.0f * scale, l.radiance[2] * 400.0f * scale};
     } else continue;
+    // The stage's sun and lamps light only the fighters in the game (the stage's art is painted and
+    // unlit); in Remix they light the painted art too, so a strongly coloured one (Fountain of Dreams'
+    // magenta top light) dyed the platforms. Their colour keeps this share of its saturation, at the same
+    // brightness (MELEE_REMIX_LIGHT_SAT, default 0: white light; 1 = the game's colours).
+    if (l.type != kRtxLightAmbient) {
+      static const float light_sat = [] { const char* v = std::getenv("MELEE_REMIX_LIGHT_SAT"); return v ? (float)std::atof(v) : 0.0f; }();
+      const float y = 0.2126f * li.radiance.x + 0.7152f * li.radiance.y + 0.0722f * li.radiance.z;
+      li.radiance = {y + (li.radiance.x - y) * light_sat, y + (li.radiance.y - y) * light_sat, y + (li.radiance.z - y) * light_sat};
+      li.radiance = {std::max(li.radiance.x, 0.0f), std::max(li.radiance.y, 0.0f), std::max(li.radiance.z, 0.0f)};
+    }
+    {
+      static const uint64_t light_log = [] { const char* v = std::getenv("MELEE_REMIX_DRAWLOG"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+      if (light_log && f.sequence == light_log)
+        host::log("remix light: type %d radiance %.3f %.3f %.3f dir %.2f %.2f %.2f pos %.0f %.0f %.0f radius %.1f", (int)l.type, li.radiance.x, li.radiance.y,
+                  li.radiance.z, l.direction[0], l.direction[1], l.direction[2], l.position[0], l.position[1], l.position[2], l.radius);
+    }
     remixapi_LightHandle h = nullptr;
     if (m.api.CreateLight(&li, &h) == REMIXAPI_ERROR_CODE_SUCCESS) { m.lights.push_back(h); m.api.DrawLightInstance(h); }
   }
@@ -978,6 +1073,12 @@ void RemixBridge::frame(const Frame& f, int camera, const float vw[12], const st
   }
   if (m.d3d9_mode && m.device) {
     present_d3d9();
+    if (!m.tracing && m.frame_no % 30 == 0) {
+      m.tracing = traced_once();
+      ++m.tracing_checks;
+      if (m.tracing || m.tracing_checks == 1 || m.tracing_checks % 20 == 0)
+        host::log("remix: %s (scene frame %llu)", m.tracing ? "ray tracing" : "not ray tracing yet; the game's own picture shows", (unsigned long long)m.frame_no);
+    }
   } else {
     remixapi_PresentInfo pi{};
     pi.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
@@ -1026,6 +1127,10 @@ void RemixBridge::present_d3d9() {
     // The HUD: one screen-space textured quad over the whole picture (Remix treats pre-transformed
     // draws as UI and composites them after path tracing).
     IDirect3DDevice9Ex* dev = m.device;
+    // A cleared back buffer each frame, as D3D9 games start theirs: Remix's picture replaces it. On a
+    // run where Remix never started ray tracing (11-22: a GPU hung over and over by another process),
+    // nothing replaced it and each frame's layer blended over the last into a white smear.
+    dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
     dev->BeginScene();
     if (m.hud_new && m.hud_w > 0 && m.hud_h > 0) {
       if (m.hud_tex) {
@@ -1097,6 +1202,41 @@ void RemixBridge::present_d3d9() {
       m.backbuffer_capture.clear();
     }
     dev->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+    // Remix traces the scene handed over for this present at the present: its picture of this frame
+    // exists only now. Copied before (as until 11-23), test captures showed the previous frame's scene
+    // under this frame's layer and HUD (Falco a pose behind his shine's flash).
+    // Remix finishes a frame's picture a present or two later (11-23: copied right after its own present,
+    // Falco still stood in the pose of two frames before). MELEE_REMIX_CAPTURE_DELAY: presents to wait;
+    // MELEE_REMIX_CAPTURE_DELAYS="0,1,2,3" also saves <capture>.d<n>.ppm after each (to measure it).
+    if (!m.final_capture.empty()) {
+      static const int delay = [] { const char* v = std::getenv("MELEE_REMIX_CAPTURE_DELAY"); return v ? std::atoi(v) : 1; }();
+      static const std::string delays = [] { const char* v = std::getenv("MELEE_REMIX_CAPTURE_DELAYS"); return std::string(v ? v : ""); }();
+      const int n = m.final_presents++;
+      if (!delays.empty() && ("," + delays + ",").find("," + std::to_string(n) + ",") != std::string::npos) {
+        capture_output(m.final_capture + ".d" + std::to_string(n) + ".ppm", (int)REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR);
+        // What that present put on screen (the swapchain's front buffer, Remix's picture with the layer).
+        IDirect3DSurface9* fb = nullptr;
+        bool ok = SUCCEEDED(dev->CreateOffscreenPlainSurface((UINT)m.width, (UINT)m.height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &fb, nullptr));
+        const HRESULT hr = ok ? dev->GetFrontBufferData(0, fb) : E_FAIL;
+        D3DLOCKED_RECT lr{};
+        ok = ok && SUCCEEDED(hr) && SUCCEEDED(fb->LockRect(&lr, nullptr, D3DLOCK_READONLY));
+        if (ok) {
+          std::ofstream out(m.final_capture + ".front" + std::to_string(n) + ".ppm", std::ios::binary);
+          out << "P6\n" << m.width << " " << m.height << "\n255\n";
+          std::vector<uint8_t> row((size_t)m.width * 3);
+          for (int y = 0; y < m.height; ++y) {
+            const uint8_t* q = (const uint8_t*)lr.pBits + (size_t)y * lr.Pitch;
+            for (int x = 0; x < m.width; ++x) { row[x * 3] = q[x * 4 + 2]; row[x * 3 + 1] = q[x * 4 + 1]; row[x * 3 + 2] = q[x * 4]; }
+            out.write((const char*)row.data(), (std::streamsize)row.size());
+          }
+          fb->UnlockRect();
+        }
+        host::log("remix: front buffer after %d presents: %s (%08X)", n, ok ? "saved" : "failed", (unsigned)hr);
+        if (fb) fb->Release();
+      }
+      if (n == delay) capture_output(m.final_capture, (int)REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR);
+      if (n >= delay && (delays.empty() || n >= 3)) { m.final_capture.clear(); m.final_presents = 0; }
+    }
 }
 
 void RemixBridge::present_2d() {
@@ -1118,11 +1258,47 @@ void RemixBridge::set_hud(const uint8_t* bgra, int w, int h) {
   }
 }
 
+bool RemixBridge::tracing() const { return impl_->tracing || (started_ && !impl_->d3d9_mode); }
+
+// Remix's normals of its last finished frame: all empty until it has ray traced one. Once a run on a GPU
+// hung over and over by another process (11-22), Remix never started ray tracing and its window
+// showed only the layer blending over itself.
+bool RemixBridge::traced_once() {
+  Impl& m = *impl_;
+  if (std::getenv("MELEE_REMIX_TEST_NOT_TRACING")) return false;   // tests: the fallback picture
+  if (!m.device || !m.api.dxvk_CopyRenderingOutput) return true;
+  IDirect3DSurface9* rt = nullptr;
+  IDirect3DSurface9* sys = nullptr;
+  bool any = false;
+  if (SUCCEEDED(m.device->CreateRenderTarget((UINT)m.width, (UINT)m.height, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &rt, nullptr)) &&
+      SUCCEEDED(m.device->ColorFill(rt, nullptr, D3DCOLOR_ARGB(0, 0, 0, 0))) &&
+      m.api.dxvk_CopyRenderingOutput(rt, REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS) == REMIXAPI_ERROR_CODE_SUCCESS &&
+      SUCCEEDED(m.device->CreateOffscreenPlainSurface((UINT)m.width, (UINT)m.height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, nullptr)) &&
+      SUCCEEDED(m.device->GetRenderTargetData(rt, sys))) {
+    D3DLOCKED_RECT lr{};
+    if (SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+      for (int y = 0; y < m.height && !any; y += 7) {
+        const uint32_t* row = (const uint32_t*)((const uint8_t*)lr.pBits + (size_t)y * lr.Pitch);
+        for (int x = 0; x < m.width; x += 7) if (row[x] & 0x00FFFFFFu) { any = true; break; }
+      }
+      sys->UnlockRect();
+    }
+  }
+  if (sys) sys->Release();
+  if (rt) rt->Release();
+  return any;
+}
+
 bool RemixBridge::capture(const std::string& path) {
   // The final picture, and the layer laid over it (<path>.layer.png, premultiplied RGBA): Remix's
   // composite of that layer happens at present, after both.
   Impl& m = *impl_;
-  if (m.d3d9_mode) m.backbuffer_capture = path + ".bb.ppm";
+  if (m.d3d9_mode) {
+    m.backbuffer_capture = path + ".bb.ppm";
+    m.final_capture = path;   // saved after the next present or a later one (present_d3d9)
+    m.final_presents = 0;
+    return started_ && m.device != nullptr;
+  }
   const bool ok = capture_output(path, (int)REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR);
   return ok;
 }
@@ -1165,6 +1341,8 @@ void RemixBridge::show(bool) {}
 void RemixBridge::place(int, int, int, int) {}
 void RemixBridge::frame(const Frame&, int, const float*, const std::vector<RtxLightRecord>&, const std::vector<uint8_t>&) {}
 bool RemixBridge::capture(const std::string&) { return false; }
+bool RemixBridge::tracing() const { return false; }
+bool RemixBridge::traced_once() { return false; }
 bool RemixBridge::capture_output(const std::string&, int) { return false; }
 void RemixBridge::present_2d() {}
 void RemixBridge::present_d3d9() {}

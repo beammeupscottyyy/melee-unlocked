@@ -69,6 +69,7 @@ struct PortSpec {
   Pick pick;
   std::vector<Pick> lineup;
   int level = 0;
+  int pro = -1;                          // a Pro AI seat (local_index 1): which pro, -1 a person
   std::string settings_digest, card_digest;
 };
 struct Plan {
@@ -88,6 +89,9 @@ struct Plan {
   std::vector<std::string> ids;         // result ids by port (CPUs cpu:<seat>)
   std::string squad_budget;
   bool doubles = false;                 // a Doubles match (finish names the winning team)
+  // A match made from connect codes (an Arena room, a Direct game with a Pro AI): the people pick on
+  // the select as usual (their own selections); only the Pro AI seats take the setup's pick.
+  bool code_match = false;
 };
 
 inline Plan refuse(const char* why) { Plan p; p.why = why; return p; }
@@ -154,7 +158,13 @@ inline Plan plan(const Setup& s, const std::string& me, const std::string& setti
       if (cpus) return refuse("a human after a cpu");
       if (x.id.empty() || x.id.rfind("cpu:", 0) == 0) return refuse("human id");
       if (x.local_index < 0 || x.local_index > 1) return refuse("local index");
-      if (x.local_index == 1) {
+      if (x.local_index == 1 && x.pro >= 0) {
+        // A Pro AI seat: the model plays it on its owner's machine (the port before it), any team, any mode.
+        const auto& owner = s.seats[i - (i ? 1 : 0)];
+        if (i == 0 || x.connection_id.empty() || x.pro > 0x7F || owner.kind != Kind::Human || owner.local_index != 0 ||
+            owner.connection_id != x.connection_id || x.id != "proai:" + x.connection_id)
+          return refuse("pro ai owner");
+      } else if (x.local_index == 1) {
         if (profile != Profile::Doubles || i == 0 || x.connection_id.empty() || x.settings_digest.empty() || x.card_digest.empty()) return refuse("local outside doubles or no owner");
         const auto& owner = s.seats[i - 1];
         if (owner.kind != Kind::Human || owner.local_index != 0 || owner.connection_id != x.connection_id ||
@@ -184,7 +194,7 @@ inline Plan plan(const Setup& s, const std::string& me, const std::string& setti
     PortSpec& out = p.port[i];
     out.connection_id = x.connection_id.empty() ? x.id : x.connection_id; out.local_index = x.local_index;
     out.connection_explicit = !x.connection_id.empty();
-    out.kind = x.kind; out.seat = x.seat; out.id = x.id; out.name = x.name; out.pick = x.pick; out.level = x.level;
+    out.kind = x.kind; out.seat = x.seat; out.id = x.id; out.name = x.name; out.pick = x.pick; out.level = x.level; out.pro = x.pro;
     out.lineup = x.lineup;
     out.settings_digest = x.settings_digest; out.card_digest = x.card_digest;
     p.ids.push_back(x.id);

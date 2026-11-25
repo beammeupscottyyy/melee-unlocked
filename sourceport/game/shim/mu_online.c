@@ -93,6 +93,7 @@ enum {
     CMD_GET_MATCH_STATE = 0xB3,
     CMD_REPORT_GAME = 0xBD,
     CMD_REPORT_MATCH_STATUS = 0xC4,
+    CMD_PROAI_SEAT = 0xC6,       /* this machine's Pro AI seat: active, port, pro (slippi_online.cpp) */
     CMD_SELFTEST_KEEP = 0xF0,     /* native test only: keep the state as a reference */
     CMD_SELFTEST_COMPARE = 0xF1,   /* native test only: compare the state with the reference */
     RESPONSE_CAPACITY = 4096,
@@ -520,6 +521,31 @@ static int command(unsigned int cmd, const u8* payload, unsigned int size, u8* r
 {
     return command_into(cmd, payload, size, response, RESPONSE_CAPACITY, response_size);
 }
+
+/* A Pro AI seat this machine plays (an Arena room's bot, a Direct game's added Pro AI, a Friends seat): the
+ * model drives the seat's fighter here (shim/mu_practice_cpu.c mu_proai_seat_pad) and its controller goes
+ * out as this machine's partner pad. Asked once per match; kept out of snapshots (a rollback never
+ * changes which seat is whose). */
+int mu_proai_seat_pad(int port, int pro, PADStatus* out);
+static int proai_port = -1, proai_pro = 0;
+static u8 proai_reply[RESPONSE_CAPACITY];
+static void proai_seat_ask(void)
+{
+    unsigned int got = 0;
+    /* The Friends Doubles home's partner tab on Pro AI: the room seated Player 2 on this machine, and the
+     * model plays that seat (the host answers with its port). 0xFF: no Pro AI partner here. */
+    const int model = mu_lobby_partner_pro_model();
+    const u8 friends_pro = model >= 0 && model < 0x80 ? (u8) model : 0xFF;
+    proai_port = -1;
+    if (command_into(CMD_PROAI_SEAT, &friends_pro, 1, proai_reply, sizeof proai_reply, &got) == 0 && got >= 3 &&
+        proai_reply[0] == 1 && proai_reply[1] < 4)
+    {
+        proai_port = proai_reply[1];
+        proai_pro = proai_reply[2];
+        logf_("online: Pro AI seat: port %d, pro %d (played on this machine)", proai_port, proai_pro);
+    }
+}
+MU_EXCLUSIONS(proai_seat, MU_EXCLUDE(proai_port), MU_EXCLUDE(proai_pro), MU_EXCLUDE(proai_reply))
 
 static int capture_state(int frame)
 {
@@ -1048,7 +1074,17 @@ int mu_online_pad_renew(PADStatus* stat)
     /* A local partner's pad follows Slippi's payload: its inputs and an RNG bits byte that is always
      * zero (one machine's random bits go out once, with the main pad). */
     memset(tx + TXB_SIZE, 0, TXB_PARTNER_PAD_SIZE);
-    {
+    if (proai_port >= 0) {
+        /* This machine's Pro AI seat: the model's controller is the partner pad (no input from it: a
+         * still pad, connected, so the seat stays in the match). */
+        PADStatus ai;
+        if (!mu_proai_seat_pad(proai_port, proai_pro, &ai)) {
+            memset(&ai, 0, sizeof ai);
+            ai.err = 0;
+        }
+        pad_to_wire(mu_online.last_partner, &ai);
+        memcpy(tx + TXB_SIZE, mu_online.last_partner, PAD_RNG_BITS);
+    } else {
         const int partner_source = mu_lobby_partner_source();
         if (partner_source >= 0 && partner_source < 4) {
             PADStatus* second = &stat[partner_source];
@@ -1184,6 +1220,11 @@ int mu_online_engine_gate(int* count)
         return 1;
     }
     if (!hooks_on()) {
+        int mu_redo_gate(void);
+        if (*count == 0 && mu_redo_gate()) {   /* tick re-run (shim/mu_redo.c), offline only */
+            *count = 1;
+            return 1;
+        }
         return *count != 0;
     }
     mu_online.loop_entered = 1;
@@ -1588,6 +1629,10 @@ int mu_online_frame_end(void)
     int current;
     if (mu_online.console_active) return console_frame_end();
     if (!hooks_on()) {
+        int mu_redo_tracking(void);
+        if (mu_redo_tracking()) {
+            mu_online_audio_frame_end();   /* tick re-run (shim/mu_redo.c): this body's sounds */
+        }
         return ENGINE_CONTINUE;
     }
     mu_online_audio_frame_end();
@@ -1904,6 +1949,7 @@ void mu_online_start_melee(StartMeleeData* data)
     mu_online_rules_set(mu_online.mode, mu_online.match_state[MSRB_ALT_STAGE_MODE], data->rules.is_teams,
                         mu_online.local_index);
     mu_online.active = 1;
+    proai_seat_ask();
     mu_online_audio_match_start(mu_online.local_index, mu_online.input_source);
     logf_("online: match starts, local port %d, delay %d, rng offset %08X", mu_online.local_index,
           mu_online.delay, (int) mu_online.rng_offset);

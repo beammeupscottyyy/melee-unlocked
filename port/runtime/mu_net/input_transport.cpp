@@ -192,6 +192,7 @@ bool InputTransport::on_commit(Reader& r, size_t size, uint64_t now_us, std::vec
   }
   if (frame > newest_remote_seen_ && frame <= limit) {
     newest_remote_seen_ = frame;
+    newest_remote_us_ = now_us;
     // One sample per new frame, on its first arrival: when the peer sent frame F (now, less half
     // the round trip) against when this side sent its own latest frame. A late duplicate of an old
     // frame would only measure the network's delay, so it is not sampled.

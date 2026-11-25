@@ -747,7 +747,7 @@ class LocalPartnerRouting(unittest.TestCase):
 using u16 = uint16_t;
 struct PADStatus { u16 button = 0; int stickX = 0; int err = 0; };
 constexpr int PAD_ERR_NO_CONTROLLER = -1, PAD_BUTTON_START = 0x1000, PAD_BUTTON_B = 0x200, PAD_BUTTON_A = 0x100;
-constexpr int MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_P2 = 2;
+constexpr int MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_PROAI = 4;
 struct { int view_ok = 1, partner_source = -1, partner_b_held = 0, partner_want = 0, curtain = 0, cancel_held = 0, cancel_mask = 0; MuLobbyView view{}; } lobby;
 int screen = 1, requests = 0, op = -1, arg = -1;
 int mu_lobby_css() { return screen; }
@@ -794,6 +794,12 @@ int main() {
     v.mode = MU_LOBBY_M_DOUBLES | MU_LOBBY_M_SEARCHING; v.my_seat = 0; v.seats[1].kind = MU_LOBBY_KIND_OPEN;
     lobby.partner_want = MU_LOBBY_WANT_P2;
     sample(pads,PAD_BUTTON_START); assert(requests == 1 && pads[1].err == PAD_ERR_NO_CONTROLLER);
+    // 11-23: a Pro AI partner's door takes no controller: a still, connected pad, controller 4 left alone.
+    v.mode = MU_LOBBY_M_DOUBLES | MU_LOBBY_M_LOCAL_OWNER; v.seats[1].kind = MU_LOBBY_KIND_LOCAL; v.seats[1].flags = 0;
+    lobby.partner_want = MU_LOBBY_WANT_PROAI; lobby.partner_source = 3;
+    sample(pads,PAD_BUTTON_START | PAD_BUTTON_A | PAD_BUTTON_B);
+    assert(requests == 1 && lobby.partner_source == -1 && pads[1].err == 0 && pads[1].button == 0 && pads[1].stickX == 0);
+    assert(lobby.partner_want == MU_LOBBY_WANT_PROAI && pads[0].stickX == 10);
     screen = 0; sample(pads,PAD_BUTTON_A); assert(pads[3].stickX == 47 && requests == 1);
 }
 '''.replace('ROUTER', router)

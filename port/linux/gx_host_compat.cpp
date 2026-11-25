@@ -44,6 +44,7 @@ void set_pe_finish_pending() {}
 void set_pe_token_pending(uint16_t) {}
 void note_frame_submitted() {}
 void note_scene_memory() {}
+void note_frame_handover() {}
 void current_scene(uint32_t* major, uint32_t* minor, uint32_t* match_frame) {
   MuStatePod state{};
   if (linux_host::state_snapshot(&state)) { *major = state.scene_major; *minor = state.scene; *match_frame = state.match_frame; }

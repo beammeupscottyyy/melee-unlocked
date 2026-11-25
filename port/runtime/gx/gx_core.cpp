@@ -27,6 +27,14 @@ namespace gx { void settings_guest_options_frame(uint8_t menu, uint16_t selectio
 #endif
 #include <algorithm>
 #include <atomic>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>   // _mm_pause (the decode worker's short spin)
+#endif
+#ifdef _WIN32
+// The two calls the decode worker's priority needs, without windows.h and its macros in this file.
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread(void);
+extern "C" __declspec(dllimport) int __stdcall SetThreadPriority(void* thread, int priority);
+#endif
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -484,6 +492,7 @@ class VertexDecodeWorker {
   std::vector<uint8_t> bytes_;       // the jobs' copied stream bytes, same rule
   std::vector<Vertex> verify_;       // MELEE_TEST_DECODE_VERIFY: the in-place results
   size_t published_ = 0, taken_ = 0, finished_ = 0;   // guarded by mutex_
+  std::atomic<size_t> finished_seen_{0};              // finished_, readable without the mutex (join's short spin)
   size_t unpublished_vertices_ = 0;
   bool stop_ = false, started_ = false;
   bool verify_on_ = false;
@@ -502,6 +511,7 @@ class VertexDecodeWorker {
       for (size_t i = begin; i < end; ++i) decode_run(jobs[i].state, bytes + jobs[i].bytes_at, jobs[i].count, jobs[i].out);
       lock.lock();
       finished_ = end;
+      finished_seen_.store(end, std::memory_order_release);
       done_.notify_all();
     }
   }
@@ -546,7 +556,15 @@ class VertexDecodeWorker {
       started_ = true;
       static const bool verify = [] { const char* v = host::test_env::getenv("MELEE_TEST_DECODE_VERIFY"); return v && *v == '1'; }();
       verify_on_ = verify;
-      thread_ = std::thread([this] { run(); });
+      thread_ = std::thread([this] {
+#ifdef _WIN32
+        // The simulation thread waits for this one at the end of every frame, so it runs at the same
+        // priority. At the default it was pushed aside by the render and re-pose threads (above normal)
+        // whenever sub-frames were on, and the game frame was handed over that much later.
+        if (const char* v = std::getenv("MELEE_DECODE_WORKER_OLD"); !(v && *v == '1')) SetThreadPriority(GetCurrentThread(), 2 /* THREAD_PRIORITY_HIGHEST */);
+#endif
+        run();
+      });
     }
     Job job{state, bytes_.size(), count, out, verify_.size(), key};
     bytes_.insert(bytes_.end(), src, src + n);
@@ -569,6 +587,22 @@ class VertexDecodeWorker {
       host::SimCostScope cost(host::SIM_DECODE);
       std::unique_lock<std::mutex> lock(mutex_);
       publish_locked();
+      const size_t target = published_;
+      // MELEE_DECODE_WORKER_OLD=1 (tests): the wait and the worker's priority as before.
+      static const bool old_wait = [] { const char* v = std::getenv("MELEE_DECODE_WORKER_OLD"); return v && *v == '1'; }();
+      if (finished_ != target && !old_wait) {
+        // The worker is usually a few hundred microseconds from done: watch for it before sleeping, since
+        // being woken costs 0.1 ms or more of every frame's way to the screen.
+        lock.unlock();
+        for (int i = 0; i < 4000 && finished_seen_.load(std::memory_order_acquire) != target; ++i) {
+#if defined(_M_X64) || defined(__x86_64__)
+          _mm_pause();
+#else
+          std::this_thread::yield();
+#endif
+        }
+        lock.lock();
+      }
       done_.wait(lock, [&] { return finished_ == published_; });
     }
     if (verify_on_) {
@@ -588,6 +622,7 @@ class VertexDecodeWorker {
     std::lock_guard<std::mutex> lock(mutex_);
     jobs_.clear(); bytes_.clear();
     published_ = taken_ = finished_ = 0;
+    finished_seen_.store(0, std::memory_order_release);
     unpublished_vertices_ = 0;
   }
 };
@@ -948,6 +983,7 @@ void bp_write(uint32_t value) {
           }
         }
         g_frame.time = host::now_seconds(); // completed snapshot availability anchors presentation
+        host::note_frame_handover();
         g_frame.tick = host::tick_timing();
         g_frame.discontinuous = g_discontinuity;
         g_frame.hard_cut = g_hard_cut;

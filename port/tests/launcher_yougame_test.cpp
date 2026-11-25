@@ -159,6 +159,25 @@ int main(int argc, char** argv) {
     CHECK(native_build_from_listing(page + rec(b, "0.9.990", "windows"), "0.9.990", "windows") == b);
     CHECK(native_build_from_listing(page + rec(b, "0.9.990-online-test.123.1", "windows"), "0.9.990", "windows") == b);
     CHECK(native_build_from_listing("", "0.9.990", "windows") == "");
+    // 11-23: numbered builds ("103"); only the newest release is named, by "latest"'s title.
+    {
+      const char* w102 = "880b2eeb-0d00-4a00-8000-0000000e0204";
+      const char* w103 = "880b2eeb-0d00-4a00-8000-0000000e0205";
+      const char* l103 = "880b2eeb-0d00-4a00-8000-0000000c0175";
+      const std::string latest = R"("latest":{"id":"705e67e6-880f-4a5e-a650-ae7b7ed0c3bc","title":"Melee Unlocked 1.0.19","codeUrl":"x"})";
+      const std::string numbered = rec(l103, "103", "linux") + rec(w103, "103", "windows") + rec(w102, "102", "windows") +
+                                   rec(a, "1.0.8-test.8681ec4", "windows");
+      CHECK(native_build_from_listing(latest + numbered, "1.0.19", "windows") == w103);   // the newest number, not the last listed
+      CHECK(native_build_from_listing(latest + numbered, "1.0.19", "linux") == l103);
+      CHECK(native_build_from_listing(latest + numbered, "1.0.19", "macos") == "");
+      CHECK(native_build_from_listing(latest + numbered, "1.0.18", "windows") == "");    // not the newest release: no record
+      CHECK(native_build_from_listing(numbered, "1.0.19", "windows") == "");             // no "latest": nothing guessed
+      CHECK(native_build_from_listing(latest + numbered, "1.0.8", "windows") == a);       // a named build still wins
+      // Escaped as the page's script carries it.
+      std::string escaped;
+      for (char c : latest + numbered) { if (c == '"') escaped += '\\'; escaped += c; }
+      CHECK(native_build_from_listing(escaped, "1.0.19", "windows") == w103);
+    }
   }
   // The YouGame app's hello answer, read as the game reads it (launcher_yougame_app.h): signed in with a
   // player id, pending while the app loads its player, signed out otherwise, refused when not ok.

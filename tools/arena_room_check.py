@@ -149,7 +149,21 @@ def main():
     ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
     ap.add_argument("--press-start", action="store_true",
                     help="the room does not lock fighters in: each member presses Start on the select itself (MELEE_TEST_ARENA_PRESS_START)")
+    ap.add_argument("--ffa", action="store_true", help="the host proposes a free-for-all before the first game (everyone says yes)")
+    ap.add_argument("--doubles", action="store_true", help="the host proposes doubles before the first game")
+    ap.add_argument("--bots", default="", help="members who add a Pro AI before the first game, e.g. 0-2,1-20 (member-character)")
+    ap.add_argument("--watch", default="", help="members who just watch, e.g. 3 or 2,3 (test plan watch steps)")
     args = ap.parse_args()
+    # The host's test plan (MELEE_ARENA_TEST_PLAN): the options above, before anything the environment names.
+    plan = [f"watch:0:{m.strip()}" for m in args.watch.split(",") if m.strip()]
+    if args.ffa:
+        plan.append("ffa:0")
+    # Pro AIs come in before any switch, so the switch can count them.
+    plan = [f"bot:0:{b.strip()}" for b in args.bots.split(",") if b.strip()] + plan
+    if args.doubles:
+        plan.append("doubles:0")
+    if plan:
+        os.environ["MELEE_ARENA_TEST_PLAN"] = ",".join(plan + [x for x in os.environ.get("MELEE_ARENA_TEST_PLAN", "").split(",") if x])
     iso = require_iso(args.iso)
     exe = (args.bin / "melee_source.exe").resolve()
     if not exe.is_file():
@@ -191,7 +205,13 @@ def main():
         # ARENA_SETTINGS_EXTRA: more settings lines for every member, "|" between them (tests).
         extra_settings = "".join(x + "\n" for x in os.environ.get("ARENA_SETTINGS_EXTRA", "").split("|") if x.strip())
         settings.write_text("startup 0\nvolume 0\nslippi_spectator 0\n" + ("backend d3d11\n" if shots else "") + extra_settings)
-        cmd = [str(exe), "--iso", str(iso), "--hidden", "--volume", "0", "--frames", str(args.frames),
+        # ARENA_BIN_FOR: another build for some members, e.g. "2=C:/old/MeleeUnlocked" (mixed-version rooms).
+        member_exe = exe
+        for spec in filter(None, os.environ.get("ARENA_BIN_FOR", "").split(";")):
+            k, _, path = spec.partition("=")
+            if k.strip() == str(i):
+                member_exe = (Path(path) / "melee_source.exe").resolve()
+        cmd = [str(member_exe), "--iso", str(iso), "--hidden", "--volume", "0", "--frames", str(args.frames),
                "--script", str(script), "--replay-dir", str(d), "--log-file", str(d / "port.log"),
                "--user-dir", str(user), "--settings-path", str(settings), "--load-settings", "--time-base", "1",
                "--arena-test", f"{i}/{args.players}/{base}"] + args.extra
@@ -243,7 +263,7 @@ def check(args, out):
     if len(ended) < args.min_games:
         problems.append(f"only {len(ended)} games ended (wanted {args.min_games})")
     def ring_of(e):
-        m = re.search(r"ring (\d+) (\d+)(?: vs (\d+) (\d+))?", e or "")
+        m = re.search(r"ring (\d+) (\d+)(?: (?:vs )?(\d+) (\d+))?", e or "")
         return {int(x) for x in m.groups() if x is not None} - {255} if m else set()
     fought = set()
     for e in revs:
@@ -256,6 +276,15 @@ def check(args, out):
         if m:
             ids[m.group(1)] = int(m.group(2))
     plan = os.environ.get("MELEE_ARENA_TEST_PLAN", "")
+    ffa_games = [e for e in host if e.startswith("room rev") and "free-for-all" in e]
+    if "ffa" in plan:
+        print(f"free-for-all rooms: {len(ffa_games)}")
+        if not ffa_games:
+            problems.append("the room never became a free-for-all")
+        # Every game of a free-for-all has three or four fighters and a winner (the result byte).
+        for e in ended:
+            if "the winner never reported" in e:
+                problems.append(f"a free-for-all ended with no winner report: {e}")
     if "mode:" not in plan and "doubles" not in plan:
         for k, e in enumerate(host):
             m = re.match(r"game [0-9A-F]{8} ended, winner (ARENA#\d+)", e)
@@ -266,7 +295,8 @@ def check(args, out):
             winner = ids.get(m.group(1))
             if ring and winner is not None and winner not in ring:
                 problems.append(f"winner {m.group(1)} left the ring under Winner stays: {after}")
-    if len(ended) >= args.players and len(fought) < args.players:
+    watching = {int(m) for m in args.watch.split(",") if m.strip()}   # just watching: never in the ring
+    if len(ended) >= args.players and len(fought | watching) < args.players:
         problems.append(f"only members {sorted(fought)} ever fought")
     for i, lg in enumerate(logs):
         if lg["crash"]:
@@ -375,11 +405,19 @@ def check(args, out):
         print(f"    m{args.hand_test} hand: " + "; ".join(steps))
         if not any("went into the left panel" in l for l in steps):
             problems.append(f"m{args.hand_test}: the hand never went into the panel")
-    watchers = args.players > 2   # two members both fight every game: nobody watches
+    ring = 4 if (args.ffa or args.doubles) else 2
+    watchers = args.players > ring or bool(args.watch)   # everyone fights every game: nobody watches
     if watchers and viewed == 0 and lived == 0:
         problems.append("no viewer or live recording to compare")
     if watchers and not args.no_viewer and viewed == 0:
-        problems.append("no viewer recording to compare")
+        # From c7c2e3c2 (11-23) a viewer saves a replay only after a takeover, so a watcher leaves no copy: its
+        # window must still have shown the games (caught up with the live feed, the feed itself compared above).
+        caught = sum(len(re.findall(r"caught up with the live game", f.read_text(errors="replace")))
+                     for i in range(args.players) for f in (out / f"m{i}" / "user" / "arena").glob("live-*.log"))
+        if caught == 0:
+            problems.append("no viewer showed a game (no viewer caught up with the live feed)")
+        else:
+            print(f"{caught} viewer windows caught up with the live feed (viewers save no copy since c7c2e3c2)")
     (out / "result.json").write_text(json.dumps({"problems": problems, "ended": ended, "fought": sorted(fought),
                                                  "viewed": viewed}, indent=2))
     for p in problems:

@@ -172,6 +172,7 @@ struct RollbackSession::Impl {
     bool verify_sent = false, pinned = false;
     bool saw_wrong_key = false, saw_other_version = false;
     bool match_begun = false;
+    bool late_offered = false, late = false;   // late controller read: offered to the game, and taken by it
     int32_t last_frame = 0;
     uint8_t delay = 2;
     bool peer_gone = false;
@@ -599,7 +600,11 @@ struct RollbackSession::Impl {
     state = SessionState::Playing;
     run.match_begun = true;
     run.delay = delay;
-    if (delay != desc.input_delay) log("the game runs input delay %u, the match setup says %u", (unsigned)delay, (unsigned)desc.input_delay);
+    // Whenever the game runs one frame less than the setup's delay it took an answer of offered_delay,
+    // whichever ask that was: the wait is on. No game runs the lower delay without it.
+    run.late = cb.late_offer && cb.late_hold && desc.input_delay >= 2 && delay + 1 == desc.input_delay;
+    if (run.late) log("late controller read: on, the game runs input delay %u for the setup's %u and waits inside each frame", (unsigned)delay, (unsigned)desc.input_delay);
+    else if (delay != desc.input_delay) log("the game runs input delay %u, the match setup says %u", (unsigned)delay, (unsigned)desc.input_delay);
     crypto_blake2b_init(&transcript, 32);
     crypto_blake2b_update(&transcript, reinterpret_cast<const uint8_t*>(kTranscriptDomain), sizeof kTranscriptDomain - 1);
     crypto_blake2b_update(&transcript, digest.data(), digest.size());
@@ -607,6 +612,18 @@ struct RollbackSession::Impl {
     static const uint8_t zero[kPadWireSize] = {};
     for (int f = 1; f <= delay; ++f) transport.commit(f, zero);
     log("match starts: input delay %u, rollback window %d, ping %u ms", (unsigned)delay, kRollbackHorizon, transport.ping_us() / 1000);
+  }
+
+  // The delay the game is given: the setup's, or one less with the late controller read. The peer
+  // applies every pad on the frame it is committed for, so each side's delay is its own.
+  uint8_t offered_delay() {
+    if (run.match_begun) return run.delay;
+    bool offer = false;
+    if (cb.late_offer && cb.late_hold && desc.input_delay >= 2) {
+      try { offer = cb.late_offer((int)desc.input_delay, transport.has_ping() ? std::max<uint32_t>(1, transport.ping_us()) : 0); } catch (...) { offer = false; }
+    }
+    run.late_offered = offer;
+    return (uint8_t)(offer ? desc.input_delay - 1 : desc.input_delay);
   }
 
   void commit_local(int32_t target, const uint8_t* pad) {
@@ -849,7 +866,8 @@ struct RollbackSession::Impl {
     if (!message.empty()) send_plain(kChannelInput, message, false);
   }
 
-  void inputs(int32_t frame, int32_t finalized, uint32_t checksum, uint8_t delay, const uint8_t* pad, std::vector<uint8_t>& reply) {
+  void inputs(int32_t frame, int32_t finalized, uint32_t checksum, uint8_t delay, const uint8_t* pad, std::vector<uint8_t>& reply,
+              std::unique_lock<std::mutex>* lock = nullptr) {
     const uint64_t now_us = now();
     tick(now_us);
     if (!playable() || !pad) { build_reply(frame, kInputsDisconnected, reply); return; }
@@ -884,6 +902,18 @@ struct RollbackSession::Impl {
     // Sent on a skipped tick as well: the unacknowledged frames again, and the heartbeat.
     transport.build_commit(now_us, message);
     if (!message.empty()) send_plain(kChannelInput, message, false);
+    if (run.late && !skip && cb.late_hold && lock) {
+      // Late controller read: the pad is on its way; the frame waits before it reads the other
+      // player's inputs. The session is unlocked for the wait, so the pump thread keeps receiving.
+      int64_t early_us = 0;
+      const bool have_early = transport.remote_early_us(frame, now(), &early_us);
+      if (link) link->flush();
+      lock->unlock();
+      try { cb.late_hold(frame, have_early, (double)early_us / 1000.0); } catch (...) {}
+      lock->lock();
+      tick(now());
+      if (!playable()) { build_reply(frame, kInputsDisconnected, reply); return; }
+    }
     advance_transcript();
     compare_checksums();
 
@@ -994,10 +1024,11 @@ void RollbackSession::tick() {
 
 void RollbackSession::on_inputs(int32_t frame, int32_t finalized, uint32_t finalized_checksum, uint8_t delay,
                                 const uint8_t pad[kPadGameSize], std::vector<uint8_t>& reply) {
-  std::lock_guard<std::mutex> lock(impl_->mu);
+  std::unique_lock<std::mutex> lock(impl_->mu);
   try {
-    impl_->inputs(frame, finalized, finalized_checksum, delay, pad, reply);
+    impl_->inputs(frame, finalized, finalized_checksum, delay, pad, reply, &lock);
   } catch (...) {
+    if (!lock.owns_lock()) lock.lock();
     // Whatever went wrong, the game gets a well-formed answer that ends the match cleanly.
     try { reply.assign(kInputsReplySize, 0); reply[0] = kInputsDisconnected; reply[1] = 1; } catch (...) {}
   }
@@ -1029,7 +1060,7 @@ void RollbackSession::match_state_reply(std::vector<uint8_t>& reply) {
     b[kMsLocalIndex] = (uint8_t)s.local_slot;
     b[kMsRemoteIndex] = (uint8_t)s.remote_slot;
     put32(b + kMsRng, s.desc.rng_seed);
-    b[kMsDelay] = s.desc.input_delay;
+    b[kMsDelay] = s.offered_delay();
     game_text(s.desc.players[s.local_slot].name, 15, b + kMsLocalName, kMsNameSize);
     for (int i = 0; i < kMaxSlots; ++i) game_text(s.desc.players[i].name, 15, b + kMsPlayerNames + i * kMsNameSize, kMsNameSize);
     game_text(s.desc.players[s.remote_slot].name, 15, b + kMsOpponentName, kMsNameSize);

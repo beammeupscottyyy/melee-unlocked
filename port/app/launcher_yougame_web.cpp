@@ -251,6 +251,14 @@ void finish_sign_in(bool ok, const std::string& why) {
 void check_sign_in() {
   if (!g->signin || !g->view || g->signin_check || current_origin() != g->signin->site) return;
   if (!g->signin->script.empty()) g->view->ExecuteScript(wide(g->signin->script).c_str(), nullptr);
+  // Tests only (MELEE_LAUNCHER_TEST_WEB_DUMP): what the sign-in page says, as text (never a field's value).
+  if (std::getenv("MELEE_LAUNCHER_TEST") && std::getenv("MELEE_LAUNCHER_TEST_WEB_DUMP"))
+    g->view->ExecuteScript(L"location.pathname+' | '+(document.body?document.body.innerText:'').replace(/\\s+/g,' ').slice(0,500)",
+        Callback<ICoreWebView2ExecuteScriptCompletedHandler>([](HRESULT, LPCWSTR result) {
+          std::printf("PAGE %s\n", result ? narrow(result).c_str() : "(none)");
+          std::fflush(stdout);
+          return S_OK;
+        }).Get());
   g->signin_check = g->next_id++;
   g->last_check = GetTickCount64();
   ask(g->signin_check, "GET", g->signin->path, "");

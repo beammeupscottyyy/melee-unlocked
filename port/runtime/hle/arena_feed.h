@@ -39,6 +39,8 @@ uint32_t game_tag(const uint8_t* start, size_t size);
 // for doubles, each port's team from its Game Start: 1 the player on `my_port` (or their team)
 // won, 0 they lost, -1 no result (a no contest, a tie, a payload too short).
 int my_result(const uint8_t* game_end, size_t size, int my_port, const uint8_t port_team[4], bool doubles);
+// The port that placed first in a Game End with a result, -1 for none (a no contest, a tie).
+int winning_port(const uint8_t* game_end, size_t size);
 // Each port's team from a Game Start payload (0 for a short one).
 void port_teams(const uint8_t* game_start, size_t size, uint8_t out[4]);
 

@@ -110,6 +110,9 @@ constexpr uint8_t MU_BUILD_CAPS3_WARMUP = 0x10;
 // pausing goes off only when every peer sends 0x20 (and the setup hash covers the pause bit anyway).
 constexpr uint8_t MU_BUILD_CAPS3_PAUSE_RULE = 0x20;
 constexpr uint8_t MU_BUILD_CAPS3_NO_PAUSE = 0x40;
+// 0x80: this build plays an arena free-for-all (a Teams match made with teams off, slippi_arena.h). A
+// free-for-all is refused unless every peer sends it: a build without it would start a teams game.
+constexpr uint8_t MU_BUILD_CAPS3_ARENA_FFA = 0x80;
 // First capability byte bit Melee Unlocked 0.9.215 and 0.9.216 read as warm-up (their 0xE5 messages).
 constexpr uint8_t MU_BUILD_CAPS_UPSTREAM_WARMUP = 0x80;
 
@@ -338,6 +341,10 @@ class NetplayClient {
   PlayerSelections GetSlippiRemoteChatMessage(bool chat_enabled);
   uint8_t GetSlippiRemoteSentChatMessage(bool chat_enabled);
   int32_t CalcTimeOffsetUs();
+  // Late controller read: how many ms before now the remote pad for `frame` arrived, taken from the
+  // newest pad received and the 59.94 Hz the pads are sent at (negative: it is still on its way). The
+  // least over the remote players; false before any pad of this game has arrived.
+  bool RemotePadEarlyMs(int32_t frame, double* early_ms);
   double GetAndResetAvgPingMs();
   // Once a dropped player's last input is settled it repeats up to `frame` (Slippi 3.7.0).
   void FillDroppedPlayerInputs(int32_t frame);
@@ -349,6 +356,11 @@ class NetplayClient {
   int RemoteCount() const { return (int)remote_count_seen_.load(std::memory_order_relaxed); }
   // The median of the last pre-match pings (NP_MSG_MU_PING) to the first opponent, 0 if none yet.
   int PreMatchPingMs() const { return (int)(prematch_ping_ms_.load(std::memory_order_relaxed)); }
+  // The connection's own round trip estimate (ENet's, from its reliable packets and keep-alive pings),
+  // the longest over the opponents; 0 before there is one. It starts high and settles over the first
+  // seconds of a connection, so early on it reads longer than the truth, never shorter. It is the only
+  // ping there is before the first game against Slippi Dolphin, which answers no pre-match ping.
+  int ConnectionPingMs() const { return (int)(connection_ping_ms_.load(std::memory_order_relaxed)); }
   void SendChatMessage(int message_id);
   void SendGamePrepStep(const GamePrepStep& step);
   std::array<uint8_t, 6> FetchGamePrepStep(uint8_t index) { return game_prep_.fetch(index); }
@@ -373,11 +385,17 @@ class NetplayClient {
                        bool gecko = false;            // takes Gecko code messages (NP_MSG_MU_GECKO)
                        bool warmup = false;           // takes and sends warm-up messages (NP_MSG_MU_WARMUP)
                        bool pause_rule = false, no_pause = false;   // MU_BUILD_CAPS3_PAUSE_RULE / _NO_PAUSE
+                       bool arena_ffa = false;        // MU_BUILD_CAPS3_ARENA_FFA
                        int8_t port_colour[2] = {-1, -1}; };   // their port colour choices (1.0.2 on), -1 none
   // Warm-up (slippi_warmup.h): tell every opponent whose build takes it that this player is warming up
   // in Training (true) or on the character select (false), and the character picked there (Slippi's
   // external id and costume, 0xFF none: Slippi itself sends a pick only at the lock-in). Any thread.
   void SendWarmup(bool warming, uint8_t character = 0xFF, uint8_t costume = 0);
+  // Ends this connection at once, without the goodbye handshake (the peers are reset): the thread stops
+  // and the destructor then closes the socket without waiting. For a pairing connection whose only job
+  // was to meet the peer (an arena free-for-all of three): its port is wanted again right away, and
+  // ENet's sockets share a port while an old one still lingers, taking the new one's packets.
+  void Abandon();
   // Remote `index`'s pick as its last warm-up message said: character << 8 | costume, -1 none.
   int RemotePick(int index) const {
     return index >= 0 && index < REMOTE_PLAYER_MAX ? (int)remote_pick_[index].load(std::memory_order_relaxed) : -1;
@@ -508,11 +526,13 @@ class NetplayClient {
   std::atomic<uint32_t> remote_ping_ms_[REMOTE_PLAYER_MAX] = {};
   std::atomic<uint8_t> remote_count_seen_{0};
   std::atomic<uint32_t> prematch_ping_ms_{0};
+  std::atomic<uint32_t> connection_ping_ms_{0};
   std::deque<uint32_t> prematch_samples_;   // network thread only
   void SendPrematchPing();
   int32_t last_frame_acked_[REMOTE_PLAYER_MAX] = {};
   FrameOffsetData frame_offset_data_[REMOTE_PLAYER_MAX];
   FrameTiming last_frame_timing_[REMOTE_PLAYER_MAX];
+  FrameTiming remote_arrival_[REMOTE_PLAYER_MAX];   // timing_mutex_: the newest pad frame received and when
   std::deque<FrameTiming> ack_timers_[REMOTE_PLAYER_MAX];
   std::atomic<ConnectStatus> status_{ConnectStatus::UNSET};
   std::atomic<uint32_t> pending_disconnect_reason_{0}, disconnect_reason_{0};
@@ -590,8 +610,11 @@ class Matchmaking {
     // online menu's search. Only the launcher's Both Unranked reads it: false searches YouGame alone.
     bool slippi_gameplay = false;
     // An arena game under YouGame (slippi_arena.h): the arena's own room carries it, and these are its
-    // fighters' YouGame player ids in ring order (2 or 4). Empty for every other search.
+    // fighters' YouGame player ids in ring order (2 to 4). Empty for every other search.
     std::vector<std::string> arena_fighters;
+    // An arena free-for-all (slippi_arena.h): a Teams search whose match is made with teams off, three
+    // or four fighters each their own team, the stage drawn from the doubles list.
+    bool arena_ffa = false;
   };
   // True when an opponent in the match is on the Unranked block list (codes compared ignoring case
   // and spaces). Public for the unit test.
@@ -624,6 +647,13 @@ class Matchmaking {
     uint16_t local_port = 0;
     std::vector<std::string> remotes;
     int test_stage = -1;  // deterministic stage selection for local regression runs only
+    // The remotes' names and connect codes (an arena free-for-all of three, slippi_arena.cpp mesh), one
+    // per remote; empty: the harness's "Peer n".
+    std::vector<std::string> names, codes;
+    // Each machine's game port, in the order above (this machine at local_index): a match with Pro AI
+    // seats leaves each owner's next port to its AI (0 and 2 for two people, 1 and 3 their AIs). Empty:
+    // the machines take ports 0 to n-1.
+    std::vector<int> ports;
   };
 
   explicit Matchmaking(User* user);
@@ -631,12 +661,19 @@ class Matchmaking {
   void FindMatch(MatchSearchSettings settings);
   // This search's own local port (arena room links), instead of forced_port or a random one.
   void SetLocalPort(uint16_t port) { port_override_ = port; }
+  // An arena room's link or pair search (slippi_online arena_matchmaking): never the match a room's frozen
+  // setup is for, so its connection is a plain one.
+  void SetRoomLink(bool on) { room_link_ = on; }
   ProcessState GetMatchmakeState() const { return state_; }
   std::string GetErrorMessage() const { std::lock_guard<std::mutex> lk(result_mutex_); return error_msg_; }
   bool IsSearching() const { return state_ == INITIALIZING || state_ == MATCHMAKING || state_ == OPPONENT_CONNECTING; }
   std::unique_ptr<NetplayClient> GetNetplayClient() { std::lock_guard<std::mutex> lk(result_mutex_); return std::move(netplay_client_); }
   int LocalPlayerIndex() const { std::lock_guard<std::mutex> lk(result_mutex_); return local_player_index_; }
   std::vector<UserInfo> GetPlayerInfo() const { std::lock_guard<std::mutex> lk(result_mutex_); return player_info_; }
+  // The other players' addresses ("ip:port") as the match named them, in player-index order with the
+  // local player left out; empty before a match is found. An arena free-for-all of three pairs its
+  // fighters up by Direct searches and plays a match made from these (Matchmaking::local_peer).
+  std::vector<std::string> RemoteAddresses() const { std::lock_guard<std::mutex> lk(result_mutex_); return remote_ips_found_; }
   display::Provider DisplayProvider() const { return display_provider_.load(); }
   std::string GetPlayerName(uint8_t port) const;
   std::vector<uint16_t> GetStages() const { std::lock_guard<std::mutex> lk(result_mutex_); return allowed_stages_; }
@@ -722,8 +759,10 @@ class Matchmaking {
   std::unique_ptr<NetplayClient> netplay_client_;
   // Matchmaking thread only.
   int host_port_ = 0;
+  bool room_link_ = false;
   uint16_t port_override_ = 0;
   std::vector<std::string> remote_ips_;
+  std::vector<std::string> remote_ips_found_;   // the same, under result_mutex_ (RemoteAddresses)
   std::vector<std::string> public_fallbacks_;
   bool is_host_ = false;
 };

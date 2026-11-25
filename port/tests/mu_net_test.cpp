@@ -87,11 +87,23 @@ struct Peer {
   std::vector<uint16_t> pool;
   uint8_t minor = kProtocolMinor;
   uint64_t next_limit_us = 20 * 1000000;
+  // Set before setup(): this side asks for the late controller read. The wait itself is the host's;
+  // here each call is counted and the session is used from inside it, which only works unlocked.
+  bool late = false;
+  int late_calls = 0, late_with_arrival = 0;
   void setup(Clock& clock, uint8_t identity_fill, bool time_sync = false, uint64_t connect_limit_us = 2000000) {
     SessionCallbacks cb;
     cb.log = [this](const char* line) { log.push_back(line); };
     cb.now_us = [&clock] { return clock.us; };
     cb.set_emulation_speed = [this](double s) { speed = s; };
+    if (late) {
+      cb.late_offer = [](int delay, uint32_t) { return delay >= 2; };
+      cb.late_hold = [this](int32_t, bool have_early, double) {
+        ++late_calls;
+        if (have_early) ++late_with_arrival;
+        session.tick();
+      };
+    }
     SessionOptions opt;
     opt.pump_thread = false;
     opt.time_sync = time_sync;
@@ -136,6 +148,7 @@ static void expected_pad(int slot, int commit, int delay, uint8_t pad[kPadWireSi
 struct FakeGame {
   RollbackSession* session = nullptr;
   int slot = 0, delay = 2;
+  int peer_delay = -1;   // the other game's delay when it is not this one's (late controller read)
   int frame = 1, finalized = 0;
   uint32_t checksum_bias = 0;
   int skips = 0, last_result = 0;
@@ -158,7 +171,7 @@ struct FakeGame {
       const int f = latest - k;
       if (f < 1 || f < sent_finalized) break;   // older than the window: not served
       uint8_t want[kPadWireSize];
-      expected_pad(1 - slot, f, delay, want);
+      expected_pad(1 - slot, f, peer_delay < 0 ? delay : peer_delay, want);
       EXPECT(std::memcmp(&reply[42 + k * 12], want, kPadWireSize) == 0);   // newest first, never changed
       static const uint8_t zero[4] = {};
       EXPECT(std::memcmp(&reply[42 + k * 12 + 8], zero, 4) == 0);
@@ -1187,6 +1200,80 @@ static void test_two_games() {
   EXPECT(!a.session.begin_next_game());
 }
 
+static void test_late_read() {
+  // One side asks for the late controller read: it is given one frame less than the setup's delay,
+  // its session calls the wait once for every frame it ran, with itself unlocked, and both games
+  // still get each other's pads on the frames they were committed for.
+  Clock clock;
+  Wire wire;
+  MemoryLink la(wire, true), lb(wire, false);
+  Peer a, b;
+  a.late = true;
+  a.max_games = 2; a.pool = kTestPool;
+  b.max_games = 0; b.pool = kTestPool;
+  a.setup(clock, 1);
+  b.setup(clock, 2);
+  const SessionDescriptor d = test_descriptor();
+  EXPECT(d.input_delay == 2);
+  EXPECT(a.session.start(d, 0, la) && b.session.start(d, 1, lb));
+  EXPECT(settle(a, b, clock));
+  std::vector<uint8_t> ms;
+  a.session.match_state_reply(ms);
+  EXPECT(ms.size() == kMatchStateReplySize && ms[9] == 1);   // the delay byte: one less
+  b.session.match_state_reply(ms);
+  EXPECT(ms.size() == kMatchStateReplySize && ms[9] == 2);
+  FakeGame ga, gb;
+  ga.session = &a.session; ga.slot = 0; ga.delay = 1; ga.peer_delay = 2;
+  gb.session = &b.session; gb.slot = 1; gb.delay = 2; gb.peer_delay = 1;
+  play_frames(a, b, ga, gb, clock, 300);
+  EXPECT(a.logged("late controller read: on"));
+  EXPECT(!b.logged("late controller read"));
+  EXPECT(a.late_calls == 300 && b.late_calls == 0);
+  EXPECT(a.late_with_arrival > 250);
+  a.session.match_state_reply(ms);
+  EXPECT(ms.size() == kMatchStateReplySize && ms[9] == 1);   // while the game runs: what it took
+  GameResult ra, rb;
+  EXPECT(a.session.result(ra) && b.session.result(rb) && ra.transcript_digest == rb.transcript_digest);
+  EXPECT(a.session.counters().checksum_mismatches == 0 && b.session.counters().checksum_mismatches == 0);
+
+  // The next game over the same connection is offered the lower delay again and waits again.
+  report_end(a);
+  report_end(b);
+  pump(a, b, clock);
+  EXPECT(a.session.next_game() == NextGame::Agreed && b.session.next_game() == NextGame::Agreed);
+  EXPECT(a.session.begin_next_game() && b.session.begin_next_game());
+  a.session.match_state_reply(ms);
+  EXPECT(ms.size() == kMatchStateReplySize && ms[9] == 1);
+  b.session.match_state_reply(ms);
+  EXPECT(ms.size() == kMatchStateReplySize && ms[9] == 2);
+  FakeGame ga2, gb2;
+  ga2.session = &a.session; ga2.slot = 0; ga2.delay = 1; ga2.peer_delay = 2;
+  gb2.session = &b.session; gb2.slot = 1; gb2.delay = 2; gb2.peer_delay = 1;
+  const int calls_before = a.late_calls;
+  play_frames(a, b, ga2, gb2, clock, 150);
+  EXPECT(a.late_calls == calls_before + 150 && b.late_calls == 0);
+  GameResult ra2, rb2;
+  EXPECT(a.session.result(ra2) && b.session.result(rb2) && ra2.transcript_digest == rb2.transcript_digest);
+  EXPECT(ra2.transcript_digest != ra.transcript_digest);
+  EXPECT(a.session.counters().checksum_mismatches == 0 && b.session.counters().checksum_mismatches == 0);
+
+  // A game that took the setup's delay although the lower one was offered does not wait.
+  Clock clock2;
+  Wire wire2;
+  MemoryLink lc(wire2, true), ld(wire2, false);
+  Peer c, e;
+  c.late = true;
+  c.setup(clock2, 1);
+  e.setup(clock2, 2);
+  EXPECT(c.session.start(d, 0, lc) && e.session.start(d, 1, ld));
+  EXPECT(settle(c, e, clock2));
+  FakeGame gc, ge;
+  gc.session = &c.session; gc.slot = 0;
+  ge.session = &e.session; ge.slot = 1;
+  play_frames(c, e, gc, ge, clock2, 60);
+  EXPECT(c.late_calls == 0 && !c.logged("late controller read: on"));
+}
+
 static void test_next_digest_mismatch() {
   // The two sides draw the next stage from different pools: the NEXT digests differ, nobody
   // starts a second game, and the finished game's record stands.
@@ -1680,6 +1767,7 @@ int main() {
   test_next_descriptor();
   test_transport_game_base();
   test_two_games();
+  test_late_read();
   test_next_digest_mismatch();
   test_previous_revision_peer();
   test_bye_between_games();

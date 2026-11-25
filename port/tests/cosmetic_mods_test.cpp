@@ -2380,6 +2380,49 @@ int main(int argc, char** argv) {
     g_disc_table.clear(); g_disc_bytes.clear();
   }
 
+  // Character select L / R on Zelda: she becomes Sheik in the match, so the same pack's Sheik skin of
+  // the same color follows (Silky 11-24: an Animelee Zelda pick left Sheik standard), and back again.
+  {
+    host::cosmetics::thaw_after_online_session();
+    host::cosmetics::set_online_probe(nullptr);
+    fs::path pair_folder = folder / L"zelda_sheik";
+    fs::create_directories(pair_folder, ec);
+    host::cosmetics::configure((pair_folder / L"port-settings.ini").string());
+    const auto zelda_retail = costume_dat("PlyZelda5K"), sheik_retail = costume_dat("PlySeak5K");
+    const auto zelda_l = costume_dat("PlyZelda5K", false), sheik_l = costume_dat("PlySeak5K", false);
+    constexpr uint32_t zelda_at = 0x100, sheik_at = 0x200;
+    g_disc_bytes.assign(0x400, 0);
+    std::copy(zelda_retail.begin(), zelda_retail.end(), g_disc_bytes.begin() + zelda_at);
+    std::copy(sheik_retail.begin(), sheik_retail.end(), g_disc_bytes.begin() + sheik_at);
+    g_disc_table = {{"PlZdNr.dat", {zelda_at, (uint32_t)zelda_retail.size()}},
+                    {"PlSkNr.dat", {sheik_at, (uint32_t)sheik_retail.size()}}};
+    fs::path pack_folder = pair_folder / L"pack";
+    fs::create_directories(pack_folder, ec);
+    write_file(pack_folder / L"PlZdNr.lat", zelda_l);
+    write_file(pack_folder / L"PlSkNr.lat", sheik_l);
+    auto scan = host::cosmetics::scan_disc_skins(pack_folder.string(), "ZS", &error);
+    std::string zelda_id, sheik_id;
+    for (const auto& item : host::cosmetics::assets()) {
+      if (item.target_path == "PlZdNr.dat" && item.variant == "alt L") zelda_id = item.id;
+      if (item.target_path == "PlSkNr.dat" && item.variant == "alt L") sheik_id = item.id;
+    }
+    check(scan.ok && !zelda_id.empty() && !sheik_id.empty(), "the pack has a Zelda and a Sheik of the default color");
+    auto fst = two_file_fst("PlZdNr.dat", zelda_at, (uint32_t)zelda_retail.size(),
+                            "PlSkNr.dat", sheik_at, (uint32_t)sheik_retail.size());
+    host::cosmetics::apply_to_fst(fst.data(), (uint32_t)fst.size());
+    auto selected = [](const std::string& id) {
+      for (const auto& item : host::cosmetics::assets()) if (item.id == id) return item.selected;
+      return false;
+    };
+    auto step = host::cosmetics::cycle_slot_live("PlZdNr.dat", 1);
+    check(step.ok && step.changed && step.asset_id == zelda_id && step.partner_slot == "PlSkNr.dat" && selected(sheik_id),
+          "Zelda's pack skin brings the same pack's Sheik skin of the same color");
+    step = host::cosmetics::cycle_slot_live("PlZdNr.dat", -1);
+    check(step.ok && step.changed && step.asset_id.empty() && step.partner_slot == "PlSkNr.dat" && !selected(sheik_id),
+          "back to Zelda's standard costume, Sheik's standard comes back too");
+    g_disc_table.clear(); g_disc_bytes.clear();
+  }
+
   // The session's own pack (the 20XX Hack Pack as the Source Port's overlay): its plain costume is
   // the standard one already, so L / R goes standard, its L set, its R set, then the other skins.
   {

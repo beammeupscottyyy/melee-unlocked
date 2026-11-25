@@ -31,8 +31,9 @@ int mu_port_shield_color(int slot, unsigned int* rgb)
 {
     extern unsigned int mu_shield_color(int slot);   /* mu_entry.c */
     unsigned int chosen;
-    /* Only where the player wears its own port colour: team matches keep the team colours. */
-    if (slot < 0 || slot >= 4 || Player_GetUnk45(slot) != (u32) slot) {
+    /* Team matches too (owner 11-24): a player who chose a colour keeps it on any team; one who did not
+     * shows the team colour. */
+    if (slot < 0 || slot >= 4) {
         return 0;
     }
     chosen = mu_shield_color(slot);

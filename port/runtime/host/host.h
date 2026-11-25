@@ -257,6 +257,8 @@ double last_sim_frame_ms();            // wall time of the most recent simulatio
 void report_sim_work();                // once, at orderly quit; completed intervals only
 double last_sim_frame_work_ms();       // the same frame without its in-frame pacing waits: the thread's own work            // work time of the most recent simulation frame (sleep excluded)
 bool last_sim_frame_late();          // the most recent frame finished after its 60 Hz deadline (the pacer had nothing to wait)
+double recent_sim_frame_work_ms();   // what 19 of 20 of the last 120 frames' work needed (menus included); any thread
+bool recent_sim_frames_steady();     // at least 60 frames seen and at most 1 in 20 of the last 120 missed its 60 Hz place
 
 // ---- time ----
 constexpr uint64_t TB_HZ = 40500000ull;   // bus clock / 4
@@ -313,6 +315,26 @@ double sleep_slack();
 void set_game_rate(double hz);
 double game_rate();
 bool latency_trace_enabled();
+// Tick re-run (MELEE_TICK_REDO=1, experimental, offline matches only; shim/mu_redo.c). The game keeps
+// the state each tick started from. When the controller changes while the game waits for the next
+// tick, it goes back to that state, reads the controller again and runs and draws the tick a second
+// time, so the change shows a few ms after it happens instead of after the next tick (8.3 ms later on
+// average). The waits between ticks watch the controller and end early for it.
+bool tick_redo_enabled();
+void note_frame_handover();     // every frame, where it is handed to the renderer: says once if frames are being held a tick
+void tick_redo_arm(bool armed);   // after a drawn frame: a state is kept for this tick (false: none)
+bool tick_redo_wanted();          // the game's gate between ticks
+void tick_redo_begin();           // the tick is being run again: host polls stand still meanwhile
+bool tick_redo_active();
+bool tick_redo_presleep();        // before a retrace: false when the wait ended early for a re-run
+// Online late controller read (hle/slippi_online.cpp): the game thread waits here until `seconds` after
+// this tick's place on the 60 Hz schedule (counted as waiting, not as work). Returns the time waited.
+double tick_hold(double seconds);
+// What a pad poll would return now differs from the last poll (window.cpp). Also places the test press
+// MELEE_TEST_MIDTICK_PRESS=<every n ticks>:<ms into the tick> (X on port 1, held 6 ticks), with a
+// latency probe line for it, whether or not the re-run is on.
+bool input_changed_since_poll(double tick_start);
+bool input_midtick_test();
 // Lag test ledger (MELEE_LAGTEST_FLASH, tests): where the whole picture turns white (X) or black (A)
 // for a Lossless adapter lag test, to split its reading into parts. 0 off: the game's own path.
 // 1 "report": the moment the adapter's report with the button arrives, past the game entirely (the

@@ -264,14 +264,15 @@ ArenaMatchStatus arena_match_status();
 // character with a random legal stage (the test harness); otherwise the player picks and presses
 // Start as usual once connected.
 // mode: Matchmaking::DIRECT for a singles pair, TEAMS for a doubles four (everyone searches the
-// same code; team 0 red, 1 blue).
+// same code; team 0 red, 1 blue) or, with `ffa`, a free-for-all of three or four (the same Teams
+// search; the match is made with teams off and a stage from the doubles list).
 bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t character, uint8_t color,
-                        uint8_t team, std::string* error);
+                        uint8_t team, bool ffa, std::string* error);
 // The same search for an arena under YouGame: the arena's room carries the game, between `fighters`
-// (YouGame player ids in ring order, 2 or 4). `code` is the arena's word for the match (the opponent's
-// id, or the host's for doubles), which arena_match_status() reports back.
+// (YouGame player ids in ring order, 2 to 4). `code` is the arena's word for the match (the opponent's
+// id, or the host's for doubles and a free-for-all), which arena_match_status() reports back.
 bool arena_start_yg_search(int mode, const std::vector<std::string>& fighters, const std::string& code, bool locked,
-                           uint8_t character, uint8_t color, uint8_t team, std::string* error);
+                           uint8_t character, uint8_t color, uint8_t team, bool ffa, std::string* error);
 // The Slippi account's connect code and display name; false when not logged in.
 bool local_identity(std::string* code, std::string* name);
 // A matchmaking client of its own for an arena room link (the game's own search is untouched).

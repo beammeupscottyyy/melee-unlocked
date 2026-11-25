@@ -277,6 +277,11 @@ void mu_lobby_pads(struct PADStatus* status) { (void) status; }
 int mu_lobby_partner_source(void) { return -1; }
 int mu_lobby_partner_want(void) { return 0; }
 void mu_lobby_set_partner_want(int want) { (void) want; }
+int mu_lobby_partner_pro(void) { return 0; }
+void mu_lobby_set_partner_pro(int index) { (void) index; }
+int mu_lobby_partner_pro_char(void) { return 2; }
+int mu_lobby_partner_pro_model(void) { return -1; }
+const char* mu_lobby_partner_pro_name(void) { return ""; }
 int mu_lobby_watch_pads(struct PADStatus* status) { (void) status; return 0; }
 int mu_slippi_css_teams(void) { return 0; }
 void mu_slippi_css_enter(struct CSSData** css, unsigned char* char_chosen, signed char* ctrl_port,

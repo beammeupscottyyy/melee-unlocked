@@ -1714,6 +1714,7 @@ static struct {
     unsigned char arm;    /* the arming this select opened on (view.arm): another one is never left */
     int partner_source, partner_b_held;   /* Doubles: the controller that plays Player 2's door, its B */
     int partner_want;     /* Doubles: the partner door's tab, MU_LOBBY_WANT_* (this machine's own; FIND each home) */
+    int partner_pro;      /* Doubles, the tab on Pro AI: which pro (mu_lobby_pros) */
     int cancel_held;      /* Doubles: B was down on the last pad read while the home searched */
     int cancel_mask;      /* Doubles: the B that cancelled the search is kept from the select until let go */
     GameRules rules;      /* the player's own rules, back when the lobby closes */
@@ -1829,7 +1830,11 @@ void mu_lobby_pads(PADStatus* status)
     mine = status[src];
     memset(&partner, 0, sizeof partner);
     partner.err = PAD_ERR_NO_CONTROLLER;
-    if (lobby.view_ok && mu_lobby_local_owned(&lobby.view)) {
+    if (lobby.view_ok && mu_lobby_local_owned(&lobby.view) && lobby.partner_want == MU_LOBBY_WANT_PROAI) {
+        /* A Pro AI's door: a still, connected pad (the select puts its coin on the pro's fighter). */
+        partner.err = 0;
+        lobby.partner_source = -1;
+    } else if (lobby.view_ok && mu_lobby_local_owned(&lobby.view)) {
         /* Player 2's door (the partner tab on P2 claimed it: mu_friends4_partner_cycle) is played by the first
          * other connected controller, taken as it is plugged in; until one is, the door stays a person's with a
          * still pad, as if a 2nd controller were plugged in. */
@@ -1908,8 +1913,34 @@ int mu_lobby_partner_want(void)
 }
 void mu_lobby_set_partner_want(int want)
 {
-    if (want < MU_LOBBY_WANT_FIND || want > MU_LOBBY_WANT_CPU) want = MU_LOBBY_WANT_FIND;
+    if (want < MU_LOBBY_WANT_FIND || want >= MU_LOBBY_WANTS) want = MU_LOBBY_WANT_FIND;
     lobby.partner_want = want;
+}
+
+/* The pros a Pro AI partner can be: the Arena panel's own list (port/runtime/gx/arena_panel.cpp kBotChoices),
+ * each fighter with the model trained on that player (shim/mu_practice_cpu.c). */
+static const struct { unsigned char ch, model; const char* name; } mu_lobby_pros[MU_LOBBY_PROS] = {
+    { 2, 3, "Pro AI Fox" }, { 20, 0, "Pro AI Falco" }, { 9, 1, "Pro AI Marth" }, { 17, 4, "Pro AI Yoshi" } };
+int mu_lobby_partner_pro(void)
+{
+    return lobby.partner_pro >= 0 && lobby.partner_pro < MU_LOBBY_PROS ? lobby.partner_pro : 0;
+}
+void mu_lobby_set_partner_pro(int index)
+{
+    lobby.partner_pro = index >= 0 && index < MU_LOBBY_PROS ? index : 0;
+}
+int mu_lobby_partner_pro_char(void)
+{
+    return mu_lobby_pros[mu_lobby_partner_pro()].ch;
+}
+int mu_lobby_partner_pro_model(void)
+{
+    if (!lobby.major || lobby.partner_want != MU_LOBBY_WANT_PROAI) return -1;
+    return mu_lobby_pros[mu_lobby_partner_pro()].model;
+}
+const char* mu_lobby_partner_pro_name(void)
+{
+    return mu_lobby_pros[mu_lobby_partner_pro()].name;
 }
 
 static void lobby_open(void)

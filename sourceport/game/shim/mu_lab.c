@@ -343,6 +343,8 @@ static u32 lab_test_presses(void)
 void mu_lab_frame_begin(void)
 {
     u32 pressed;
+    void mu_redo_frame_begin(void);
+    mu_redo_frame_begin();   /* tick re-run (shim/mu_redo.c): back to the kept state first */
     if (!lab_on()) {
         lab_bubbles_release();
         return;
@@ -781,6 +783,23 @@ int mu_test_classic_stage(void)
         }
     }
     return *v == '\0' ? n : -1;
+}
+
+/* MELEE_TEST_VS_TEAMS=<t1>,<t2>,<t3>,<t4> (tests only): VS Mode as a team match, each port on that team (0 red,
+ * 1 blue, 2 green; '-' or missing leaves the port's team). Returns 0 when unset. */
+int mu_test_vs_teams(int teams[4])
+{
+    const char* v = mu_test_getenv("MELEE_TEST_VS_TEAMS");
+    int i;
+    if (v == NULL || *v == '\0') {
+        return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        teams[i] = *v >= '0' && *v <= '2' ? *v - '0' : -1;
+        while (*v != '\0' && *v != ',') v++;
+        if (*v == ',') v++;
+    }
+    return 1;
 }
 
 /* MELEE_TEST_VS_STAGE=<n> (tests only): VS mode goes straight to stage n, the external id the stage

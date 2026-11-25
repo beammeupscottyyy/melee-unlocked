@@ -124,9 +124,21 @@ static int doubles_teams(void)
 #endif
 }
 
+/* An arena room's free-for-all (host slippi_arena): the room's next game is a free-for-all on this
+ * Teams character select. No team toggle (every fighter is their own team), and Start locks in a
+ * random stage (the host picks the stage from the doubles list, the same on every fighter). Read
+ * from the host's arena reply (arena_pairing below) on entry and every frame of the select. */
+static int arena_ffa_css;
+static u32 arena_pairing(int* test_room, int* in_room);
+
 int mu_slippi_css_teams(void)
 {
-    return mu_slippi_css_online() && mu_slippi_state()->mode == MU_SLP_MODE_TEAMS;
+    return mu_slippi_css_online() && mu_slippi_state()->mode == MU_SLP_MODE_TEAMS && !arena_ffa_css;
+}
+
+int mu_slippi_css_arena_ffa(void)
+{
+    return arena_ffa_css;
 }
 
 int mu_slippi_css_local_ready(void)
@@ -180,6 +192,8 @@ void mu_slippi_css_enter(CSSData** css, u8* chosen, s8* port, u8* request, s8* n
 
     /* FN_InitBuffers: nothing to allocate natively. CSS data table zeroed. */
     memset(&dt, 0, sizeof dt);
+    /* The room's word on a free-for-all before the team toggle is set up. */
+    { int t = 0, i = 0; arena_pairing(&t, &i); }
 
     /* The injection byte starts at 1 (red) and only ever holds 1-3. */
     if (st->team_idx == 0) {
@@ -211,12 +225,6 @@ void mu_slippi_css_enter(CSSData** css, u8* chosen, s8* port, u8* request, s8* n
 
 /* ---- FetchMatchInfo (mnCharSel_CursorThink, inside the no-scene-request branch) ---- */
 
-void mu_slippi_css_poll(void)
-{
-    mu_slippi_load_match_state(NULL);
-    dt.msrb = *mu_slippi_match_state();
-}
-
 /* An arena room (host slippi_arena) counts the new pairings it starts; 0 outside a room. */
 int mu_online_abi_command(unsigned int command, const unsigned char* payload, unsigned int size,
                           unsigned char* response, unsigned int capacity, unsigned int* response_size);
@@ -227,12 +235,23 @@ static u32 arena_pairing(int* test_room, int* in_room)
     unsigned int got = 0;
     *test_room = 0;
     *in_room = 0;
+    arena_ffa_css = 0;
     if (mu_online_abi_command(CMD_ARENA_PAIRING, NULL, 0, reply, sizeof reply, &got) != 0 || got < 4) {
         return 0;
     }
     *test_room = got >= 5 && (reply[4] & 1) != 0;   /* the host locked in a random stage itself */
     *in_room = got >= 5 && (reply[4] & 2) != 0;     /* the player is in a room now (the count outlives it) */
+    arena_ffa_css = got >= 5 && (reply[4] & 4) != 0; /* the room's next game is a free-for-all */
     return (u32) reply[0] << 24 | (u32) reply[1] << 16 | (u32) reply[2] << 8 | reply[3];
+}
+
+void mu_slippi_css_poll(void)
+{
+    int test_room, in_room;
+    mu_slippi_load_match_state(NULL);
+    dt.msrb = *mu_slippi_match_state();
+    /* The room's word on a free-for-all, every frame (the toggle and Start read it). */
+    arena_pairing(&test_room, &in_room);
 }
 
 #define CMD_CSS_FRAME 0xDA /* upstream 0xEC: MU_SQUAD_COMMAND in this build */
@@ -647,8 +666,16 @@ int mu_slippi_css_inputs(unsigned int trigger)
             OSReport("arena: no winner or loser on record, local index %d %s the stage\n", (int) m->local_index,
                      m->local_index == 0 ? "picks" : "waits for");
         }
-        if (test_room && st->is_winner == MU_SLP_WINNER_LOST) {
-            st->chose_stage = 1;   /* a test room: nobody is there to pick, the host's random stage stands */
+        {
+            /* Tests: MELEE_TEST_ARENA_PRESS_START=1 in a real room (hidden runs through Slippi's server)
+             * has nobody to pick a stage either. */
+            static int press_env = -1;
+            if (press_env < 0) {
+                press_env = mu_test_getenv("MELEE_TEST_ARENA_PRESS_START") != NULL;
+            }
+            if ((test_room || (in_room && press_env)) && st->is_winner == MU_SLP_WINNER_LOST) {
+                st->chose_stage = 1;   /* a test room: nobody is there to pick, the host's random stage stands */
+            }
         }
     }
 
@@ -675,8 +702,8 @@ int mu_slippi_css_inputs(unsigned int trigger)
             squad_start_refused();
         }
 #endif
-        if (advance && *char_chosen != 0 && gm_801A4BB8() != 0 && doubles_teams()) {
-            tx_lock_in(SB_RAND);   /* every game: the room's seed picks the stage */
+        if (advance && *char_chosen != 0 && gm_801A4BB8() != 0 && (doubles_teams() || arena_ffa_css)) {
+            tx_lock_in(SB_RAND);   /* every game: the room's seed picks the stage (a free-for-all: the host's doubles list) */
         } else if (advance && *char_chosen != 0 && gm_801A4BB8() != 0) {
             switch (st->mode) {
             case MU_SLP_MODE_UNRANKED:

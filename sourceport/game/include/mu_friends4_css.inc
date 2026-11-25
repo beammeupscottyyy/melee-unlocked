@@ -249,8 +249,27 @@ static int mu_f4_send(const unsigned char* req, unsigned size)
  * through the home's matches. Nothing new goes over the wire: CPU is the SEAT request the HMN/CPU switch always
  * sent (mu_f4_host_doors), P2 the LOCAL_SEAT claim a 2nd controller's START used to send, Invite the INVITE op
  * (a Teams invite, yougame_friends.h doubles_invite). Only seat 0 turns it; it is locked while the home
- * searches, once a match is being set up, while a friend is in the seat, and while a CPU or Player 2 sits down. */
-static const char* const mu_f4_want_names[MU_LOBBY_WANTS] = { "find", "invite", "p2", "cpu" };
+ * searches, once a match is being set up, while a friend is in the seat, and while a CPU or Player 2 sits down.
+ * Pro AI (owner 11-23, after Invite: Find, Invite, Pro AI, P2, CPU) is P2's claim with the door played by a Pro AI:
+ * each A on it moves to the next pro (Fox, Falco, Marth, Yoshi), then on to P2. The
+ * door's coin goes down on the pro's fighter by itself (mu_f4_proai_door) and in the match the model plays the
+ * seat on this machine (shim/mu_online.c, CMD_PROAI_SEAT): the room only sees Player 2. */
+static const char* const mu_f4_want_names[MU_LOBBY_WANTS] = { "find", "invite", "p2", "cpu", "proai" };
+
+static void mu_f4_proai_door(CSSData* css);
+static void mu_f4_proai_lift(CSSData* css);
+
+/* The tab's order (the enum's is older): Find, Invite, Pro AI, P2, CPU. */
+static int mu_f4_want_next(int want)
+{
+    switch (want) {
+    case MU_LOBBY_WANT_FIND: return MU_LOBBY_WANT_INVITE;
+    case MU_LOBBY_WANT_INVITE: return MU_LOBBY_WANT_PROAI;
+    case MU_LOBBY_WANT_PROAI: return MU_LOBBY_WANT_P2;
+    case MU_LOBBY_WANT_P2: return MU_LOBBY_WANT_CPU;
+    default: return MU_LOBBY_WANT_FIND;
+    }
+}
 
 /* The partner door's kind as the tab sets it, the way Melee's own switch press does (an empty port's door is
  * never HMN, so mu_f4_host_doors never reads it as one); the door keeps it while the view catches up. */
@@ -310,6 +329,8 @@ static int mu_friends4_partner_cycle(u8 door)
         locked = "the CPU is sitting down";
     else if (mu_lobby_partner_want() == MU_LOBBY_WANT_P2 && s->kind == MU_LOBBY_KIND_OPEN && mu_f4.partner_p2_wait > 0)
         locked = "Player 2 is sitting down";
+    else if (mu_lobby_partner_want() == MU_LOBBY_WANT_PROAI && s->kind == MU_LOBBY_KIND_OPEN && mu_f4.partner_p2_wait > 0)
+        locked = "the Pro AI is sitting down";
     if (locked != NULL) {
         lbAudioAx_80024030(3);
         OSReport("doubles: partner tab locked (%s)\n", locked);
@@ -318,8 +339,20 @@ static int mu_friends4_partner_cycle(u8 door)
         return 1;
     }
     want = mu_lobby_partner_want();
-    next = (want + 1) % MU_LOBBY_WANTS;
-    if (want == MU_LOBBY_WANT_P2 && s->kind == MU_LOBBY_KIND_LOCAL) {
+    if (want == MU_LOBBY_WANT_PROAI && mu_lobby_partner_pro() + 1 < MU_LOBBY_PROS) {
+        /* The next pro in the same seat: mu_f4_proai_door lifts the coin and puts it down on the new fighter. */
+        mu_lobby_set_partner_pro(mu_lobby_partner_pro() + 1);
+        OSReport("doubles: partner tab Pro AI %s\n", mu_lobby_partner_pro_name());
+        if (s->kind == MU_LOBBY_KIND_OPEN && mu_f4.partner_p2_wait == 0) mu_f4_p2_claim("tab, Pro AI");
+        sfxMove();
+        return 1;
+    }
+    next = mu_f4_want_next(want);
+    if (next == MU_LOBBY_WANT_PROAI) mu_lobby_set_partner_pro(0);
+    if (want == MU_LOBBY_WANT_PROAI && s->kind == MU_LOBBY_KIND_LOCAL) {
+        /* Pro AI to P2: the same seat, now a 2nd controller's; the Pro AI's coin comes back up for it. */
+        mu_f4_proai_lift(css);
+    } else if (want == MU_LOBBY_WANT_P2 && s->kind == MU_LOBBY_KIND_LOCAL) {
         const unsigned char release[2] = { MU_LOBBY_OP_LOCAL_SEAT, 0 };
         if (!mu_f4_send(release, sizeof release)) {
             lbAudioAx_80024030(3);
@@ -334,6 +367,7 @@ static int mu_friends4_partner_cycle(u8 door)
     }
     mu_f4_want(next, "tab");
     if (next == MU_LOBBY_WANT_P2 && s->kind == MU_LOBBY_KIND_OPEN) mu_f4_p2_claim("tab");
+    if (next == MU_LOBBY_WANT_PROAI && s->kind == MU_LOBBY_KIND_OPEN) mu_f4_p2_claim("tab, Pro AI");
     sfxMove();
     return 1;
 }
@@ -348,7 +382,8 @@ static void mu_f4_partner_sync(CSSData* css, int mine)
     want = mu_lobby_partner_want();
     if (kind != mu_f4.partner_kind) {
         if (kind == MU_LOBBY_KIND_CPU && want != MU_LOBBY_WANT_CPU) mu_f4_want(MU_LOBBY_WANT_CPU, "a CPU is in the seat");
-        else if (kind == MU_LOBBY_KIND_LOCAL && want != MU_LOBBY_WANT_P2 && mu_f4.partner_cpu_wait == 0)
+        else if (kind == MU_LOBBY_KIND_LOCAL && want != MU_LOBBY_WANT_P2 && want != MU_LOBBY_WANT_PROAI &&
+                 mu_f4.partner_cpu_wait == 0)
             mu_f4_want(MU_LOBBY_WANT_P2, "Player 2 is in the seat");
         else if (kind == MU_LOBBY_KIND_HUMAN && want != MU_LOBBY_WANT_FIND)
             mu_f4_want(MU_LOBBY_WANT_FIND, "a friend took the seat");
@@ -385,7 +420,8 @@ static int mu_f4_partner_start(void)
         sfxForward();
         return 1;
     }
-    if (want == MU_LOBBY_WANT_P2 && mu_f4.partner_p2_wait == 0 && mu_f4_p2_claim("START")) {
+    if ((want == MU_LOBBY_WANT_P2 || want == MU_LOBBY_WANT_PROAI) && mu_f4.partner_p2_wait == 0 &&
+        mu_f4_p2_claim(want == MU_LOBBY_WANT_PROAI ? "START, Pro AI" : "START")) {
         sfxForward();
         return 1;
     }
@@ -923,6 +959,44 @@ static void mu_f4_draw(CSSData* css, int i, const MuLobbySeat* s)
      * player's hover only changes the portrait. */
     door->sel_icon_prev = door->sel_icon;
     mnCharSel_8025DB34((u8) i);
+}
+
+/* Doubles, the partner tab on Pro AI and Player 2's seat ours: the door's coin goes down on the pro's fighter,
+ * as a remote pick is drawn (mu_f4_draw); mu_f4_local then sends it as Player 2's pick. A coin down on another
+ * fighter (the tab moved to the next pro) comes back up first: its UNPICK goes out, then the new pick. */
+static void mu_f4_proai_door(CSSData* css)
+{
+    PlayerInitData* p = &css->vs.start.players[1];
+    struct CSSCharModel* coin = mnCharSel_804A0BD0[1];
+    const int ch = mu_lobby_partner_pro_char();
+    MuLobbySeat s;
+    if (coin == NULL || (mu_f4.view.flags & MU_LOBBY_F_STARTED) || mu_f4_searching()) return;
+    if (coin->x5 == 0 && p->ckind == ch) return;
+    memset(&s, 0, sizeof s);
+    s.kind = MU_LOBBY_KIND_LOCAL;
+    if (coin->x5 == 0 && (unsigned) p->ckind <= MU_LOBBY_CHAR_MAX) {
+        OSReport("doubles: the Pro AI's coin comes up off fighter %d\n", (int) p->ckind);
+        s.hover_ch = MU_LOBBY_NONE;
+    } else {
+        OSReport("doubles: the Pro AI (%s) picks fighter %d\n", mu_lobby_partner_pro_name(), ch);
+        s.flags = MU_LOBBY_S_PICKED;
+        s.pick_ch = (unsigned char) ch;
+        s.pick_color = 0;
+        s.pick_team = mu_f4_u8(mnCharSel_803F0DFC.doors[1].team, MU_LOBBY_TEAM_MAX);
+    }
+    mu_f4_draw(css, 1, &s);
+}
+
+/* Pro AI to P2 on the tab: the coin back in Player 2's hand, for a 2nd controller to pick with. */
+static void mu_f4_proai_lift(CSSData* css)
+{
+    struct CSSCharModel* coin = mnCharSel_804A0BD0[1];
+    MuLobbySeat s;
+    if (coin == NULL || coin->x5 != 0) return;
+    memset(&s, 0, sizeof s);
+    s.kind = MU_LOBBY_KIND_LOCAL;
+    s.hover_ch = MU_LOBBY_NONE;
+    mu_f4_draw(css, 1, &s);
 }
 
 /* Another person's hand (cursor think): their door comes from the view and the hand stays parked. */
@@ -1564,7 +1638,7 @@ static const char* mu_f4_partner_tag(const MuLobbyView* v, int mine, int want, c
     *caption = NULL;
     if (!(v->mode & MU_LOBBY_M_DOUBLES) || !(v->flags & MU_LOBBY_F_KNOWN) || mine != 0 || kind == MU_LOBBY_KIND_HUMAN)
         return NULL;
-    if (kind == MU_LOBBY_KIND_LOCAL) return "P2";
+    if (kind == MU_LOBBY_KIND_LOCAL) return want == MU_LOBBY_WANT_PROAI ? "PRO" : "P2";
     /* A CPU seat the host has just tabbed away from (CPU, then Find) is still a CPU until the room catches up: the
      * tab's choice wins, so the gray N/A tab never reads CPU. mu_f4_partner_sync moves the choice to CPU whenever a
      * CPU does sit down, so the two only disagree after the host's own press. */
@@ -1575,6 +1649,7 @@ static const char* mu_f4_partner_tag(const MuLobbyView* v, int mine, int want, c
     }
     if (want == MU_LOBBY_WANT_P2) return "P2";
     if (want == MU_LOBBY_WANT_CPU) return "CPU";
+    if (want == MU_LOBBY_WANT_PROAI) return "PRO";
     *caption = "Find online";
     return "FIND";
 }
@@ -1676,7 +1751,7 @@ static void mu_f4_panel_text(const MuLobbyView* v, unsigned hint, int noted, int
                hint == MU_LOBBY_HINT_SEARCH_STOPPED || hint == MU_LOBBY_HINT_FIXED_RULES ||
                hint == MU_LOBBY_HINT_UNRANKED_ONLY || hint == MU_LOBBY_HINT_HOST_ONLY) {
         if (host && open && want == MU_LOBBY_WANT_INVITE) strcpy(p->line[1], "Press START to invite");
-        else if (host && open && (want == MU_LOBBY_WANT_P2 || want == MU_LOBBY_WANT_CPU))
+        else if (host && open && (want == MU_LOBBY_WANT_P2 || want == MU_LOBBY_WANT_CPU || want == MU_LOBBY_WANT_PROAI))
             strcpy(p->line[1], "Waiting for players");   /* Player 2 or the CPU is sitting down */
         else strcpy(p->line[1], "Press START to search");
     } else if (hint == MU_LOBBY_HINT_PICK && !(me->flags & MU_LOBBY_S_PICKED)) {
@@ -1691,6 +1766,8 @@ static void mu_f4_panel_text(const MuLobbyView* v, unsigned hint, int noted, int
         mu_f4_panel_copy(name, sizeof name, partner->name);
         if (name[0]) sprintf(p->line[2], "Partner: %s", name);   /* 9 + at most 15: within 30 */
         else strcpy(p->line[2], "Partner: a friend");
+    } else if (partner->kind == MU_LOBBY_KIND_LOCAL && host && want == MU_LOBBY_WANT_PROAI) {
+        sprintf(p->line[2], "Partner: %s", mu_lobby_partner_pro_name());   /* 9 + at most 13 */
     } else if (partner->kind == MU_LOBBY_KIND_LOCAL) {
         strcpy(p->line[2], "Partner: Player 2");
     } else if (partner->kind == MU_LOBBY_KIND_CPU) {
@@ -1706,6 +1783,9 @@ static void mu_f4_panel_text(const MuLobbyView* v, unsigned hint, int noted, int
         p->spin[2] = 1;
     } else if (host && want == MU_LOBBY_WANT_CPU) {
         strcpy(p->line[2], "Partner: CPU");
+        p->spin[2] = 1;
+    } else if (host && want == MU_LOBBY_WANT_PROAI) {
+        sprintf(p->line[2], "Partner: %s", mu_lobby_partner_pro_name());
         p->spin[2] = 1;
     } else {
         strcpy(p->line[2], "Partner: find online");
@@ -2170,6 +2250,29 @@ static void mu_f4_sync_mode(CSSData* css, int mine)
 }
 
 /* Once a frame (mu_css_state_frame, after the doubles frame), and at the end of OnEnter. */
+#include <mu_test_env.h>
+/* Tests only (MELEE_TEST_F4_PARTNER=N): the host's partner tab is pressed N times in the Doubles home, as A on
+ * it does (2 = Pro AI Fox, 3 = Pro AI Falco...), one press a second once the room is known. */
+static void mu_f4_test_partner(int mine)
+{
+    static int left = -1, wait = 120;
+    const char* v;
+    if (left == 0 || mine != 0 || !mu_f4_doubles() || !mu_f4_host()) return;
+    if (left < 0) {
+        v = mu_test_getenv("MELEE_TEST_F4_PARTNER");
+        left = (v != NULL && v[0] >= '1' && v[0] <= '9') ? v[0] - '0' : 0;
+        if (left) OSReport("doubles: test, the partner tab is pressed %d times\n", left);
+        return;
+    }
+    if (--wait > 0) return;
+    wait = 60;
+    {
+        const int want = mu_lobby_partner_want(), pro = mu_lobby_partner_pro();
+        mu_friends4_partner_cycle(1);
+        if (mu_lobby_partner_want() != want || mu_lobby_partner_pro() != pro) --left;   /* a locked tab: again */
+    }
+}
+
 static void mu_friends4_css_frame(void)
 {
     CSSData* css = mnCharSel_804D6CB0;
@@ -2219,10 +2322,12 @@ static void mu_friends4_css_frame(void)
     if (mu_f4.view_ok && (mu_f4.view.flags & MU_LOBBY_F_KNOWN) && mu_f4.view.my_seat < MU_LOBBY_SEATS) {
         mu_f4_pair_team(css, mine);    /* first: the pick and hover below carry the pair's colour */
         mu_f4_local(css, mine);
+        if (mu_lobby_local_owned(&mu_f4.view) && mu_lobby_partner_want() == MU_LOBBY_WANT_PROAI) mu_f4_proai_door(css);
         if (mu_lobby_local_owned(&mu_f4.view)) mu_f4_local(css, 1);
         else mu_f4.partner_sent[0] = 0xFF;
         mu_f4_doors(css, mine);        /* the view first: the host's doors then see what the room has */
         mu_f4_partner_sync(css, mine);
+        mu_f4_test_partner(mine);
         mu_f4_pair_paint(css, mine);
         mu_f4_host_doors(css, mine);
         mu_f4_rules(css);

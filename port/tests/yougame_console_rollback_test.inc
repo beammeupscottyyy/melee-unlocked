@@ -328,6 +328,7 @@ int32_t host_call(int32_t op, uint32_t body, MuConsoleInputs* out) {
 enum { MU_SFX_NO_TICKET = -1, MU_SFX_ADOPTED = -2, MU_MUSIC_START = 1, MU_MUSIC_STOP = 2 };
 int mu_online_active() { return current->slippi; }
 int mu_online_resim_active() { return current->online.resim; }
+int mu_redo_tracking() { return 0; }   // the tick re-run (mu_redo.c) is off in these games
 void mu_online_abi_log(const char* line) { current->logs.emplace_back(line); }
 int snprintf(char* out, size_t n, const char* format, ...) {
   va_list args; va_start(args, format); int result = ::vsnprintf(out, n, format, args); va_end(args);

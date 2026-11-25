@@ -47,6 +47,10 @@ void shutdown();
 enum class Act : uint8_t {
   ToggleLine = 1, Ask = 2, Answer = 3, GiveUp = 4, SetMode = 5, ProposeSwitch = 6, VoteSwitch = 7, Leave = 8,
   SetCharacter = 9,              // arg the character, text[0] the costume (sent by the room itself)
+  AddBot = 10,                   // this player's Pro AI: arg its character, text[0] the pro (again: changes them)
+  RemoveBot = 11,                // this player's Pro AI leaves the room
+  DirectProAi = 12,              // from a Direct game: a room with the opponent and this player's Pro AI
+                                 // (arg its character, text[0] the pro); it proposes a free-for-all
   OpenRoom = 20, AddCode = 21,   // the host's own (AddCode carries a connect code)
   LeaveRoom = 22,                // this player leaves the room (a host's room closes with it)
   JoinYouGame = 23,              // under YouGame: join the arena whose room code is text (an invite)
@@ -65,6 +69,7 @@ struct View {
   std::string status;                       // one plain line: what this member's game is doing
   std::string notice;                       // a short-lived line beside the room tab (a full room), else empty
   uint16_t warming = 0;                     // who is warming up in Training (the warm-up room), a bit per member id
+  std::string direct_opponent;              // out of a room: the Direct opponent this player is connected to (Add Pro AI)
 };
 View view();
 // Tests only (MELEE_TEST_ARENA_FIXTURE=<state>[:long]): view() answers a made-up room so the panel can
@@ -84,6 +89,9 @@ bool room_just_ended();
 // True while a Slippi search or a connected pair is up (any thread): then Z belongs to the game
 // ("Z to cancel") unless this game is in a room.
 bool search_busy();
+// The room's next game is a free-for-all (any thread): the Teams character select hides its team
+// toggle and Start locks in a random stage (the shim's arena reply, cmd 0xDD bit 2).
+bool css_ffa();
 // The online character select's pick (the game shim, cmd 0xEE): Slippi's external character id, or
 // kNone while no character is picked, and the costume. Shown as this member's portrait in the room.
 void set_css_pick(uint8_t character, uint8_t costume);

@@ -110,6 +110,7 @@ class TabHarness(unittest.TestCase):
         code = names
         for decl in ('static void mu_f4_partner_door(CSSData* css, u8 kind)',
                      'static void mu_f4_want(int want, const char* why)',
+                     'static int mu_f4_want_next(int want)',
                      'static int mu_f4_p2_claim(const char* why)',
                      'static int mu_friends4_partner_cycle(u8 door)',
                      'static void mu_f4_partner_sync(CSSData* css, int mine)',
@@ -122,7 +123,8 @@ class TabHarness(unittest.TestCase):
 #include "mu_lobby_wire.h"
 using u8 = unsigned char; using u32 = unsigned; using s8 = signed char;
 enum { Gm_PKind_Human = 0, Gm_PKind_Cpu = 1, Gm_PKind_NA = 3 };
-enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3, MU_LOBBY_WANTS = 4 };
+enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3,
+       MU_LOBBY_WANT_PROAI = 4, MU_LOBBY_WANTS = 5 };
 #define MU_F4_HOLD 60
 struct CSSDoor { u8 p_kind = Gm_PKind_NA, p_kind_prev = Gm_PKind_NA, selected_since_load = 0, costume = 0, team = 0; };
 struct { CSSDoor doors[4]; } mnCharSel_803F0DFC;
@@ -144,6 +146,12 @@ struct {
 } mu_f4;
 int mu_lobby_partner_want() { return want_v; }
 void mu_lobby_set_partner_want(int w) { want_v = w; }
+int pro_v, proai_lifts;   // the partner tab's Pro AI (mu_lobby_partner_pro_*): which pro, in order
+int mu_lobby_partner_pro() { return pro_v; }
+void mu_lobby_set_partner_pro(int p) { pro_v = p; }
+const char* mu_lobby_partner_pro_name() { return "Pro AI"; }
+void mu_f4_proai_lift(CSSData*) { ++proai_lifts; }
+#define MU_LOBBY_PROS 4
 int mu_lobby_css() { return 1; }
 int mu_f4_doubles() { return mu_f4.view_ok && (mu_f4.view.mode & MU_LOBBY_M_DOUBLES); }
 int mu_f4_searching() { return mu_f4_doubles() && (mu_f4.view.mode & MU_LOBBY_M_SEARCHING); }
@@ -202,9 +210,21 @@ int main() {
     assert(mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_INVITE && buzzes == 2);   // locked while out
     mu_f4.view.flags &= ~MU_LOBBY_F_INVITING;   // B took it back: the door is still on Invite
     frame(); assert(want_v == MU_LOBBY_WANT_INVITE);
-    // Invite -> P2: Player 2 takes the door at once (LOCAL_SEAT {1}), as if controller 2 were plugged in.
+    // Invite -> Pro AI: Player 2's door is claimed for the Pro AI (LOCAL_SEAT {1}), the first pro.
     sent.clear();
     const std::vector<unsigned char> claim{MU_LOBBY_OP_LOCAL_SEAT, 1};
+    assert(mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_PROAI && pro_v == 0 && sent.size() == 1 && sent[0] == claim);
+    { const int bp = buzzes; assert(mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_PROAI && pro_v == 0 && buzzes == bp + 1); }   // sitting down
+    // The room never seats it: once the wait runs out, each press is the next pro, claiming the door again.
+    for (int p = 1; p < MU_LOBBY_PROS; ++p) {
+        for (int i = 0; i < MU_F4_HOLD; ++i) frame();
+        const size_t before = sent.size();
+        assert(mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_PROAI && pro_v == p);
+        assert(sent.size() == before + 1 && sent.back() == claim);
+    }
+    for (int i = 0; i < MU_F4_HOLD; ++i) frame();
+    // The last pro -> P2: Player 2 takes the door at once (LOCAL_SEAT {1}), as if controller 2 were plugged in.
+    sent.clear();
     assert(mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_P2 && sent.size() == 1 && sent[0] == claim);
     assert(mu_f4.partner_p2_wait == MU_F4_HOLD);
     int b0 = buzzes;
@@ -236,8 +256,8 @@ int main() {
     assert(mu_f4_partner_start() == 0);   // Find: the search
 
     // The tab to P2 and the room seats Player 2: the door is a person's, the wait ends, the tab turns again.
-    home(); frame();
-    assert(mu_friends4_partner_cycle(1) == 1 && mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_P2);
+    home(); frame(); want_v = MU_LOBBY_WANT_PROAI; pro_v = MU_LOBBY_PROS - 1;   // the last pro: the next press is P2
+    assert(mu_friends4_partner_cycle(1) == 1 && want_v == MU_LOBBY_WANT_P2);
     assert(sent.size() == 1 && sent[0] == claim);
     room(); frame();
     assert(mu_f4.view.seats[1].kind == MU_LOBBY_KIND_LOCAL && mu_lobby_local_owned(&mu_f4.view));
@@ -297,7 +317,8 @@ class PadsAndInvite(unittest.TestCase):
 using u16 = uint16_t;
 struct PADStatus { u16 button = 0; int stickX = 0; int err = 0; };
 constexpr int PAD_ERR_NO_CONTROLLER = -1, PAD_BUTTON_START = 0x1000, PAD_BUTTON_B = 0x200, PAD_BUTTON_A = 0x100;
-enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3 };
+enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3,
+       MU_LOBBY_WANT_PROAI = 4 };
 struct { int view_ok = 1, partner_source = -1, partner_b_held = 0, partner_want = 0, curtain = 0, cancel_held = 0, cancel_mask = 0; MuLobbyView view{}; } lobby;
 int requests = 0, op = -1, arg = -1;
 int mu_lobby_css() { return 1; }

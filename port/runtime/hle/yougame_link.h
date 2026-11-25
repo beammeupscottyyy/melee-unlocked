@@ -295,7 +295,8 @@ struct Search {
     bool ranked = false;   // the home searched the ranked queue: a best of 3, rated
   } doubles_match;
   // An arena game (slippi_arena.cpp under YouGame): the room players of this game, in ring order (ring slot n
-  // plays port n+1), found in the arena's own room (arena_room below) instead of a room of their own. 2 or 4.
+  // plays port n+1), found in the arena's own room (arena_room below) instead of a room of their own. 2 to 4
+  // (3 only in a free-for-all).
   std::vector<std::string> arena_fighters;
 };
 
@@ -345,6 +346,11 @@ struct FriendsLobby {
   std::shared_ptr<const lobby::Plan> plan;
 };
 FriendsLobby friends_lobby();
+// A match made from connect codes (an Arena room or a Direct game with Pro AI seats) plays a setup its room
+// froze the same way: friends_lobby() returns it while no YouGame Friends lobby is open. nullptr clears it.
+void set_code_match_plan(std::shared_ptr<const lobby::Plan> plan);
+// The plan set above when it is a usable code match (an arena ring with Pro AIs), else null.
+std::shared_ptr<const lobby::Plan> code_plan_now();
 // The game refused the Friends lobby's frozen setup before frame 1: a guest ends that match in the room
 // (lobby::Session::refuse_setup); the host's own call-off follows the park (next_match).
 void lobby_refuse_setup();

@@ -54,6 +54,7 @@
 #include "net_trace.h"
 #include "netplay_state.h"
 #include "early_input.h"
+#include "late_read.h"
 #include "render_options.h"
 #include <algorithm>
 #include <cmath>
@@ -332,7 +333,8 @@ bool g_local_random_stage = false;
 Matchmaking::MatchSearchSettings g_last_search;
 // The next search is an arena game under YouGame (arena_start_yg_search): its fighters and the arena's
 // whole word for the match (a player id, longer than the 18 bytes a typed code gets).
-struct ArenaNext { std::vector<std::string> fighters; std::string code; } g_arena_next;
+struct ArenaNext { std::vector<std::string> fighters; std::string code; bool ffa = false; } g_arena_next;
+bool g_arena_ffa_next = false;   // the next search is an arena free-for-all (arena_start_search)
 // The 4-player Friends lobby (yougame_lobby.h) on the 4-door select: armed by the Friends row (the host
 // holds a room) or an accepted lobby invite (a guest joins its room), until the player leaves it (LEAVE).
 // One Control lasts the whole lobby, across its matches. closed: its search failed or its room closed
@@ -428,6 +430,7 @@ static void stop_early_inputs() {
 }
 static int g_match_delay = 0;
 bool g_in_online_match = false;
+namespace late_read { static void end(); }   // the late controller read (below): a game or its session is over
 // Warm-up room (warmup_park): the pair stays connected while the player is in Training.
 bool g_warmup_parked = false;
 // A kept search (native_practice.cpp, play while searching): the player chose to leave the search screen
@@ -671,6 +674,7 @@ void cleanup_connection(yougame::Leave why = yougame::Leave::Lost) {
   g_setup_hash = {};
   g_play_session_active = false;
   g_in_online_match = false;
+  late_read::end();
 #if MU_SQUAD
   g_squad_costume_match = false;   // the connection is gone: no squad match is set up
   g_squad_match_standards.clear();
@@ -833,7 +837,7 @@ bool should_advance_online_frame(int32_t frame) {
 // game asks for it twice while a match is set up (CMD_GET_DELAY, then the match start block), so the
 // value is latched on the first ask and held until the match ends: both asks must agree.
 static int g_latched_delay = 0;
-static int effective_delay() {
+static int chosen_delay() {
   // The Friends lobby's Start froze one input delay for every machine (yougame_lobby_setup.h).
   if (const auto lobby = yougame::friends_lobby(); lobby.open && lobby.plan && lobby.plan->ok) return lobby.plan->input_delay;
   // MELEE_TEST_AUTO_DELAY=1 (hidden runs, which read no settings file) turns auto on.
@@ -862,6 +866,108 @@ static int effective_delay() {
   g_latched_delay = std::clamp((int)std::lround(ping / 4.0 / 16.683), 2, 4);
   host::log("slippi: auto delay: %s ping %d ms, %d frames", match_ping > 0 ? "match" : "pre-match", ping, g_latched_delay);
   return g_latched_delay;
+}
+
+// ---------------------------------------------------------------- late controller read
+// host/late_read.h says what it is. Here: the game is given one frame less than the chosen delay when
+// the connection has room, and each frame of that match waits between sending its pad and reading
+// the other player's inputs. 1v1 on the Source Port only. Off unless the player turns on "Variable online
+// delay" (owner 11-24: optional, never the default); MELEE_ONLINE_LATE_READ=0/1 overrides it (tests).
+namespace late_read {
+using namespace host::late_read;
+struct Latch { const void* connection = nullptr; int base = 0; bool on = false; };
+static Latch latch;
+static const void* soured = nullptr;   // the connection a game played this way went badly on: not offered there again
+static bool engaged = false;
+static int base_delay = 0;
+static Control control;
+
+static bool enabled() { return host::late_read::enabled(); }   // the setting, or MELEE_ONLINE_LATE_READ
+// Tests: MELEE_TEST_LATE_READ=1 takes it whatever the ping, MELEE_TEST_LATE_HOLD_MS fixes the wait.
+static bool forced() {
+  static const bool on = [] { const char* v = host::test_env::getenv("MELEE_TEST_LATE_READ"); return v && *v == '1'; }();
+  return on;
+}
+static double fixed_hold() {
+  static const double ms = [] { const char* v = host::test_env::getenv("MELEE_TEST_LATE_HOLD_MS"); return v && *v ? std::atof(v) : -1.0; }();
+  return ms;
+}
+
+// The delay the game is given for a chosen delay of `chosen` frames.
+static int offer(int chosen) {
+  if (!enabled() || !host::game_image || chosen < 2 || !g_netplay) return chosen;
+  if (soured == g_netplay.get()) return chosen;
+  if (latch.connection == g_netplay.get() && latch.base == chosen) return latch.on ? chosen - 1 : chosen;
+  if (const auto lobby = yougame::friends_lobby(); lobby.open && lobby.plan && lobby.plan->ok) return chosen;   // one delay for every machine
+  if (g_netplay->GetSlippiConnectStatus() != NetplayClient::ConnectStatus::CONNECTED) return chosen;
+  if (g_netplay->RemoteMachineCount() != 1 || g_netplay->RemotePortCount() != 1 || g_netplay->SecondLocalPort() >= 0 || opponent_runahead()) return chosen;
+  const int match_ping = (int)g_netplay->LastPingMs();
+  const int prematch_ping = g_netplay->PreMatchPingMs();
+  const bool measured = match_ping > 0 || prematch_ping > 0;
+  const int ping = match_ping > 0 ? match_ping : prematch_ping > 0 ? prematch_ping : g_netplay->ConnectionPingMs();
+  bool on = forced();
+  const double work = host::recent_sim_frame_work_ms();
+  if (!on) {
+    if (ping <= 0) return chosen;   // no ping yet: the chosen delay as it is
+    on = has_room(chosen, ping, work) && host::recent_sim_frames_steady();
+    // A busy computer is not a final "no" either: the next ask looks again, the match takes one answer.
+    if (!on && has_room(chosen, ping)) {
+      static unsigned busy_logged = 0;
+      if (busy_logged++ % 300 == 0)
+        host::log("slippi: late controller read: not now, this computer's frames are %s (%.1f ms of work, ping %d ms)",
+                  host::recent_sim_frames_steady() ? "too busy for the wait" : "missing their 60 Hz place, or too few seen yet", work, ping);
+      return chosen;
+    }
+  }
+  // The connection's own estimate starts high and comes down: a "no" from it is not final, the next
+  // ask looks again (the game takes the delay once, when the match starts).
+  if (!on && !measured) return chosen;
+  latch = {g_netplay.get(), chosen, on};
+  host::log("slippi: late controller read: %s (chosen delay %d, ping %d ms)", on ? "on, the game runs one frame less and waits inside each frame" : "off, the connection has no room for it", chosen, ping);
+  return on ? chosen - 1 : chosen;
+}
+
+// Frame 1 of a game: `delay` is what the game took and `chosen` the delay chosen for it. Whenever the
+// game runs one frame less than the chosen delay it came from an answer above, whichever ask the game
+// took it from: the wait is on for that game. No game runs the lower delay without it.
+static void begin(int delay, int chosen) {
+  if (engaged && delay == base_delay - 1) return;   // frame 1 again, while the game waits for the other player
+  engaged = enabled() && host::game_image && g_netplay && chosen >= 2 && delay == chosen - 1;
+  base_delay = engaged ? chosen : 0;
+  control.reset();
+}
+static void end() {
+  if (engaged && control.frames())
+    host::log("slippi: late controller read: this game waited %.1f ms a frame on average, so presses showed %.1f ms sooner than with delay %d",
+              control.average_hold_ms(), control.saved_ms(), base_delay);
+  if (engaged && g_netplay && control.went_badly()) {
+    soured = g_netplay.get();
+    host::log("slippi: late controller read: not offered again to this opponent (%llu pads came after their frame had started, %llu of %llu frames had no room for the wait)",
+              (unsigned long long)control.late_arrivals(), (unsigned long long)control.short_frames(), (unsigned long long)control.frames());
+  }
+  engaged = false; base_delay = 0; latch = {};
+}
+
+// After this frame's pad went out, before the other player's inputs are read.
+static void hold(int32_t frame, bool advancing) {
+  if (!engaged || !g_netplay) return;
+  double early = 0.0;
+  const bool have_early = g_netplay->RemotePadEarlyMs(frame, &early);
+  const double wait = control.step(frame, have_early, early, host::last_sim_frame_work_ms(), host::last_sim_frame_late(), fixed_hold());
+  double waited = 0.0;
+  if (!advancing) waited = host::tick_hold(wait / 1000.0) * 1000.0;   // a frame run to catch up does not wait
+  control.note_waited(waited);
+  if (control.frames() % 600 == 0)
+    host::log("slippi: late controller read: wait %.1f ms now (%.1f waited this frame), %.1f on average; remote pads at least %.1f ms early without it; work %.1f ms; %.1f ms sooner than delay %d",
+              wait, waited, control.average_hold_ms(), control.least_early_ms(), control.work_ms(), control.saved_ms(), base_delay);
+}
+}  // namespace late_read
+
+// The delay the game is given: the chosen one, or one less with the late controller read. While a
+// game runs it is the delay that game took.
+static int effective_delay() {
+  if (g_in_online_match && late_read::engaged) return late_read::base_delay - 1;
+  return late_read::offer(chosen_delay());
 }
 
 void prepare_opponent_inputs(int32_t frame, bool should_skip, std::vector<uint8_t>& q) {
@@ -1046,7 +1152,9 @@ void handle_online_inputs(const uint8_t* payload, uint32_t size, std::vector<uin
     if (yougame::session()) yougame::game_started(g_game_facts.rng, g_game_facts.stage);   // the room records this game's result
 #endif
     host::log("slippi: online game starts, delay %d frames, direct peer to peer", (int)delay);
+    const int chosen_for_game = chosen_delay();
     g_latched_delay = (int)delay;   // the delay the game took: every later answer this match agrees with it
+    late_read::begin((int)delay, chosen_for_game);
     g_in_online_match = true;
     g_friends_lobby.note.clear();
     gecko_session::match_started();   // the agreed Gecko codes, decided from both locks
@@ -1104,6 +1212,7 @@ void handle_online_inputs(const uint8_t* payload, uint32_t size, std::vector<uin
         g_netplay->SecondLocalPort() >= 0 ? std::make_unique<Pad>(frame + delay, finalized, finalized_checksum, payload + 27) : nullptr);
     host::early_input::note_sent_pad(frame + delay, inputs);
     host::input_note_pad_frame(frame);
+    late_read::hold(frame, g_currently_advancing || g_frames_to_advance > 0);
   }
   prepare_opponent_inputs(frame, skip, q);
   host::early_input::note_frame_done(skip, !q.empty() && q[0] == 4, inputs);
@@ -1232,6 +1341,8 @@ void start_find_match(const uint8_t* payload, const std::string& friend_room = {
   sj.erase(std::find(sj.begin(), sj.end(), '\0'), sj.end());
   const ArenaNext arena = std::move(g_arena_next);
   g_arena_next = ArenaNext{};
+  search.arena_ffa = g_arena_ffa_next || arena.ffa;
+  g_arena_ffa_next = false;
   if (!arena.fighters.empty()) {
     // An arena game under YouGame: the arena's room carries it. Not a code the player typed, so it
     // stays out of the recent codes, and a pending Discord join is left for the player's own Direct.
@@ -1486,6 +1597,16 @@ int build_verdict(uint8_t remote_count, std::string* why) {
   const bool lobby_match = lobby.open && lobby.plan && lobby.plan->ok;
   for (int i = 0; i < remote_count; ++i) {
     const auto rb = g_netplay->GetRemoteBuild(i);
+    if (g_last_search.arena_ffa && !rb.arena_ffa) {
+      // A free-for-all: a peer whose build has none would start a teams game (desync at best). A
+      // build message still on its way gets the usual wait.
+      const uint64_t since = g_netplay->ConnectedAtMs();
+      const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (!rb.received && !(since != 0 && now - since >= kBuildWaitMs)) { waiting = true; continue; }
+      *why = "A player's game can't play a free-for-all. Everyone needs the latest Melee Unlocked.";
+      return -1;
+    }
     if (lobby_match) {
       if (lobby.plan->humans != lobby.plan->machines && rb.received && !mu_local_partner_capable(rb.caps2)) {
         *why = "A player's game can't play local partners. Everyone needs the latest Melee Unlocked.";
@@ -1946,6 +2067,7 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
   std::string setup_budget;           // with them, this side's squad budget identity (setup hash only)
   std::array<int, PLAYER_COUNT_MAX> lobby_colors;   // a Doubles lobby match: each machine's colour, by port
   lobby_colors.fill(-1);
+  std::vector<PlayerSelections> code_picks;   // a code match: each port's selections as sent (people's picks)
   if (local_ready && remote_ready) {
     bool decider = g_netplay->IsDecider();
     uint8_t remote_count = bounded_remote_machine_count();
@@ -1970,6 +2092,8 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
       // including local partners; readiness above still waits for each real connection's lock-in.
       frozen_selections.resize(lobby_plan->humans);
       for (int port = 0; port < lobby_plan->humans; ++port) {
+        // A code match: a person's own pick stands (their selections); only a Pro AI seat's is the setup's.
+        if (lobby_plan->code_match && lobby_plan->port[port].pro < 0 && ordered[port]) continue;
         auto& pick = frozen_selections[port];
         pick.player_idx = uint8_t(port); pick.character_id = uint8_t(lobby_plan->port[port].pick.ch);
         pick.character_color = uint8_t(lobby_plan->port[port].pick.color);
@@ -1990,6 +2114,7 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
     }
     std::vector<PlayerSelections> sent_selections;   // as sent, before the game's overwrites (setup hash)
     for (auto* o : ordered) sent_selections.push_back(*o);
+    code_picks = sent_selections;
     for (size_t i = 0; i < g_overwrite_selections.size() && i < ordered.size(); ++i) {
       ordered[i]->character_id = g_overwrite_selections[i].character_id;
       ordered[i]->character_color = g_overwrite_selections[i].character_color;
@@ -2073,12 +2198,19 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
       }
     }
     rng_offset = decider ? lps.rng_offset : rps[0].rng_offset;
+    // An arena free-for-all: a Teams search played with teams off (every fighter their own team) on a
+    // stage from the doubles list, drawn from the seed every peer agrees on (no stage select).
+    const bool arena_ffa = g_last_search.arena_ffa;
+    if (arena_ffa) {
+      stage_id = stage_pool::agreed_stage(rng_offset, true);
+      alt_stage_mode = 0;
+    }
     uint8_t first_team = ordered[0]->team_id;
     bool all_same_team = true;
     for (auto* s : ordered) if (s->team_id != first_team) all_same_team = false;
     static const uint8_t perms[6][4] = {{0, 0, 1, 1}, {1, 1, 0, 0}, {0, 1, 1, 0}, {1, 0, 0, 1}, {0, 1, 0, 1}, {1, 0, 1, 0}};
     const uint8_t* team_assign = perms[rng_offset % 6];
-    bool teams = g_last_search.mode == Matchmaking::TEAMS;
+    bool teams = g_last_search.mode == Matchmaking::TEAMS && !arena_ffa;
     std::array<int, PLAYER_COUNT_MAX> room_teams;
     room_teams.fill(-1);
     std::array<int, 2> team_color{{0, 1}};   // Doubles: the colour each room team wears (team_colors)
@@ -2131,6 +2263,7 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
     }
 #endif
     setup_inputs = setup_inputs_hash(sent_selections, room_teams.data(), room_teams_known, setup_squad);
+    if (arena_ffa) setup_inputs = mu_fnv64_u8(setup_inputs, 0xFA);   // a peer not playing a free-for-all refuses the match
     // The block is kept between matches, and a Friends lobby setup writes bytes no other match does
     // (P1/P2 slot types, CPU kind and level, the rules bit): back to the shipped block's first. They
     // are hashed, so two machines with different pasts would otherwise refuse the match.
@@ -2179,7 +2312,8 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
     // instance test logs show the teams, characters and stage every peer agreed on.
     {
       char setup[160];
-      int len = std::snprintf(setup, sizeof setup, "teams %d stage %u rng %08X:", teams ? 1 : 0, (unsigned)stage_id, rng_offset);
+      int len = std::snprintf(setup, sizeof setup, "%steams %d stage %u rng %08X:", arena_ffa ? "free-for-all " : "", teams ? 1 : 0,
+                              (unsigned)stage_id, rng_offset);
       for (int i = 0; i < PLAYER_COUNT_MAX && len > 0 && len < (int)sizeof setup; ++i)
         if (block[0x61 + i * 0x24] == 0)
           len += std::snprintf(setup + len, sizeof setup - len, " P%d char %u color %u team %u", i + 1, block[0x60 + i * 0x24],
@@ -2223,7 +2357,19 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
     // Doubles: the room's pairs wear the colours their players chose (lobby::doubles_colors). Hashed with
     // the block: a machine that mapped other colours refuses the match, never plays a different one.
     const auto team_colors = yougame::lobby::doubles_colors(*lobby_plan, lobby_colors);
-    yougame::lobby::apply(*lobby_plan, block.data(), block.size(), timer, g_lobby_costumes.data(), &team_colors);
+    if (lobby_plan->code_match) {
+      // A code match: each person's own pick from the select (sent_selections, by port); the Pro AI seats
+      // keep the setup's. Hashed with the block, so a machine with other picks refuses the match.
+      yougame::lobby::Plan picked = *lobby_plan;
+      for (int port = 0; port < picked.humans && port < (int)code_picks.size(); ++port) {
+        if (picked.port[port].pro >= 0) continue;
+        picked.port[port].pick.ch = code_picks[port].character_id;
+        picked.port[port].pick.color = code_picks[port].character_color;
+      }
+      yougame::lobby::apply(picked, block.data(), block.size(), timer, g_lobby_costumes.data(), &team_colors);
+    } else {
+      yougame::lobby::apply(*lobby_plan, block.data(), block.size(), timer, g_lobby_costumes.data(), &team_colors);
+    }
     rng_offset = lobby_plan->seed;
     alt_stage_mode = 0;
     setup_inputs = yougame::lobby::inputs_hash(*lobby_plan);
@@ -2406,6 +2552,7 @@ void handle_report_game(const uint8_t* p) {
   }
   stop_early_inputs();
   g_latched_delay = 0;   // the next match picks its delay from its own ping
+  late_read::end();
   trace_end_match();
   // Source publishes its Game End record in h_replay_event, except a duel's TIME!, which this
   // report decides (yougame_ranked.h time_out_waits_for_report). A disconnect or desync in the
@@ -2935,8 +3082,10 @@ ArenaMatchStatus arena_match_status() {
 }
 
 bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t character, uint8_t color,
-                        uint8_t team, std::string* error) {
+                        uint8_t team, bool ffa, std::string* error) {
+  host::log("slippi: arena search: mode %d, code %s, locked %d, ffa %d", mode, code.c_str(), locked ? 1 : 0, ffa ? 1 : 0);
   if (mode != Matchmaking::DIRECT && mode != Matchmaking::TEAMS) return false;
+  if (ffa && mode != Matchmaking::TEAMS) return false;
   if (!g_user) init();
   if (session_mode() >= 0 || g_warmup_parked) {
     if (error) *error = g_warmup_parked ? "Warming up: go back to your match first" : "An online session is already active";
@@ -2956,7 +3105,9 @@ bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t 
   find[0] = (uint8_t)mode;
   const std::string sjis = utf8_to_shiftjis(code);
   std::memcpy(find + 1, sjis.data(), std::min<size_t>(18, sjis.size()));
+  g_arena_ffa_next = ffa;
   start_find_match(find);
+  g_arena_ffa_next = false;   // refused before the search read it: never carried to the player's next search
   if (!g_forced_error.empty()) {
     if (error) *error = g_forced_error;
     return false;
@@ -2965,14 +3116,14 @@ bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t 
 }
 
 bool arena_start_yg_search(int mode, const std::vector<std::string>& fighters, const std::string& code, bool locked,
-                           uint8_t character, uint8_t color, uint8_t team, std::string* error) {
-  if (fighters.size() != 2 && fighters.size() != 4) return false;
+                           uint8_t character, uint8_t color, uint8_t team, bool ffa, std::string* error) {
+  if (fighters.size() < 2 || fighters.size() > 4) return false;
   if (!yougame::session()) {
     if (error) *error = "The arena needs a YouGame sign-in";
     return false;
   }
-  g_arena_next = {fighters, utf8_to_shiftjis(code)};
-  const bool ok = arena_start_search(mode, code, locked, character, color, team, error);
+  g_arena_next = {fighters, utf8_to_shiftjis(code), ffa};
+  const bool ok = arena_start_search(mode, code, locked, character, color, team, ffa, error);
   g_arena_next = ArenaNext{};   // refused before the search read it: never carried to the player's next search
   return ok;
 }
@@ -2991,7 +3142,10 @@ std::unique_ptr<Matchmaking> arena_matchmaking() {
   // Room links search on their own (not through start_find_match): they need this game's own hold on
   // Windows networking (the spectator server lets go of its own when it cannot open its port).
   if (!enet_ready()) return nullptr;
-  return g_user ? std::make_unique<Matchmaking>(g_user.get()) : nullptr;
+  if (!g_user) return nullptr;
+  auto mm = std::make_unique<Matchmaking>(g_user.get());
+  mm->SetRoomLink(true);
+  return mm;
 }
 
 bool arena_pop_from_match(std::vector<uint8_t>& out) { return g_netplay && g_netplay->PopArena(out); }
@@ -3602,6 +3756,31 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
     // Disable the console's second offline queue so inputs are delayed once.
     case CMD_GET_DELAY: q.clear(); q.push_back(session_mode() >= 0 ? 1 : 0);
       q.push_back(session_mode() >= 0 ? (uint8_t)effective_delay() : 0); return true;
+    // This machine's Pro AI seat in the match it plays (shim/mu_online.c drives its partner pad from the
+    // model): active, the seat's port, its pro. Asked once per match. A room's Pro AI seat says so in the
+    // setup; the YouGame Friends Doubles home's Pro AI partner is the Player 2 seat Rooms gave this machine
+    // (id local:<connection>:1), named by the shim (payload: the pro, 0xFF none). Rooms never knows it is a
+    // model: the seat goes out as any Player 2's pad, so nothing else changes on any machine.
+    case CMD_PROAI_SEAT: {
+      q.assign(3, 0);
+      const uint8_t friends_pro = payload_len >= 1 ? payload[0] : 0xFF;
+      const auto lobby = yougame::friends_lobby();
+      const auto* p = lobby.open && lobby.plan && lobby.plan->ok ? lobby.plan.get() : nullptr;
+      const int second = p ? p->second_local_port : -1;
+      const bool in_setup = p && second >= 0 && second < p->ports;
+      const char* how = "none here";
+      if (in_setup && session_mode() >= 0 && p->port[second].pro >= 0) {
+        q[0] = 1; q[1] = (uint8_t)second; q[2] = (uint8_t)p->port[second].pro;
+        how = "the room's Pro AI seat";
+      } else if (in_setup && session_mode() >= 0 && friends_pro < 0x80 && p->port[second].local_index == 1 &&
+                 p->port[second].id.rfind("local:", 0) == 0) {
+        q[0] = 1; q[1] = (uint8_t)second; q[2] = friends_pro;
+        how = "the Friends partner, Player 2's seat";
+      }
+      host::log("slippi: Pro AI seat asked: setup %d, second local port %d, session %d, partner pro %d -> %s",
+                p ? 1 : 0, second, session_mode(), friends_pro == 0xFF ? -1 : (int)friends_pro, how);
+      return true;
+    }
     // Ranks: YouGame mode answers with its ladder rank; standalone never shows one (visibility 0
     // hides every rank display; the rest reads as unranked).
     case CMD_GET_RANK:

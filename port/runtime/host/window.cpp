@@ -1373,6 +1373,7 @@ std::array<PortSource, 4> g_port_feeding{};
 std::mutex g_last_pads_mutex;
 PadState g_last_pads[4]{};
 std::atomic<uint16_t> g_test_hold{0};   // input_test_hold (tests only)
+static void midtick_note_poll();   // the mid-tick test press (below, with input_changed_since_poll)
 
 namespace {
 bool g_capture_key_baseline[256]{};
@@ -2552,6 +2553,7 @@ void input_poll(PadState out[4]) {
     if (latency_trace_enabled()) note_script_presses(out);
     route_takeover(out);
     if (const uint16_t held = g_test_hold.load(std::memory_order_relaxed)) { out[0].button |= held; out[0].err = 0; }
+    midtick_note_poll();
     // Scripted runs took this return before the overlay's copy was made below, so the controller
     // overlay stayed blank whenever a script was driving. It is the only way to see the overlay
     // without a controller in hand, so keep it fed here too.
@@ -2655,6 +2657,60 @@ bool input_keyboard_button_label(int port, uint16_t pad_button, char* out, size_
   for (size_t i = 0; i < (size_t)BindAction::Count; ++i)
     if (kActionPadBit[i] == pad_button) { vk = g_key_bindings.vk[i]; break; }
   return vk != 0 && short_key_name(vk, out, n);
+}
+
+// Mid-tick test press and change detection for the tick re-run (host.h).
+static double g_midtick_inject = 0.0;        // when the test press went down or up, until a poll has read it
+static uint16_t g_midtick_polled = 0;        // the test hold as the last poll saw it
+static void midtick_note_poll() {
+  const uint16_t held = g_test_hold.load(std::memory_order_relaxed);
+  if (held != g_midtick_polled && g_midtick_inject > 0.0) {
+    TickTiming& tick = tick_timing();
+    tick.probe = tick.probe + 1;
+    tick.probe_inject = g_midtick_inject;
+    tick.probe_pad = now_seconds();
+    g_midtick_inject = 0.0;
+  }
+  g_midtick_polled = held;
+}
+struct MidtickTest {
+  unsigned every = 0, shift = 0; double offset = 0.0;   // <every n ticks>:<ms into the tick>[:<ticks earlier>]
+  MidtickTest() { if (const char* v = host::test_env::getenv("MELEE_TEST_MIDTICK_PRESS")) { double ms = 0; if (std::sscanf(v, "%u:%lf:%u", &every, &ms, &shift) >= 2) offset = ms / 1000.0; else every = 0; } }
+};
+// Read on first use, through the test switch policy (a release session reads no test switches).
+static const MidtickTest& midtick_test() { static const MidtickTest t; return t; }
+bool input_midtick_test() { return midtick_test().every != 0; }
+bool input_changed_since_poll(double tick_start) {
+  const MidtickTest& g_midtick_test = midtick_test();
+  if (g_midtick_test.every) {
+    // Down on every n-th tick, up six ticks later, both at the same point inside the tick. Matches only.
+    static uint32_t fired = 0;
+    const uint32_t tick = retrace_count();
+    uint32_t major = 0, minor = 0, match_frame = 0;
+    current_scene(&major, &minor, &match_frame);
+    const uint32_t phase = (tick + g_midtick_test.shift) % g_midtick_test.every;
+    if (match_frame > 120 && tick != fired && (phase == 0 || phase == 6) && now_seconds() - tick_start >= g_midtick_test.offset) {
+      fired = tick;
+      g_test_hold.store(phase == 0 ? PAD_X : 0, std::memory_order_relaxed);
+      g_midtick_inject = now_seconds();
+    }
+    return g_test_hold.load(std::memory_order_relaxed) != g_midtick_polled;
+  }
+  if (input_script_active()) return false;
+  PadState now[4], last[4];
+  for (auto& p : now) { p = {}; p.err = -1; }
+  input_read_devices(now);
+  input_last_pads(last);
+  for (int port = 0; port < 4; ++port) {
+    if (now[port].err != 0 || last[port].err != 0) continue;
+    if (now[port].button != last[port].button) return true;
+    // Sticks and triggers: a move of 12 steps or more since the poll (a flick, not drift or noise).
+    if (std::abs(now[port].stick_x - last[port].stick_x) >= 12 || std::abs(now[port].stick_y - last[port].stick_y) >= 12 ||
+        std::abs(now[port].sub_x - last[port].sub_x) >= 12 || std::abs(now[port].sub_y - last[port].sub_y) >= 12 ||
+        std::abs((int)now[port].trig_l - (int)last[port].trig_l) >= 24 || std::abs((int)now[port].trig_r - (int)last[port].trig_r) >= 24)
+      return true;
+  }
+  return false;
 }
 
 void input_read_devices(PadState out[4]) {

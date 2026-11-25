@@ -6574,11 +6574,16 @@ bool select_variant_live(const std::string& slot, const std::string& asset_id, s
   return select_live_locked(slot, asset_id, error);
 }
 
-// Nana's costume slot for one of Popo's (the same place in each one's costume order), or empty.
+// The costume slot that goes with one picked on the character select, or empty: Nana's for one of Popo's
+// (the same place in each one's costume order), and Zelda's and Sheik's of the same color for each other,
+// since Zelda becomes Sheik in the match (Silky 11-24: an Animelee Zelda pick left Sheik standard).
 static std::string climber_partner(const std::string& target) {
   static constexpr const char* popo[] = {"PlPpNr.dat", "PlPpGr.dat", "PlPpOr.dat", "PlPpRe.dat"};
   static constexpr const char* nana[] = {"PlNnNr.dat", "PlNnYe.dat", "PlNnAq.dat", "PlNnWh.dat"};
   for (size_t i = 0; i < std::size(popo); ++i) if (lower(target) == lower(popo[i])) return nana[i];
+  const std::string name = lower(target);
+  if (name.size() == 10 && name.compare(0, 4, "plzd") == 0) return "PlSk" + target.substr(4);
+  if (name.size() == 10 && name.compare(0, 4, "plsk") == 0) return "PlZd" + target.substr(4);
   return {};
 }
 

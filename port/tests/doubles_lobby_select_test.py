@@ -473,6 +473,23 @@ class PartnerPortrait(unittest.TestCase):
         claim = body(self.inc, 'static int mu_f4_p2_claim(const char* why)')
         self.assertIn('const unsigned char claim[2] = { MU_LOBBY_OP_LOCAL_SEAT, 1 };', claim)
 
+    def test_pro_ai_partner_is_player_2s_seat_played_by_the_model(self):
+        # 11-23: the tab's Pro AI claims the same local seat as P2 (nothing new on the wire), steps through the
+        # pros, puts the door's coin on the pro's fighter, and the match asks the host for that seat's port.
+        cycle = body(self.inc, 'static int mu_friends4_partner_cycle(u8 door)')
+        self.assertIn('if (next == MU_LOBBY_WANT_PROAI && s->kind == MU_LOBBY_KIND_OPEN) mu_f4_p2_claim("tab, Pro AI");', cycle)
+        self.assertIn('mu_lobby_set_partner_pro(mu_lobby_partner_pro() + 1);', cycle)
+        nxt = body(self.inc, 'static int mu_f4_want_next(int want)')
+        for a, b in (('FIND', 'INVITE'), ('INVITE', 'PROAI'), ('PROAI', 'P2'), ('P2', 'CPU')):
+            self.assertIn(f'case MU_LOBBY_WANT_{a}: return MU_LOBBY_WANT_{b};', nxt)
+        door = body(self.inc, 'static void mu_f4_proai_door(CSSData* css)\n')
+        self.assertIn('mu_f4_draw(css, 1, &s);', door)
+        self.assertIn('if (mu_lobby_local_owned(&mu_f4.view) && mu_lobby_partner_want() == MU_LOBBY_WANT_PROAI) mu_f4_proai_door(css);', self.inc)
+        online = (ROOT / 'sourceport/game/shim/mu_online.c').read_text(encoding='utf-8')
+        self.assertIn('command_into(CMD_PROAI_SEAT, &friends_pro, 1,', online)
+        host = (ROOT / 'port/runtime/hle/slippi_online.cpp').read_text(encoding='utf-8')
+        self.assertIn('p->port[second].id.rfind("local:", 0) == 0', host)
+
 
 class TwoDoorsOnTheLeft(unittest.TestCase):
     """Build 95 (report e22413bd: "2 potraits should be all the way on the left ... The UI shouldn't change
@@ -606,8 +623,9 @@ static struct { int shut, shut_count, shut_texts; HSD_JObj* shut_jobj[MU_F4_SHUT
     HSD_DObj* plate[2]; unsigned plate_was[2]; int plates;
     HSD_Text* panel; char panel_drawn[MU_F4_PANEL_SUBS][40]; GXColor panel_color[MU_F4_PANEL_SUBS];
     unsigned panel_draws, panel_frame; } mu_f4;
-enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3 };
+enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3, MU_LOBBY_WANT_PROAI = 4 };
 static int curtain, want_v;
+static const char* mu_lobby_partner_pro_name(void) { return "Falco (Pro AI)"; }
 static int mu_lobby_curtain(void) { return curtain; }
 static int mu_lobby_partner_want(void) { return want_v; }
 /* The panel names the player's own keys; here no keyboard is bound, so the controller words stay. */
@@ -771,6 +789,8 @@ int main(void)
           LINES("Character selected", 2, "Waiting for players", 1, "Partner: Player 2", 1), "Tab changes partner", "");
     check(&v, MU_LOBBY_HINT_START_PARTNER, 0, MU_LOBBY_WANT_CPU, "",
           LINES("Character selected", 2, "Waiting for players", 1, "Partner: CPU", 1), "Tab changes partner", "");
+    check(&v, MU_LOBBY_HINT_START_PARTNER, 0, MU_LOBBY_WANT_PROAI, "",   /* the Pro AI sitting down */
+          LINES("Character selected", 2, "Waiting for players", 1, "Partner: Falco (Pro AI)", 1), "Tab changes partner", "");
     v.flags |= MU_LOBBY_F_INVITING;
     check(&v, MU_LOBBY_HINT_START_PARTNER, 0, MU_LOBBY_WANT_INVITE, "",
           LINES("Character selected", 2, "Waiting for players", 1, "Inviting a friend", 1), "Press B to cancel", "");
@@ -781,6 +801,8 @@ int main(void)
     v.seats[1].kind = MU_LOBBY_KIND_LOCAL;
     check(&v, MU_LOBBY_HINT_START_SEARCH, 0, MU_LOBBY_WANT_P2, "",
           LINES("Character selected", 2, "Press START to search", 1, "Partner: Player 2", 2), "Tab changes partner", "");
+    check(&v, MU_LOBBY_HINT_START_SEARCH, 0, MU_LOBBY_WANT_PROAI, "",   /* the Pro AI in Player 2's seat */
+          LINES("Character selected", 2, "Press START to search", 1, "Partner: Falco (Pro AI)", 2), "Tab changes partner", "");
     v.seats[1].kind = MU_LOBBY_KIND_HUMAN; strcpy(v.seats[1].name, "Fox (main)");
     check(&v, MU_LOBBY_HINT_START_SEARCH, 0, MU_LOBBY_WANT_FIND, "",   /* a friend: the tab is locked */
           LINES("Character selected", 2, "Press START to search", 1, "Partner: Fox  main ", 2), "", "");

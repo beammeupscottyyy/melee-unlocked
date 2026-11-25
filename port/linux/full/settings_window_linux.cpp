@@ -23,7 +23,7 @@
 namespace app {
 
 namespace {
-constexpr int kBaseWidth = 620, kBaseHeight = 700;
+constexpr int kBaseWidth = 860, kBaseHeight = 700;   // 860: the hover descriptions fit (tyler631 11-24: cut off at 620)
 
 // MELEE_TEST_SETTINGS_SHOT=<file.bmp> (tests): a few frames hidden, the last one written, then out.
 void save_test_shot(const std::string& path, int w, int h) {

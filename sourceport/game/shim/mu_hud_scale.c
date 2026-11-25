@@ -119,6 +119,8 @@ static int mu_nana_damage(int slot)
 void mu_hud_report(void)
 {
     int slot;
+    void mu_redo_after_render(void);
+    mu_redo_after_render();   /* tick re-run (shim/mu_redo.c): the frame is drawn, keep the state */
     for (slot = 0; slot < 4; slot++) {
         float x = 0.0f, y = 0.0f;
         const int present = Player_GetPlayerSlotType(slot) != Gm_PKind_NA;

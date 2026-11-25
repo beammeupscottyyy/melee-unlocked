@@ -20,6 +20,8 @@ enum Cmd : uint8_t {
   CMD_CLEANUP_CONNECTION = 0xBA, CMD_SEND_CHAT_MESSAGE = 0xBB, CMD_GET_NEW_SEED = 0xBC, CMD_REPORT_GAME = 0xBD, CMD_FETCH_CODE_SUGGESTION = 0xBE,
   CMD_OVERWRITE_SELECTIONS = 0xBF, CMD_GP_COMPLETE_STEP = 0xC0, CMD_GP_FETCH_STEP = 0xC1, CMD_REPORT_SET_COMPLETE = 0xC2,
   CMD_GET_PLAYER_SETTINGS = 0xC3, CMD_REPORT_MATCH_STATUS_UPDATE = 0xC4, CMD_GET_DELAY = 0xD5,
+  // This fork: this machine's Pro AI seat in the match (reply: active, port, pro), shim/mu_online.c.
+  CMD_PROAI_SEAT = 0xC6,
   CMD_GET_RANK = 0xE3, CMD_FETCH_RANK = 0xE4, CMD_GET_RANK_VISIBILITY = 0xE5,
   // This fork's empty-payload query (0xF0-0xF9 belong to the Source Port host): flags bit 0
   // offers Ranked, bit 1 Friends, bit 2 Ranked presentation; then six 128-byte game-text lines
@@ -106,6 +108,8 @@ inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t 
     case CMD_GET_PLAYER_SETTINGS: case CMD_GET_DELAY: case CMD_GET_RANK:
     case CMD_FETCH_RANK: case CMD_GET_RANK_VISIBILITY:
     expected = 0; break;
+    // The match's Pro AI query: one byte, the Friends Doubles partner's pro (0xFF none); none from older shims.
+    case CMD_PROAI_SEAT: return payload_len == 0 || (payload_len == 1 && payload);
     // 0xFA is two commands: the online menu's Ranked query (no payload) and the replay viewer's gate
     // (shim/mu_replay.c CMD_REPLAY_GATE: the next frame, then 0 ask or 1 restore). Refusing the gate's
     // five bytes left every replay control dead: pause, jumps, fast forward and take over (1.0 report).

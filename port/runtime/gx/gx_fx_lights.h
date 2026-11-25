@@ -14,7 +14,10 @@ struct Frame;
 // The draw's TEV (colour combiner) for one texel: what the surface shows under neutral light. Only
 // texmap `own_map` is the given texel (other textures read white), the rasterized colour is `ras`
 // (0..255); comparison modes are taken as plain adds. Output RGBA 0..255.
-void tev_texel(const DrawCall& d, int own_map, const float texel[4], const float ras[4], float out[4]);
+// map2/texel2: a second texture's texel (same coordinates); fighter_surface: stop before the first stage
+// that reads the rasterized (lit) colour, skip stages reading any other texture; returns the stages run.
+int tev_texel(const DrawCall& d, int own_map, const float texel[4], const float ras[4], float out[4],
+              int map2 = -1, const float* texel2 = nullptr, bool fighter_surface = false);
 
 // A bright effect as a small sphere light: its world-space centre and size, its colour (linear 0..1,
 // weighted by how it adds to the picture) and a rank for keeping the brightest.

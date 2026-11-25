@@ -36,11 +36,23 @@ class ArrivalPresentWiringTest(unittest.TestCase):
         backend = source("port/runtime/gx/threaded_backend.cpp")
         self.assertIn("const bool may_wait = arrival_exact_on && authored && !interpolate && (cap_period <= 0.0 || (handover_present && vrr == 1)) &&", backend)
         self.assertIn("if (pair_pending && current.sequence != rendered_sequence && !interpolate && t <= kArrivalPhase) {", backend)
-        self.assertIn("constexpr double kArrivalPhase = 0.0015 / SIM_PERIOD;", backend)
+        self.assertIn('return (v && *v ? std::atof(v) : 1.5) / 1000.0 / SIM_PERIOD; }();', backend)
         # Every path that does not present the frame as drawn pairs before it uses the solver.
         self.assertIn("if (!arrival_exact) pair_now(true);", backend)
         drain = backend[backend.index("if (frames[cur].sequence != rendered_sequence && queue.size() > 0) {"):]
         self.assertTrue(drain.lstrip().split("\n")[1].strip().startswith("pair_now(true);"))
+
+    def test_capped_variable_refresh_presents_on_arrival_and_levels_the_two_kinds(self):
+        backend = source("port/runtime/gx/threaded_backend.cpp")
+        # On unless switched off, and only ever used on a display found to follow the frames.
+        self.assertIn("static const bool handover_env = [] { const char* v = std::getenv(\"MELEE_PRESENT_ON_HANDOVER\"); return !(v && *v == '0'); }();", backend)
+        self.assertIn("handover_now = handover_present && vrr == 1 && !reflex_pacing && cap_period > 0 && current.sequence != rendered_sequence;", backend)
+        # A frame shown as drawn is held to the usual ready point by default; at once and the late edge are test switches.
+        self.assertIn("return v && *v == '0' ? 0 : v && *v == 'l' ? 2 : 1; }();", backend)
+        self.assertIn("static const bool kind_level = [] { const char* v = std::getenv(\"MELEE_KIND_LEVEL\"); return !(v && *v == '0'); }();", backend)
+        self.assertIn("repeat_shift = std::min(std::max(repeat_shift + 0.02 * (kind_lag[0] - kind_lag[1]), -0.003), 0.003);", backend)
+        d3d12 = source("port/runtime/gx/gx_d3d12.cpp")
+        self.assertIn("const double shown = std::max(gpu_end, slot_present_[slot_]);", d3d12)
 
     def test_ledger_is_off_without_its_switch(self):
         host = source("port/runtime/host/host.cpp")
