@@ -541,6 +541,25 @@ void scan_installed() {
   if (g_main) InvalidateRect(g_main, nullptr, FALSE);
 }
 void rescan() { std::lock_guard<std::mutex> lock(g_install_mutex); scan_installed(); }
+// The one whole-disc mod switched On (ACE, Akaneia, an m-ex build, a code mod): the big PLAY starts it the way its Mods
+// row's Play does (owner 11-24: "the play button need to auto play the source port with ace"). Before, PLAY always
+// started the normal game while the status line said "Mod (1) active: ACE". Layers (20XX TE, TM-CE, asset mods) load
+// inside the normal game, so they are not counted; two discs On start neither (which one is not ours to guess).
+bool disc_for_play(const std::string& selected, std::string* iso, std::string* key, std::string* kind, std::string* engine) {
+  const View current = view();
+  if (!current.ready) request_view();
+  const Installed* pick = nullptr;
+  int discs = 0;
+  for (const auto& entry : current.installed) {
+    const auto& m = entry.second;
+    if (!m.enabled || m.copy || !runs_here(m) || m.kind == "te" || m.kind == "tmce" || m.kind == "asset_mod") continue;
+    if (catalog_core::play_engine(m, selected).empty()) continue;
+    pick = &m; ++discs;
+  }
+  if (discs != 1) return false;
+  *iso = pick->path; *key = pick->key; *kind = pick->kind; *engine = catalog_core::play_engine(*pick, selected);
+  return true;
+}
 std::string summary() {
   std::string packs;
   int on = 0;

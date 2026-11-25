@@ -157197,10 +157197,15 @@ index 4d3dfce69..40115112d 100644
              ip->xDD4_itemVar.clinkmilk.x0 = parent;
              Item_8026AB54(item_gobj, parent, bone);
 diff --git a/src/melee/it/kinds/itcoin.c b/src/melee/it/kinds/itcoin.c
-index 8e0971304..72413df40 100644
+index 8e0971304..d0ef4460b 100644
 --- a/src/melee/it/kinds/itcoin.c
 +++ b/src/melee/it/kinds/itcoin.c
-@@ -2,6 +2,7 @@
+@@ -1,7 +1,12 @@
+ #include "itcoin.h"
++#ifdef MU_NATIVE
++#include <dolphin/mtx.h>
++#include <dolphin/os.h>
++#endif
  
  #include <melee/it/forward.h>
  
@@ -157208,7 +157213,7 @@ index 8e0971304..72413df40 100644
  #include <melee/cm/camera.h>
  #include <melee/gm/gm_unsplit.h>
  #include <melee/gr/grfigureget.h>
-@@ -59,10 +60,10 @@ ItemStateTable it_803F93C8[] = {
+@@ -59,10 +64,10 @@ ItemStateTable it_803F93C8[] = {
        itCoin_UnkMotion5_Coll },
  };
  
@@ -157221,7 +157226,7 @@ index 8e0971304..72413df40 100644
      HSD_JObj* jobj = GET_JOBJ(gobj)->child;
  
      if (ip->xDD4_itemVar.coin.x4 != 0) {
-@@ -141,7 +142,7 @@ bool itCoin_UnkMotion0_Coll(Item_GObj* gobj)
+@@ -141,7 +146,7 @@ bool itCoin_UnkMotion0_Coll(Item_GObj* gobj)
      return false;
  }
  
@@ -157230,7 +157235,7 @@ index 8e0971304..72413df40 100644
  {
      HSD_JObj* jobj;
      jobj = GET_JOBJ(gobj);
-@@ -208,7 +209,7 @@ bool itCoin_Logic116_DmgReceived(Item_GObj* gobj)
+@@ -208,7 +213,7 @@ bool itCoin_Logic116_DmgReceived(Item_GObj* gobj)
      PAD_STACK(20);
  
      ip = GET_ITEM(gobj);
@@ -157239,7 +157244,7 @@ index 8e0971304..72413df40 100644
      it_802762BC(ip);
      ip->xC9C = ip->xC9C + it_8027CBFC(gobj);
      it_8027B798(gobj, &ip->x40_vel);
-@@ -271,7 +272,7 @@ bool itCoin_UnkMotion3_Anim(Item_GObj* gobj)
+@@ -271,7 +276,7 @@ bool itCoin_UnkMotion3_Anim(Item_GObj* gobj)
  void itCoin_UnkMotion3_Phys(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
@@ -157248,7 +157253,7 @@ index 8e0971304..72413df40 100644
  
      ip->x40_vel.x *= attr->x34;
      it_80272860(gobj, ip->xDD4_itemVar.coin.x8, ip->xDD4_itemVar.coin.xC);
-@@ -381,8 +382,7 @@ Item_GObj* it_802F2094(HSD_GObj* arg0, Vec3* pos, int arg2, int arg3)
+@@ -381,8 +386,7 @@ Item_GObj* it_802F2094(HSD_GObj* arg0, Vec3* pos, int arg2, int arg3)
      void* var_r29;
  
      spawn.kind = It_Kind_Coin;
@@ -157258,7 +157263,7 @@ index 8e0971304..72413df40 100644
      spawn.facing_dir = 0.0F;
      spawn.vel.z = 0.0F;
      spawn.vel.y = 0.0F;
-@@ -396,7 +396,7 @@ Item_GObj* it_802F2094(HSD_GObj* arg0, Vec3* pos, int arg2, int arg3)
+@@ -396,7 +400,7 @@ Item_GObj* it_802F2094(HSD_GObj* arg0, Vec3* pos, int arg2, int arg3)
      gobj = Item_80268B18(&spawn);
      if (gobj != NULL) {
          ip = GET_ITEM(gobj);
@@ -157267,7 +157272,7 @@ index 8e0971304..72413df40 100644
          ip->xDD4_itemVar.coin.x0 = arg2;
          ip->xDD4_itemVar.coin.x4 = arg3;
          ip->xDD4_itemVar.coin.x14 = arg0;
-@@ -430,6 +430,13 @@ Item_GObj* it_802F2094(HSD_GObj* arg0, Vec3* pos, int arg2, int arg3)
+@@ -430,6 +434,32 @@ Item_GObj* it_802F2094(HSD_GObj* arg0, Vec3* pos, int arg2, int arg3)
          it_8027163C(gobj);
          ip->scl = Ground_801C0498();
          ip->scl *= attr->x44;
@@ -157275,7 +157280,26 @@ index 8e0971304..72413df40 100644
 +        /* No trophy model (id -1, or its archive not loaded): the console read through NULL here.
 +         * Leave the item without a model instead of crashing. */
 +        if (gobj->hsd_obj == NULL) {
-+            return gobj;
++            /* A trophy whose model is not there (an m-ex stage's trophy id, SUPA DIDDY BROS.' Fichina,
++             * 11-25) still needs a joint: every frame sets its position and rotation, and
++             * it_802F13B4 hides its child and that child's sibling. An empty root with that child and
++             * sibling plays it as an invisible trophy instead of stopping at jobj.h's assert. */
++            HSD_JObj* root = HSD_JObjAlloc();
++            HSD_JObj* shown = HSD_JObjAlloc();
++            HSD_JObj* hidden = HSD_JObjAlloc();
++            static int told;
++            PSMTXIdentity(root->mtx);
++            PSMTXIdentity(shown->mtx);
++            PSMTXIdentity(hidden->mtx);
++            root->scl = shown->scl = hidden->scl = NULL;
++            HSD_JObjAddChild(root, shown);
++            HSD_JObjAddNext(shown, hidden);
++            HSD_GObjObject_80390ADC(gobj);   /* the slot still says joint, holding NULL */
++            HSD_GObjObject_80390A70(gobj, HSD_GObj_JObjKind, root);
++            if (!told) {
++                told = 1;
++                OSReport("[trophy] trophy %d has no model; it plays without one\n", (int) arg2);
++            }
 +        }
 +#endif
  

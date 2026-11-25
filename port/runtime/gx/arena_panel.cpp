@@ -821,15 +821,34 @@ void prompt_box(float x, float y, float w, const View& v, int kind) {
 // Fox, Falco, Marth, Yoshi (named by fighter: only Fight a pro names the pros). Slippi's external ids; the pro follows the
 // character (ghost_ai).
 struct BotChoice { uint8_t character, pro; const char* name; };
-constexpr BotChoice kBotChoices[] = {{2, 3, "Pro AI Fox"}, {20, 0, "Pro AI Falco"}, {9, 1, "Pro AI Marth"}, {17, 4, "Pro AI Yoshi"}};
+// Then the 20XX CPUs (owner 11-24): a CPU port on every machine with the 20XX AI on for the match.
+constexpr BotChoice kBotChoices[] = {{2, 3, "Pro AI Fox"}, {20, 0, "Pro AI Falco"}, {9, 1, "Pro AI Marth"}, {17, 4, "Pro AI Yoshi"},
+                                     {2, ar::kPro20xx, "20XX Fox"}, {20, ar::kPro20xx, "20XX Falco"},
+                                     {9, ar::kPro20xx, "20XX Marth"}, {19, ar::kPro20xx, "20XX Sheik"},
+                                     {0, ar::kPro20xx, "20XX Falcon"}, {15, ar::kPro20xx, "20XX Puff"},
+                                     {12, ar::kPro20xx, "20XX Peach"}, {16, ar::kPro20xx, "20XX Samus"}};
 constexpr int kBotChoiceCount = (int)(sizeof kBotChoices / sizeof kBotChoices[0]);
 // Which choice this player's Pro AI is: -1 none.
 int my_bot_choice(const View& v) {
   const uint8_t bot = ar::bot_of(v.room, v.self);
   const Member* m = bot == ar::kNone ? nullptr : ar::find(v.room, bot);
   if (!m) return -1;
-  for (int i = 0; i < kBotChoiceCount; ++i) if (kBotChoices[i].character == m->character) return i;
+  for (int i = 0; i < kBotChoiceCount; ++i)
+    if (kBotChoices[i].character == m->character && (kBotChoices[i].pro == ar::kPro20xx) == ar::is_cpu_bot(*m)) return i;
   return 0;
+}
+// This player's bot's level (1-9), 0 with no bot.
+int my_bot_level(const View& v) {
+  const uint8_t bot = ar::bot_of(v.room, v.self);
+  const Member* m = bot == ar::kNone ? nullptr : ar::find(v.room, bot);
+  return m ? m->level : 0;
+}
+// The bot's action: its character, its pro (or kPro20xx) and its level.
+std::string bot_text(int choice, int level) {
+  std::string t(2, '\0');
+  t[0] = (char)kBotChoices[choice].pro;
+  t[1] = (char)std::clamp(level, (int)ar::kBotLevelMin, (int)ar::kBotLevelMax);
+  return t;
 }
 
 // ---------------------------------------------------------------- the pages: rules, add a friend
@@ -837,7 +856,7 @@ void page_box(float x, float y, float w, const View& v) {
   const Ink head{Face::Title, 13, kWhite, true, 2};
   const Ink small{Face::Body, 10, kGold, false, 0, false, 1.5f};
   if (g.page == Page::Rules) {
-    const float h = px(234);
+    const float h = px(262);
     glow(x, y, x + w, y + h, px(6), IM_COL32(243, 194, 46, 90), px(10));
     steel(x, y, x + w, y + h, kGold);
     text(small, x + px(8), y + px(8), "ROOM");
@@ -848,10 +867,12 @@ void page_box(float x, float y, float w, const View& v) {
     // Pro AI: this player's own (it plays beside them in doubles and free-for-alls, on their machine).
     const int bot = my_bot_choice(v);
     const std::string mine = bot < 0 ? std::string("Off") : kBotChoices[bot].name;
-    const std::string values[5] = {kModeWords[(int)v.room.mode], match, mine, kLookNames[(int)g.look], g.tabs ? "Tabs" : "Shown"};
-    const char* labels[5] = {"Mode", "Match", "Your Pro AI", "Look", "Panel"};
+    const int level = my_bot_level(v);
+    const std::string level_text = level ? "Level " + std::to_string(level) : std::string("No bot");
+    const std::string values[6] = {kModeWords[(int)v.room.mode], match, mine, level_text, kLookNames[(int)g.look], g.tabs ? "Tabs" : "Shown"};
+    const char* labels[6] = {"Mode", "Match", "Your bot", "Bot level", "Look", "Panel"};
     const bool bot_note = g.bot_note_until > ImGui::GetTime() && !g.bot_note.empty();
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
       const float yy = y + px(44) + i * px(28);
       if (g.row == i) {
         const int start = dl()->VtxBuffer.Size;
@@ -861,13 +882,13 @@ void page_box(float x, float y, float w, const View& v) {
       const Ink lk{Face::Body, 9.5f, g.row == i ? kInk : kDimText};
       Ink vk{Face::Bold, 12, g.row == i ? kInk : kWhite};
       text(lk, x + px(12), yy, i == 1 && note && g.row == 1 ? fit(lk, g.match_note, w - px(24))
-                               : i == 2 && bot_note && g.row == 2 ? fit(lk, g.bot_note, w - px(24)) : labels[i]);
+                               : (i == 2 || i == 3) && bot_note && g.row == i ? fit(lk, g.bot_note, w - px(24)) : labels[i]);
       text(vk, x + px(12), yy + px(10), fit_name(vk, std::string("< ") + values[i] + " >", w - px(24)));
     }
     {
       // The last row: leave the room (A). A host's room closes for everyone, and the row says so.
-      const float yy = y + px(44) + 5 * px(28);
-      const bool sel = g.row == 5;
+      const float yy = y + px(44) + 6 * px(28);
+      const bool sel = g.row == 6;
       if (sel) {
         const int start = dl()->VtxBuffer.Size;
         dl()->AddRectFilled(ImVec2(x + px(6), yy - px(2)), ImVec2(x + w - px(6), yy + px(25)), kWhite, px(4));
@@ -1101,9 +1122,9 @@ void handle_input(const Frame& f, const View& v) {
   }
   if (g.page == Page::Rules) {
     if (step == 1) g.row = std::max(0, g.row - 1);
-    if (step == 2) g.row = std::min(5, g.row + 1);
-    if (g.row != 5) g.leave_armed = false;
-    if (g.row == 5) {
+    if (step == 2) g.row = std::min(6, g.row + 1);
+    if (g.row != 6) g.leave_armed = false;
+    if (g.row == 6) {
       // Leave the room: A, then A again (one press on the way down the list never leaves by accident).
       if (pressed & kA) {
         if (!g.leave_armed) g.leave_armed = true;
@@ -1134,7 +1155,7 @@ void handle_input(const Frame& f, const View& v) {
         }
       }
       if (g.row == 2 && v.active) {
-        // Off, Fox, Falco, Marth, Yoshi: this player's Pro AI comes in, changes, or leaves.
+        // Off, the Pro AIs, the 20XX CPUs: this player's bot comes in, changes, or leaves.
         if (!v.room.ffa_allowed) {
           g.bot_note = "Everyone needs the latest Melee Unlocked";
           g.bot_note_until = ImGui::GetTime() + 3.0;
@@ -1143,13 +1164,28 @@ void handle_input(const Frame& f, const View& v) {
           const int next = ((now + 1 + delta) % (kBotChoiceCount + 1) + kBotChoiceCount + 1) % (kBotChoiceCount + 1) - 1;
           if (next < 0) { host::log("arena panel: Pro AI off"); send_act(Act::RemoveBot); }
           else {
-            host::log("arena panel: Pro AI %s", kBotChoices[next].name);
-            send_act(Act::AddBot, kBotChoices[next].character, std::string(1, (char)kBotChoices[next].pro));
+            host::log("arena panel: bot %s", kBotChoices[next].name);
+            const int level = my_bot_level(v);
+            send_act(Act::AddBot, kBotChoices[next].character, bot_text(next, level ? level : ar::kBotLevelMax));
           }
         }
       }
-      if (g.row == 3) { g.look = (Look)(((int)g.look + delta + kLookCount) % kLookCount); save(); }
-      if (g.row == 4) { g.tabs = !g.tabs; save(); }
+      if (g.row == 3 && v.active) {
+        // The bot's level, 1-9: a Pro AI's reaction (9 its own), a 20XX CPU's CPU level.
+        const int now = my_bot_choice(v), level = my_bot_level(v);
+        if (now < 0) {
+          g.bot_note = "Add a bot first";
+          g.bot_note_until = ImGui::GetTime() + 3.0;
+        } else {
+          const int next = std::clamp(level + delta, (int)ar::kBotLevelMin, (int)ar::kBotLevelMax);
+          if (next != level) {
+            host::log("arena panel: bot level %d", next);
+            send_act(Act::AddBot, kBotChoices[now].character, bot_text(now, next));
+          }
+        }
+      }
+      if (g.row == 4) { g.look = (Look)(((int)g.look + delta + kLookCount) % kLookCount); save(); }
+      if (g.row == 5) { g.tabs = !g.tabs; save(); }
     }
     if (pressed & kB) { g.page = Page::None; g.row = 0; }
     return;

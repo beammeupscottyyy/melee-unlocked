@@ -306,10 +306,14 @@ void open_links() {
 
 // ---- the room (host side) ----
 // A member whose build reads only the old room wire (no free-for-all).
-bool legacy_member() {
-  for (const Link& l : g_links) if (l.id != kNone && l.wire < kWireVersion) return true;
-  return false;
+// The oldest room wire a member reads (kWireVersion when everyone is current).
+uint8_t room_wire() {
+  uint8_t w = kWireVersion;
+  for (const Link& l : g_links) if (l.id != kNone && l.wire < w) w = l.wire;
+  return w;
 }
+// A member whose build plays no free-for-all (wire 2).
+bool legacy_member() { return room_wire() < kWireFfa; }
 
 void broadcast_warming() {
   if (!g_hosting) return;
@@ -331,7 +335,7 @@ void broadcast_room() {
   g_sent_rev = g_room.rev;
   std::vector<uint8_t> m = {kRoomState};
   // A member on a build before free-for-all reads the old wire (the room is never a free-for-all then).
-  const std::vector<uint8_t> bytes = encode(g_room, legacy_member() ? kWireLegacy : kWireVersion);
+  const std::vector<uint8_t> bytes = encode(g_room, room_wire());
   m.insert(m.end(), bytes.begin(), bytes.end());
   for (Link& l : g_links) if (l.id != kNone) send(l, m);
   if (doubles(g_room))
@@ -348,21 +352,25 @@ void broadcast_room() {
           (int)g_room.ring[0], (int)g_room.ring[1], g_room.line.size(), g_room.games);
 }
 
-bool apply_action(uint8_t who, Act a, uint8_t arg, uint8_t extra = 0) {
+bool apply_action(uint8_t who, Act a, uint8_t arg, uint8_t extra = 0, uint8_t level = kBotLevelMax) {
   switch (a) {
     case Act::SetCharacter: return set_character(g_room, who, arg, extra);
     case Act::AddBot: {
       const uint8_t bot = bot_of(g_room, who);
+      // A 20XX CPU runs on every machine: only when every member's build has it (wire 4).
+      if ((extra & 0x7F) == kPro20xx && room_wire() < kWireVersion) { event("20XX CPU refused: a member's build is older"); return false; }
       if (bot == kNone) {
-        const uint8_t id = add_bot(g_room, who, arg, extra);
-        if (id != kNone) event("%s added a Pro AI (character %u, pro %u)", find(g_room, who) ? find(g_room, who)->code.c_str() : "?", arg, extra);
+        const uint8_t id = add_bot(g_room, who, arg, extra, level);
+        if (id != kNone) event("%s added a %s (character %u, pro %u, level %u)", find(g_room, who) ? find(g_room, who)->code.c_str() : "?",
+                               (extra & 0x7F) == kPro20xx ? "20XX CPU" : "Pro AI", arg, extra, level);
         return id != kNone;
       }
       // Already in: its character and pro change (between games only: a game's fighters are fixed).
       if (g_room.in_game && ring_slot(g_room, bot) >= 0) return false;
       for (Member& m : g_room.members)
-        if (m.id == bot && (m.character != arg || m.pro != (extra & 0x7F))) {
-          m.character = arg; m.pro = (uint8_t)(extra & 0x7F); ++g_room.rev;
+        if (m.id == bot && (m.character != arg || m.pro != (extra & 0x7F) || m.level != level)) {
+          m.character = arg; m.pro = (uint8_t)(extra & 0x7F);
+          m.level = level < kBotLevelMin || level > kBotLevelMax ? kBotLevelMax : level; ++g_room.rev;
           return true;
         }
       return false;
@@ -502,7 +510,10 @@ void host_message(Link& from, const std::vector<uint8_t>& m) {
       bool full = g_room.members.size() >= (size_t)room_limit();
       // A free-for-all is on (or voted on): a build that cannot read it waits outside; between games it
       // joins and the room goes back to what every build plays (set_ffa_allowed).
-      const bool ffa_busy = wire < kWireVersion && (ffa(g_room) || (g_room.switch_pending && g_room.switch_to == Ring::Ffa));
+      const bool ffa_busy = (wire < kWireFfa && (ffa(g_room) || (g_room.switch_pending && g_room.switch_to == Ring::Ffa))) ||
+                            // A game with a 20XX CPU is on, which their build cannot play (owner 11-24): they come in
+                            // between games, and the 20XX CPUs go then.
+                            (wire < kWireVersion && g_room.in_game && has_cpu_bot(g_room));
       if (they_host && !g_test.on) {
         // Two rooms met: the bigger one keeps its host; between equals, the lower connect code hosts.
         // Not when both together would pass the limit: then neither moves (a host that joined a full
@@ -517,6 +528,13 @@ void host_message(Link& from, const std::vector<uint8_t>& m) {
       const uint8_t id = full || ffa_busy ? kNone : join(g_room, code, name);
       from.id = id;
       from.wire = wire;
+      if (id != kNone && wire < kWireVersion && has_cpu_bot(g_room)) {
+        // Their build has no 20XX CPU: the room goes back to what every build plays.
+        std::vector<uint8_t> owners;
+        for (const Member& b : g_room.members) if (is_cpu_bot(b)) owners.push_back(b.bot_of);
+        for (uint8_t o : owners) remove_bot(g_room, o);
+        event("20XX CPUs off: %s's build is older", code.c_str());
+      }
       std::vector<uint8_t> w = {kWelcome, id};
       if (full) w.push_back(1);   // why: the room is full (older members ignore the extra byte)
       else if (ffa_busy) w.push_back(2);   // why: a free-for-all their build cannot play
@@ -547,7 +565,7 @@ void host_message(Link& from, const std::vector<uint8_t>& m) {
     case kAction:
       if (from.id != kNone && m.size() >= 3) {
         const uint8_t who = from.id;
-        apply_action(who, (Act)m[1], m[2], m.size() >= 4 ? m[3] : 0);
+        apply_action(who, (Act)m[1], m[2], m.size() >= 4 ? m[3] : 0, m.size() >= 5 ? m[4] : kBotLevelMax);
         if ((Act)m[1] == Act::Leave) {
           // Left on purpose: the link closes and that friend is not searched for again (their next
           // Direct search for this player's code is a plain one).
@@ -1305,12 +1323,14 @@ void do_act(const Pending& p) {
   }
   if (!g_active) return;
   if (g_hosting) {
-    if (apply_action(g_self, p.a, p.arg, p.text.empty() ? 0 : (uint8_t)p.text[0]) && p.a != Act::SetCharacter)
+    if (apply_action(g_self, p.a, p.arg, p.text.empty() ? 0 : (uint8_t)p.text[0],
+                     p.text.size() >= 2 ? (uint8_t)p.text[1] : kBotLevelMax) && p.a != Act::SetCharacter)
       event("action %d by the host", (int)p.a);
     return;
   }
   std::vector<uint8_t> m = {kAction, (uint8_t)p.a, p.arg};
   if (p.a == Act::SetCharacter || p.a == Act::AddBot) m.push_back(p.text.empty() ? 0 : (uint8_t)p.text[0]);
+  if (p.a == Act::AddBot && p.text.size() >= 2) m.push_back((uint8_t)p.text[1]);   // the level (older hosts read 4 bytes)
   send_to_host(m);
 }
 
@@ -1629,8 +1649,13 @@ std::shared_ptr<yougame::lobby::Plan> make_plan(std::string* why) {
     if (!is_person(g_room.ring[s])) continue;
     order.push_back(g_room.ring[s]);
     const uint8_t bot = bot_of(g_room, g_room.ring[s]);
-    if (bot != kNone && ring_slot(g_room, bot) >= 0) order.push_back(bot);
+    if (bot != kNone && ring_slot(g_room, bot) >= 0 && !is_cpu_bot(*find(g_room, bot))) order.push_back(bot);
   }
+  for (int s = 0; s < ring_size(g_room); ++s) {
+    const Member* c = find(g_room, g_room.ring[s]);
+    if (c && is_cpu_bot(*c)) order.push_back(c->id);
+  }
+  bool cpu_20xx = false;
   const Member* host = find(g_room, owner(g_room));
   if (!host || order.size() < 3 || order.size() > (size_t)kRingMax) { if (why) *why = "not enough fighters"; return nullptr; }
   lb::Setup st;
@@ -1654,12 +1679,21 @@ std::shared_ptr<yougame::lobby::Plan> make_plan(std::string* why) {
     x.pick.color = 0;
     x.pick.team = doubles(g_room) ? team_of_slot(g_room, ring_slot(g_room, m->id)) : 0;
     x.name = m->name;
-    if (is_bot(*m)) {
+    if (is_cpu_bot(*m)) {
+      // A 20XX CPU: a CPU port at its level on every machine (the 20XX AI on for the match).
+      x.kind = lb::Kind::Cpu;
+      x.id = "cpu:" + std::to_string(i);
+      x.level = m->level;
+      x.pick.ch = m->character < 26 ? m->character : 2;
+      cpu_20xx = true;
+      ports.push_back({{"id", x.id}, {"cpu", "20xx"}, {"level", x.level}, {"ch", x.pick.ch}, {"team", x.pick.team}});
+    } else if (is_bot(*m)) {
       const Member* o = find(g_room, m->bot_of);
       x.id = "proai:" + o->code;
       x.connection_id = o->code;
       x.local_index = 1;
       x.pro = m->pro;
+      x.level = m->level;   // its reaction on its owner's machine (CMD_PROAI_SEAT)
       x.pick.ch = m->character < 26 ? m->character : 2;   // Fox when none was picked
       ports.push_back({{"id", x.id}, {"pro", x.pro}, {"ch", x.pick.ch}, {"team", x.pick.team}});
     } else {
@@ -1673,6 +1707,7 @@ std::shared_ptr<yougame::lobby::Plan> make_plan(std::string* why) {
     st.seats.push_back(x);
   }
   st.frozen = {{"match", st.match_id}, {"seed", seed}, {"stage", st.stage}, {"teams", st.rules.teams}, {"ports", ports}};
+  if (cpu_20xx) st.frozen["cpu20xx"] = true;
   auto plan = std::make_shared<lb::Plan>(lb::plan(st, g_code));
   if (!plan->ok) {
     if (why) {
@@ -1683,6 +1718,7 @@ std::shared_ptr<yougame::lobby::Plan> make_plan(std::string* why) {
     return nullptr;
   }
   plan->code_match = true;
+  plan->cpu_20xx = cpu_20xx;
   return plan;
 }
 void clear_plan() {
@@ -2136,6 +2172,7 @@ void steer_match() {
 //                                  are in, default the kind's own least; every voter says yes)
 //   watch:<N>:<member>             (that member steps out of the line to just watch)
 //   bot:<N>:<k or code>-<character> (test member k (ARENA#k) or that code adds their Pro AI playing that character)
+//   cpu:<N>:<k or code>-<character>[-<level>] (the same member adds a 20XX CPU of that character, level 9 by default)
 struct PlanStep { std::string what, arg; uint32_t after = 0; uint8_t member = kNone; bool done = false; };
 std::vector<PlanStep> g_plan;
 bool g_plan_read = false;
@@ -2172,9 +2209,9 @@ void run_test_plan() {
         (p.what == "ffa" && (int)g_room.members.size() < std::max(kFfaMin, named))) return;
     if (p.what == "watch" && !find(g_room, (uint8_t)std::atoi(p.arg.c_str()))) return;
     uint8_t bot_owner = kNone;
-    if (p.what == "bot") {
+    if (p.what == "bot" || p.what == "cpu") {
       // ARENA#k in a test room, or a real member's code (bot:0:HERO#162-2 in a real room's plan).
-      const size_t dash_at = p.arg.rfind('-');
+      const size_t dash_at = p.arg.find('-');
       const std::string who = dash_at == std::string::npos ? p.arg : p.arg.substr(0, dash_at);
       const std::string code = who.find('#') != std::string::npos ? who : "ARENA#" + std::to_string(std::atoi(who.c_str()));
       for (const Member& m : g_room.members) if (m.code == code) bot_owner = m.id;
@@ -2193,6 +2230,13 @@ void run_test_plan() {
       const size_t dash = p.arg.find('-');
       const uint8_t ch = dash == std::string::npos ? 2 : (uint8_t)std::atoi(p.arg.c_str() + dash + 1);
       ok = add_bot(g_room, bot_owner, ch, 0) != kNone;
+    }
+    else if (p.what == "cpu") {
+      // A 20XX CPU (owner 11-24): <who>-<character>[-<level>].
+      const size_t dash = p.arg.find('-'), dash2 = dash == std::string::npos ? dash : p.arg.find('-', dash + 1);
+      const uint8_t ch = dash == std::string::npos ? 2 : (uint8_t)std::atoi(p.arg.c_str() + dash + 1);
+      const uint8_t level = dash2 == std::string::npos ? kBotLevelMax : (uint8_t)std::atoi(p.arg.c_str() + dash2 + 1);
+      ok = room_wire() >= kWireVersion && add_bot(g_room, bot_owner, ch, kPro20xx, level) != kNone;
     }
     else if (p.what == "answer") {
       const Answer a = p.arg == "no" ? Answer::No : p.arg == "winner" ? Answer::YesAndPlayWinner : Answer::Yes;

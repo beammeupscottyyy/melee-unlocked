@@ -319,6 +319,11 @@ void fetch_later(const Entry& e, bool retry = false) {
 
 std::atomic<int> g_stronger{kStrongerAsk};
 std::atomic<int> g_extra_delay{0};   // set_extra_delay
+std::atomic<int> g_slot_delay[4] = {-1, -1, -1, -1};   // set_slot_extra_delay: a seat's level
+int extra_for(unsigned slot) {
+  const int own = slot < 4 ? g_slot_delay[slot].load() : -1;
+  return std::clamp(own >= 0 ? own : g_extra_delay.load(), 0, kMaxExtraDelay);
+}
 
 // Phillip's newest policies (90 MB) need about 10 ms a step: a PC plays them only once a background
 // check shows it steps one fast enough (0 not known, 1 fast enough, -1 too slow). Until then, and on
@@ -1082,7 +1087,7 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
   MuGhostAct a{};
   // Its own delay plus the player's extra reaction time. Answers are kept for the longest extra, so
   // raising it mid-match finds the older answers it now needs instead of waiting for them.
-  const uint32_t delay = (uint32_t)(s.entry->delay + std::clamp(g_extra_delay.load(), 0, kMaxExtraDelay));
+  const uint32_t delay = (uint32_t)(s.entry->delay + extra_for(o.slot));
   if (o.frame - s.first >= delay) {
     const uint32_t due = o.frame - delay;
     std::unique_lock<std::mutex> lk2(s.m);
@@ -1101,6 +1106,9 @@ bool act(const MuGhostObs& o, MuGhostAct& out) {
 
 void set_stronger_choice(int choice) { g_stronger = std::clamp(choice, 0, 2); }
 void set_extra_delay(int frames) { g_extra_delay = std::clamp(frames, 0, kMaxExtraDelay); }
+void set_slot_extra_delay(int slot, int frames) {
+  if (slot >= 0 && slot < 4) g_slot_delay[slot] = frames < 0 ? -1 : std::clamp(frames, 0, kMaxExtraDelay);
+}
 int extra_delay() { return g_extra_delay.load(); }
 int stronger_choice() { return g_stronger.load(); }
 

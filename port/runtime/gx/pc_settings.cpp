@@ -2499,7 +2499,12 @@ void load_pc_settings(RenderOptions& options, int& volume) {
         slippi::online::config().blocked_codes[key.back() - '1'] = value.substr(0, 16);
       else if (key == "practicecpu") {
         MuPcConfig pc;
-        if (practice_cpu::from_text(value, pc)) practice_cpu::set_config(pc);
+        if (practice_cpu::from_text(value, pc)) {
+          // A Fight a pro pick lasts for its session (grizzly 11-24: Training started with a pro playing by
+          // itself). The next launch starts Training with its usual CPU; the rest of the setup is kept.
+          if (pc.preset & 0x80u) { pc.preset = 0; pc.enabled = 0; }
+          practice_cpu::set_config(pc);
+        }
       }
       else if (key.size() == 16 && key.rfind("practicecpuslot", 0) == 0 && key[15] >= '1' && key[15] <= '3') {
         MuPcConfig pc;
@@ -7616,7 +7621,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             ImGui::TextDisabled("%s download", card.size);
             if (!s.message.empty()) ImGui::TextWrapped("%s", s.message.c_str());
           }
-#ifdef _WIN32
+          // Linux too (owner 11-24: the settings look the same as on Windows): the compat ShellExecuteA opens
+          // the page with xdg-open.
+#if defined(_WIN32) || defined(__linux__)
           if (settings_widgets::SmallButton("Authors' page")) ShellExecuteA(nullptr, "open", card.page, nullptr, nullptr, SW_SHOWNORMAL);
 #endif
           ImGui::PopID();
@@ -7770,7 +7777,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           restart_now_button("look_pack");
       }
       settings_widgets::InputText("Patch folder##exactlooks", patcher_folder, sizeof patcher_folder);
-#ifdef _WIN32
+      // Linux too: the compat GetOpenFileNameW is zenity's or kdialog's file picker.
+#if defined(_WIN32) || defined(__linux__)
       ImGui::SameLine();
       if (settings_widgets::Button("Browse...##lookpatch")) {
         wchar_t path[32768]{};
@@ -11763,8 +11771,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::Spacing();
     }
     if (cur_family.fam == (int)host::PadFamily::Box)
-      settings_hint("Mod X and Mod Y work inside the box itself and are never bound here. A Frame1 plugged in "
-                    "normally shows up as a GameCube adapter: set it up under GameCube.");
+      // K-Dubb 11-24: "set it up under GameCube" sent a Frame1 owner looking for a section that does not exist; his box
+      // is set up in Box layouts, below.
+      settings_hint("Mod X and Mod Y work inside the box itself and are never bound here. This box's buttons, triggers "
+                    "included, are set under Box layouts below. A Frame1 in its GameCube mode shows up as a GameCube "
+                    "adapter instead: then choose GameCube with Change at the top.");
     if (cur_family.fam == (int)host::PadFamily::GameCube) {
       const double rate = host::gcadapter_poll_rate_hz();
       if (rate > 0.0) ImGui::Text("Adapter polling rate: %.0f Hz", rate);

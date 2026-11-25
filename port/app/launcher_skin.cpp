@@ -423,7 +423,9 @@ void status_line_bar(HDC dc, double bottom) {
       mt(dc, value, x, y + 5.6, 17, vc); x += mw(dc, value, 17) * 96.0 / dpi();
     } else {   // A: the label in the page's font, the value in Melee's, on one baseline
       if (!label.empty()) x += tx(dc, label, x, y + 4.5, g_f12, P.dim) * 96.0 / dpi() + 5;
-      mt(dc, value, x, y + 6.6, 17, vc); x += mw(dc, value, 17) * 96.0 / dpi();
+      // y + 4.6: the value's baseline on the label's (measured 11-24: at y + 6.6 every value sat 2 px under its
+      // label, "none" most visibly, owner's report).
+      mt(dc, value, x, y + 4.6, 17, vc); x += mw(dc, value, 17) * 96.0 / dpi();
     }
     if (hot) hline(dc, x0 + (dotted ? 12 : 0), y + 20, x - x0 - (dotted ? 12 : 0), P.dim);
     hit(R(x0 - 4, y, x - x0 + 8, h), A_STATUS, id);

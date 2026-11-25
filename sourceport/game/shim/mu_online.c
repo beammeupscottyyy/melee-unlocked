@@ -528,6 +528,8 @@ static int command(unsigned int cmd, const u8* payload, unsigned int size, u8* r
  * changes which seat is whose). */
 int mu_proai_seat_pad(int port, int pro, PADStatus* out);
 static int proai_port = -1, proai_pro = 0;
+static int match_20xx;   /* this match's setup has 20XX CPUs (owner 11-24): mu_20xx_ai_enabled online */
+int mu_online_match_20xx(void) { return mu_online.active && match_20xx; }
 static u8 proai_reply[RESPONSE_CAPACITY];
 static void proai_seat_ask(void)
 {
@@ -537,7 +539,12 @@ static void proai_seat_ask(void)
     const int model = mu_lobby_partner_pro_model();
     const u8 friends_pro = model >= 0 && model < 0x80 ? (u8) model : 0xFF;
     proai_port = -1;
-    if (command_into(CMD_PROAI_SEAT, &friends_pro, 1, proai_reply, sizeof proai_reply, &got) == 0 && got >= 3 &&
+    match_20xx = 0;
+    if (command_into(CMD_PROAI_SEAT, &friends_pro, 1, proai_reply, sizeof proai_reply, &got) == 0 && got >= 4 && proai_reply[3]) {
+        match_20xx = 1;
+        logf_("online: this match's CPUs play the 20XX AI");
+    }
+    if (got >= 3 &&
         proai_reply[0] == 1 && proai_reply[1] < 4)
     {
         proai_port = proai_reply[1];
@@ -545,7 +552,7 @@ static void proai_seat_ask(void)
         logf_("online: Pro AI seat: port %d, pro %d (played on this machine)", proai_port, proai_pro);
     }
 }
-MU_EXCLUSIONS(proai_seat, MU_EXCLUDE(proai_port), MU_EXCLUDE(proai_pro), MU_EXCLUDE(proai_reply))
+MU_EXCLUSIONS(proai_seat, MU_EXCLUDE(proai_port), MU_EXCLUDE(proai_pro), MU_EXCLUDE(proai_reply), MU_EXCLUDE(match_20xx))
 
 static int capture_state(int frame)
 {

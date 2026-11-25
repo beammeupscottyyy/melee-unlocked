@@ -4,6 +4,7 @@
 // in a match, and capture/load savestates around rollbacks.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "slippi_agent_lock.h"
+#include "phillip_ai.h"
 #include "test_env.h"
 #include "slippi_online.h"
 #include "slippi_stage_pool.h"
@@ -3762,7 +3763,7 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
     // (id local:<connection>:1), named by the shim (payload: the pro, 0xFF none). Rooms never knows it is a
     // model: the seat goes out as any Player 2's pad, so nothing else changes on any machine.
     case CMD_PROAI_SEAT: {
-      q.assign(3, 0);
+      q.assign(5, 0);
       const uint8_t friends_pro = payload_len >= 1 ? payload[0] : 0xFF;
       const auto lobby = yougame::friends_lobby();
       const auto* p = lobby.open && lobby.plan && lobby.plan->ok ? lobby.plan.get() : nullptr;
@@ -3777,8 +3778,15 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
         q[0] = 1; q[1] = (uint8_t)second; q[2] = friends_pro;
         how = "the Friends partner, Player 2's seat";
       }
-      host::log("slippi: Pro AI seat asked: setup %d, second local port %d, session %d, partner pro %d -> %s",
-                p ? 1 : 0, second, session_mode(), friends_pro == 0xFF ? -1 : (int)friends_pro, how);
+      // [3]: the match has 20XX CPUs (an Arena room's 20XX bots): every machine turns the 20XX AI on for it.
+      // [4]: this seat's level (1-9): its reaction here, 5 frames a level under 9 (owner 11-24).
+      q[3] = p && p->cpu_20xx ? 1 : 0;
+      const int level = q[0] && in_setup && p->port[second].level >= 1 && p->port[second].level <= 9 ? p->port[second].level : 9;
+      q[4] = (uint8_t)level;
+      for (int slot = 0; slot < 4; ++slot) phillip_ai::set_slot_extra_delay(slot, -1);
+      if (q[0]) phillip_ai::set_slot_extra_delay(q[1], (9 - level) * 5);
+      host::log("slippi: Pro AI seat asked: setup %d, second local port %d, session %d, partner pro %d -> %s; 20XX CPUs %s, level %d",
+                p ? 1 : 0, second, session_mode(), friends_pro == 0xFF ? -1 : (int)friends_pro, how, q[3] ? "on" : "off", level);
       return true;
     }
     // Ranks: YouGame mode answers with its ladder rank; standalone never shows one (visibility 0

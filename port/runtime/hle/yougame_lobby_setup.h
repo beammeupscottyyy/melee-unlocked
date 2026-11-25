@@ -92,6 +92,9 @@ struct Plan {
   // A match made from connect codes (an Arena room, a Direct game with a Pro AI): the people pick on
   // the select as usual (their own selections); only the Pro AI seats take the setup's pick.
   bool code_match = false;
+  // The match has 20XX CPUs (an Arena room's 20XX bots, owner 11-24): every machine plays its CPU ports with
+  // the 20XX AI on, so they stay in step (the game asks once a match, CMD_PROAI_SEAT).
+  bool cpu_20xx = false;
 };
 
 inline Plan refuse(const char* why) { Plan p; p.why = why; return p; }

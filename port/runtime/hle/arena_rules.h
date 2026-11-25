@@ -50,9 +50,15 @@ struct Member {
   // partner port), kNone for a person. It has no machine or links of its own, never votes or hosts,
   // and fights only beside its owner in a doubles or free-for-all ring (one machine can't play singles).
   uint8_t bot_of = kNone;
-  uint8_t pro = 0;             // which pro (the model follows the character, ghost_ai)
+  uint8_t pro = 0;             // which pro (the model follows the character, ghost_ai); kPro20xx: a 20XX CPU
+  uint8_t level = 9;           // a bot's level, 1-9 (owner 11-24): a Pro AI's reaction, a 20XX CPU's CPU level
 };
+// A bot that is a 20XX CPU (owner 11-24): a real CPU port on every machine with the 20XX AI on for the match,
+// rather than a model on its owner's machine. Only in rooms every build of which reads wire 4.
+constexpr uint8_t kPro20xx = 0x0F;
+constexpr uint8_t kBotLevelMin = 1, kBotLevelMax = 9;
 inline bool is_bot(const Member& m) { return m.bot_of != kNone; }
+inline bool is_cpu_bot(const Member& m) { return is_bot(m) && m.pro == kPro20xx; }
 constexpr int kMinPeople = 2;   // a match needs two machines: a ring with Pro AIs needs two people in it
 
 struct Room {
@@ -126,7 +132,8 @@ uint8_t join(Room& room, const std::string& code, const std::string& name);
 bool leave(Room& room, uint8_t id);
 // A person adds their Pro AI (one each, the room's new features on: ffa_allowed), or takes it away.
 // The Pro AI's id, kNone when refused. `character` is Slippi's external id.
-uint8_t add_bot(Room& room, uint8_t owner, uint8_t character, uint8_t pro);
+uint8_t add_bot(Room& room, uint8_t owner, uint8_t character, uint8_t pro, uint8_t level = kBotLevelMax);
+bool has_cpu_bot(const Room& room);                 // a 20XX CPU among the members
 bool remove_bot(Room& room, uint8_t owner);
 uint8_t bot_of(const Room& room, uint8_t owner);   // the person's Pro AI, kNone
 int people(const Room& room);                       // members who are people
@@ -159,8 +166,8 @@ bool game_end(Room& room, uint8_t winner_team);
 // Wire 2 is what builds before free-for-all read: it carries no ring kind beyond doubles, so a room
 // encoded for them must not be a free-for-all (the host keeps ffa_allowed off while such a build is
 // in the room). Wire 3 adds the kind, the proposed kind, ffa_allowed and each member's Pro AI owner and
-// pro. decode reads both.
-constexpr uint8_t kWireLegacy = 2, kWireVersion = 3;
+// pro. Wire 4 adds each member's bot level, and a bot's pro may be kPro20xx (a 20XX CPU). decode reads all three.
+constexpr uint8_t kWireLegacy = 2, kWireFfa = 3, kWireVersion = 4;
 std::vector<uint8_t> encode(const Room& room, uint8_t version = kWireVersion);
 bool decode(const uint8_t* data, size_t size, Room& out);
 

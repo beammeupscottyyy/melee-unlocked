@@ -6,6 +6,7 @@
  * rank_enum). No Slippi server IO.
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <mu_native.h>
+#include <mu_test_env.h>
 #include <mu_ranked_setup_online.h>
 #include "mu_rank_text.h"
 #include <stdio.h>
@@ -69,7 +70,11 @@ static MuYgU16 shown_matches = 0xFFFF;
 
 static int active(void)
 {
-    return mu_slippi_css_online() && mu_slippi_state()->mode == MU_SLP_MODE_RANKED;
+    /* MELEE_TEST_RANK_PANEL (tests only): the panel on any online character select, so a hidden run (which
+     * cannot queue Ranked) can capture it. */
+    static int test = -1;
+    if (test < 0) test = mu_test_getenv("MELEE_TEST_RANK_PANEL") != NULL;
+    return mu_slippi_css_online() && (test || mu_slippi_state()->mode == MU_SLP_MODE_RANKED);
 }
 
 /* yougame_ranked.h rank_enum: challenger is Grandmaster; YouGame's division 1 is a tier's top. */
@@ -141,7 +146,9 @@ static void init_icon(int rank)
     panel.icon = HSD_JObjLoadJoint(DP(desc->joint));
     if (!panel.icon) return;
     panel.icon->translate.x = -9.f;
-    panel.icon->translate.y = -12.5f;
+    /* Slippi's -12.5 put the icon's top over the "Rank" label here (owner 11-24 and 11-25, captures with
+     * MELEE_TEST_RANK_PANEL): centred on the rank and rating lines beside it instead. */
+    panel.icon->translate.y = -14.3f;
     panel.icon->scale.x = 2.f;
     panel.icon->scale.y = 2.f;
     HSD_JObjSetMtxDirtySub(panel.icon);
@@ -152,6 +159,11 @@ static void init_icon(int rank)
     HSD_ForeachAnim(panel.icon, JOBJ_TYPE, JOBJ_MASK, HSD_AObjReqAnim, AOBJ_ARG_AF, 0.f);
     HSD_JObjAnimAll(panel.icon);
     HSD_ForeachAnim(panel.icon, JOBJ_TYPE, JOBJ_MASK, HSD_AObjStopAnim, AOBJ_ARG_AOV, NULL, NULL);
+    /* The model's joint animation above writes the root's translation: place the icon after it, or the
+     * position set before is lost (the icon stayed over the "Rank" label whatever it was set to). */
+    panel.icon->translate.x = -9.f;
+    panel.icon->translate.y = -14.3f;
+    HSD_JObjSetMtxDirtySub(panel.icon);
     HSD_GObjObject_80390A70(gobj, HSD_GObj_JObjKind, panel.icon);
     GObj_SetupGXLink(gobj, HSD_GObj_JObjCallback, 1, 129);
 }
@@ -255,6 +267,10 @@ void mu_ranked_rank_enter(void)
     /* InitRankInfoText: kerning 1, left aligned, scale 0.01 (here: font 0.1 with positions in tenths
      * of a world unit, so Slippi's x/10 and scale/10). */
     panel.text->default_kerning = 1;
+    /* Slippi's text->use_aspect = 1 and text->aspect.X *= 2.5 (m-ex Text: use_aspect is SIS fitting at 0x48,
+     * aspect the text box at 0x0C). Left unset, every line was laid out against the default box. */
+    panel.text->default_fitting = 1;
+    panel.text->box_size_x *= 2.5f;
     panel.text->default_alignment = 0;
     panel.text->pos_x = 0;
     panel.text->pos_y = 0;

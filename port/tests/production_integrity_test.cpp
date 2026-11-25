@@ -23,6 +23,7 @@ static const MuHostApi* mu_host = nullptr;
 static bool native_online = false, native_pending = false, native_replay = false, native_option = false;
 static int mu_online_active() { return native_online; }
 static int mu_online_pending() { return native_pending; }
+static int mu_online_match_20xx() { return 0; }   // an online match with 20XX CPUs (Arena bots): none here
 static int mu_replay_abi_active() { return native_replay; }
 static int mu_option2_offline(unsigned) { return native_option && !native_online && !native_pending; }
 static constexpr unsigned MU_TE2_20XX_CPUS = MU_GAME_OPTION2_TE_20XX_CPUS;

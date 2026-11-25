@@ -28,6 +28,7 @@ struct HSD_Text {
   HSD_GObj* entity=nullptr;
   int default_kerning=0, default_alignment=-1;
   float pos_x=1,pos_y=1;
+  int default_fitting=0; float box_size_x=0;   // Slippi's aspect box, set by the panel
   struct { float x,y; } font_size{};
   std::vector<std::string> rows;
   struct Row {float x,y,sx=1,sy=1; GXColor color{};};
@@ -114,6 +115,7 @@ static void HSD_SisLib_803A5CC4(HSD_Text* t) { --text_count; delete t; }
 static HSD_GObj* GObj_Create(int, int, int) { return &owner; }
 static void GObj_InitUserData(HSD_GObj*, int, void (*fn)(void*), void*) { cleanup = fn; }
 #include "../../sourceport/game/shim/mu_ranked_rank.c"
+const char* mu_test_getenv(const char*) { return nullptr; }   // no test switches here (MELEE_TEST_RANK_PANEL is off)
 
 static std::vector<std::string> splash;
 static GXColor splash_colors[5];
@@ -169,8 +171,9 @@ int main() {
   // Still fetching, nothing known: Slippi's PENDING and "????".
   e3_status = 0; enter(); CHECK(fetches == 0 && text_count == 1 && joints == 1);
   shows("PENDING", "\x81\x48\x81\x48\x81\x48\x81\x48");
-  // Slippi's icon: slpCSS rank_icons at (-9, -12.5) x2, texture frame = rank.
-  CHECK(panel.icon && panel.icon->linked && panel.icon->translate.x == -9.f && panel.icon->translate.y == -12.5f);
+  // Slippi's icon: slpCSS rank_icons x2, texture frame = rank, at (-9, -14.3): Slippi's -12.5 put its top over
+  // the "Rank" label here (owner 11-25), so it sits beside the rank and rating lines.
+  CHECK(panel.icon && panel.icon->linked && panel.icon->translate.x == -9.f && panel.icon->translate.y == -14.3f);
   CHECK(panel.icon->scale.x == 2.f && panel.icon->scale.y == 2.f && panel.icon->tex_frame == 0 && panel.icon->bob_frame == 0);
   e3_status = 1;
   // YouGame's four divisions show as Slippi's three: division 1 is the tier's top.

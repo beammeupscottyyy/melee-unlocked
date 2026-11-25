@@ -152,6 +152,7 @@ def main():
     ap.add_argument("--ffa", action="store_true", help="the host proposes a free-for-all before the first game (everyone says yes)")
     ap.add_argument("--doubles", action="store_true", help="the host proposes doubles before the first game")
     ap.add_argument("--bots", default="", help="members who add a Pro AI before the first game, e.g. 0-2,1-20 (member-character)")
+    ap.add_argument("--cpus", default="", help="members who add a 20XX CPU before the first game, e.g. 0-2-9,1-20-5 (member-character-level)")
     ap.add_argument("--watch", default="", help="members who just watch, e.g. 3 or 2,3 (test plan watch steps)")
     args = ap.parse_args()
     # The host's test plan (MELEE_ARENA_TEST_PLAN): the options above, before anything the environment names.
@@ -159,7 +160,8 @@ def main():
     if args.ffa:
         plan.append("ffa:0")
     # Pro AIs come in before any switch, so the switch can count them.
-    plan = [f"bot:0:{b.strip()}" for b in args.bots.split(",") if b.strip()] + plan
+    plan = [f"bot:0:{b.strip()}" for b in args.bots.split(",") if b.strip()] + \
+           [f"cpu:0:{c.strip()}" for c in args.cpus.split(",") if c.strip()] + plan
     if args.doubles:
         plan.append("doubles:0")
     if plan:

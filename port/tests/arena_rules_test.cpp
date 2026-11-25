@@ -606,6 +606,30 @@ TEST(ffa_links_connect_every_fighter) {
   Room t = ffa_room(3);
   CHECK(feed_tree(t).empty() && wanted_links(t).size() == 3);
 }
+TEST(bot_levels_and_20xx_cpus_on_wire_4) {
+  // Owner 11-24: a bot's level and a 20XX CPU travel on wire 4; wire 3 carries neither (decode refuses a 20XX CPU on it).
+  Room r;
+  join(r, "AAAA#1", "A"); join(r, "BBBB#2", "B");
+  set_ffa_allowed(r, true);
+  const uint8_t pro = add_bot(r, 0, 2, 3, 4), cpu = add_bot(r, 1, 20, kPro20xx, 7);
+  CHECK(pro != kNone && cpu != kNone);
+  CHECK(find(r, pro)->level == 4 && !is_cpu_bot(*find(r, pro)));
+  CHECK(find(r, cpu)->level == 7 && is_cpu_bot(*find(r, cpu)) && has_cpu_bot(r));
+  std::vector<uint8_t> bytes = encode(r);
+  CHECK(bytes[0] == kWireVersion);
+  Room back;
+  CHECK(decode(bytes.data(), bytes.size(), back));
+  CHECK(find(back, cpu)->level == 7 && is_cpu_bot(*find(back, cpu)) && find(back, pro)->level == 4);
+  CHECK(encode(back) == bytes);
+  bytes = encode(r, kWireFfa);
+  CHECK(bytes[0] == kWireFfa && !decode(bytes.data(), bytes.size(), back));   // a 20XX CPU never on wire 3
+  remove_bot(r, 1);
+  bytes = encode(r, kWireFfa);
+  CHECK(decode(bytes.data(), bytes.size(), back) && find(back, pro)->level == kBotLevelMax);   // wire 3: no levels
+  // A level out of range is the default.
+  CHECK(find(r, add_bot(r, 1, 9, kPro20xx, 0))->level == kBotLevelMax);
+}
+
 TEST(ffa_wire_round_trip_and_legacy_wire) {
   Room r = ffa_room(5);
   set_mode(r, Mode::Ask);

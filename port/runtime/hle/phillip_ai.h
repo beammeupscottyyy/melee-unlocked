@@ -21,6 +21,8 @@ void set_stronger_choice(int choice);
 // more makes it react later (Wens, 11-23: the practice CPU's Reaction row turned the pro off).
 constexpr int kMaxExtraDelay = 40;
 void set_extra_delay(int frames);
+// One slot's own extra delay (an online seat's level, owner 11-24), -1: the player's setting applies.
+void set_slot_extra_delay(int slot, int frames);
 int extra_delay();
 int stronger_choice();
 // One pro's stronger policies (pro < 0: every pro's): how many there are, how many are not

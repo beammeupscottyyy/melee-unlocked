@@ -3046,6 +3046,12 @@ int mu_20xx_ai_enabled(void)
         /* Tests only. Same limits as the option: not online, not in replay playback. */
         return !(mu_online_active() || mu_online_pending() || mu_replay_abi_active());
     }
+    /* Online: only a match whose setup has 20XX CPUs (an Arena room's 20XX bots, owner 11-24). Every machine
+     * reads the same setup, and the AI's state is game data the rollback saves, so the CPUs stay in step. */
+    {
+        extern int mu_online_match_20xx(void);
+        if (mu_online_active()) return mu_online_match_20xx();
+    }
     /* The plain "20XX CPUs" option (Game tab), with or without a 20XX TE save; in replay playback
      * the host passes the recorded word, so the replay plays back as it was played. */
     return mu_option2_offline(MU_TE2_20XX_CPUS);

@@ -515,7 +515,11 @@ bool leave(Room& r, uint8_t id) {
   return true;
 }
 
-uint8_t add_bot(Room& r, uint8_t owner_id, uint8_t character, uint8_t pro) {
+bool has_cpu_bot(const Room& r) {
+  for (const Member& m : r.members) if (is_cpu_bot(m)) return true;
+  return false;
+}
+uint8_t add_bot(Room& r, uint8_t owner_id, uint8_t character, uint8_t pro, uint8_t level) {
   const Member* o = find(r, owner_id);
   if (!o || is_bot(*o) || !r.ffa_allowed || bot_of(r, owner_id) != kNone || pro > 0x7F) return kNone;
   if (r.members.size() >= (size_t)kMaxMembers) return kNone;
@@ -527,6 +531,7 @@ uint8_t add_bot(Room& r, uint8_t owner_id, uint8_t character, uint8_t pro) {
   m.name = clean(o->name, kMaxName - 6, false) + " (AI)";
   m.bot_of = owner_id;
   m.pro = pro;
+  m.level = level < kBotLevelMin || level > kBotLevelMax ? kBotLevelMax : level;
   m.character = character;
   r.members.push_back(m);
   r.line.push_back(id);
@@ -722,8 +727,9 @@ bool game_end(Room& r, uint8_t winner_team) {
 // ---------------------------------------------------------------- wire form
 std::vector<uint8_t> encode(const Room& r, uint8_t version) {
   const bool legacy = version <= kWireLegacy;
+  const bool levels = version >= kWireVersion;   // wire 4: each member's bot level
   std::vector<uint8_t> o;
-  o.push_back(legacy ? kWireLegacy : kWireVersion);
+  o.push_back(legacy ? kWireLegacy : levels ? kWireVersion : kWireFfa);
   put32(o, r.rev);
   o.push_back((uint8_t)r.mode);
   o.push_back((uint8_t)((doubles(r) ? 1 : 0) | (r.in_game ? 2 : 0) | (r.leaver_plays_winner ? 4 : 0) |
@@ -740,6 +746,7 @@ std::vector<uint8_t> encode(const Room& r, uint8_t version) {
     o.push_back(m.id); put16(o, m.wins); put16(o, m.losses); o.push_back(m.character); o.push_back(m.costume);
     put_str(o, m.code); put_str(o, m.name);
     if (!legacy) { o.push_back(m.bot_of); o.push_back(m.pro); }
+    if (levels) o.push_back(m.level);
   }
   o.push_back((uint8_t)r.line.size());
   o.insert(o.end(), r.line.begin(), r.line.end());
@@ -750,8 +757,8 @@ bool decode(const uint8_t* data, size_t size, Room& out) {
   if (!data) return false;
   Reader in{data, size};
   const uint8_t version = in.u8();
-  if (version != kWireLegacy && version != kWireVersion) return false;
-  const bool legacy = version == kWireLegacy;
+  if (version != kWireLegacy && version != kWireFfa && version != kWireVersion) return false;
+  const bool legacy = version == kWireLegacy, levels = version == kWireVersion;
   Room r;
   r.rev = in.u32();
   r.mode = (Mode)in.u8();
@@ -782,6 +789,9 @@ bool decode(const uint8_t* data, size_t size, Room& out) {
     m.id = in.u8(); m.wins = in.u16(); m.losses = in.u16(); m.character = in.u8(); m.costume = in.u8();
     m.code = in.str(kMaxId); m.name = in.str(kMaxName);
     if (!legacy) { m.bot_of = in.u8(); m.pro = in.u8(); }
+    if (levels) m.level = in.u8();
+    if (m.level < kBotLevelMin || m.level > kBotLevelMax) return false;
+    if (!levels && m.pro == kPro20xx) return false;   // an older wire never carries a 20XX CPU
     if (!in.ok) return false;
     r.members.push_back(std::move(m));
   }
