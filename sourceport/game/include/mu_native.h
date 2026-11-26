@@ -287,6 +287,32 @@ void mu_te_debug_menu_save(void);
 unsigned int mu_game_options2(void);
 int mu_te2(unsigned int feature);   /* a second-word 20XX TE feature is in effect */
 int mu_option2_offline(unsigned int bit);   /* a plain second-word option is in effect (offline, no TE master) */
+/* shim/mu_controls.c: tap jump off and tilt stick (port/runtime/abi/mu_controls.h). The host's per-slot
+ * bits are taken once as each match starts (gm/gmvs.c); mu_control says whether this fighter plays
+ * with that bit this match (a person's fighter only). */
+#include "mu_controls.h"
+struct Fighter;
+void mu_controls_match_start(void);
+int mu_control(const struct Fighter* fp, unsigned int bit);
+/* 20XX Melee 1.03 by Hax$ and Altimor, its netplay ruleset (shim/mu_20xx103.c); on per match (mu_controls.c). */
+int mu_20xx103_on(void);
+void mu_20xx_input(struct Fighter* fp);
+void mu_20xx_record_pad(struct Fighter* fp);
+void mu_20xx_proc_update(struct Fighter* fp);
+void mu_20xx_damage_hitlag(struct Fighter* fp);
+void mu_20xx_guard_sdi(struct Fighter* fp);
+void mu_20xx_guard_800939B4_after(struct Fighter* fp);
+int mu_20xx_escape_blocked(struct Fighter* fp);
+int mu_20xx_squatrv_blocked(struct Fighter* fp);
+void mu_20xx_fall_enter(struct Fighter* fp);
+int mu_20xx_damagefall_wiggle(struct HSD_GObj* gobj);
+void mu_20xx_turn(struct Fighter* fp);
+void mu_20xx_nana_buffer(struct Fighter* popo, struct Fighter* nana);
+int mu_20xx_ground_accel(struct Fighter* fp, float accel_max, float target_max);
+void mu_controls_pad(struct Fighter* fp);       /* Fighter_procInput: Start + D-pad toggles */
+int mu_controls_pause_combo(int pad);           /* gmvs.c: that Start is a toggle, not a pause */
+int mu_controls_lcancel_off(int slot);          /* the host's automatic L-cancel, turned off mid-match */
+void mu_controls_hud_init(void);                /* ifStatus_802F665C: the toggle's line */
 /* "Freeze Pokemon Stadium (offline only)" (Game tab, Stages): Slippi's Frozen Pokemon
  * Stadium, offline. Never in playback: there the replay's own isFrozenPS counts. */
 int mu_stadium_frozen_option(void);

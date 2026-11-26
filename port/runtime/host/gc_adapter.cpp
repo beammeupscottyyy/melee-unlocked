@@ -118,6 +118,32 @@ std::string g_problem;
 void set_problem(const std::string& text) { std::lock_guard<std::mutex> lock(g_problem_mutex); g_problem = text; }
 constexpr const char* kFrame1Note = " A box controller plugged in normally, such as a Frame1, counts as an adapter.";
 struct Origin { bool set = false; uint8_t sx = 128, sy = 128, cx = 128, cy = 128, tl = 0, tr = 0; } g_origin[4];
+// The last neutral point per port that was taken with the sticks and triggers at rest. An adapter
+// can drop a port for one report mid-match and bring it straight back; a neutral taken then, with the
+// stick held, made the released stick read as a full push the other way for the rest of the session.
+Origin g_rest_origin[4];
+// How far from centre a reading still counts as a stick at rest: real controllers sit within about
+// 30 steps of 128, a held stick is 70 or more away.
+constexpr int kRestStick = 48, kRestTrigger = 64;
+// Takes the neutral point from this report. When any stick axis or trigger is clearly held (a
+// held stick can sit near centre on its other axis), the whole neutral point stays the last one
+// taken at rest for that port, or the centre when there is none.
+void take_origin(int port, const uint8_t* c) {
+  Origin& o = g_origin[port];
+  auto off = [](uint8_t v) { return std::abs((int)v - 128) > kRestStick; };
+  const bool held = off(c[3]) || off(c[4]) || off(c[5]) || off(c[6]) || c[7] > kRestTrigger || c[8] > kRestTrigger;
+  if (held) o = g_rest_origin[port];
+  else { o.sx = c[3]; o.sy = c[4]; o.cx = c[5]; o.cy = c[6]; o.tl = c[7]; o.tr = c[8]; }
+  o.set = true;
+  if (!held) g_rest_origin[port] = o;
+  if (held)
+    log("gc adapter: port %d connected with a stick or trigger held (stick %u,%u c-stick %u,%u triggers %u,%u): "
+        "neutral stick %u,%u c-stick %u,%u triggers %u,%u kept", port + 1, c[3], c[4], c[5], c[6], c[7], c[8],
+        o.sx, o.sy, o.cx, o.cy, o.tl, o.tr);
+  else
+    log("gc adapter: port %d connected, neutral stick %u,%u c-stick %u,%u triggers %u,%u", port + 1, o.sx, o.sy, o.cx, o.cy, o.tl, o.tr);
+}
+
 
 // PhobGCC settings per adapter port (phob.h). The firmware's loop runs on the reader thread, once
 // per millisecond of adapter reports, so its filters see every report the adapter sends; the poll
@@ -869,12 +895,7 @@ uint32_t gcadapter_poll(PadState out[4]) {
     uint8_t status = c[0] & 0x30;
     if (!status) { g_origin[port].set = false; continue; }
     Origin& o = g_origin[port];
-    if (!o.set) {
-      o.set = true; o.sx = c[3]; o.sy = c[4]; o.cx = c[5]; o.cy = c[6]; o.tl = c[7]; o.tr = c[8];
-      // The neutral point is taken from this first report; a stick held while the controller
-      // connects shifts every later reading, so record it for input reports.
-      log("gc adapter: port %d connected, neutral stick %u,%u c-stick %u,%u triggers %u,%u", port + 1, o.sx, o.sy, o.cx, o.cy, o.tl, o.tr);
-    }
+    if (!o.set) take_origin(port, c);
     PadState& p = out[port];
     std::memset(&p, 0, sizeof p);
     p.err = 0;
@@ -930,9 +951,10 @@ void gcadapter_rumble(int port, bool on) {
 // ---- test runs: a scripted controller on socket 1 ----
 // MELEE_TEST_ADAPTER_SCRIPT=<file>, honoured only when the real adapter is off (--no-gc-adapter, as
 // every hidden test run is). One line per step: `<ms> <ax> <ay> <cx> <cy> <la> <ra> [buttons...]`,
-// raw adapter bytes (128 is centre), buttons A B X Y Z L R S DU DD DL DR. The steps play once at
+// raw adapter bytes (128 is centre), buttons A B X Y Z L R S DU DD DL DR, and U for a step where the
+// adapter reports the controller unplugged (a dropped port). The steps play once at
 // 1 kHz through the same report path as a real adapter (phob_process); the last one then holds.
-struct ScriptStep { int ms; uint8_t ax, ay, cx, cy, la, ra; uint16_t buttons; };
+struct ScriptStep { int ms; uint8_t ax, ay, cx, cy, la, ra; uint16_t buttons; bool unplugged = false; };
 std::thread g_test_thread;
 std::atomic<bool> g_test_run{false};
 
@@ -945,7 +967,7 @@ void test_script_thread(std::vector<ScriptStep> steps) {
   uint8_t rep[37] = {0x21};
   auto fill = [&](const ScriptStep& s) {
     uint8_t* c = rep + 1;
-    c[0] = 0x10;
+    c[0] = s.unplugged ? 0x00 : 0x10;
     const uint16_t b = s.buttons;
     c[1] = (uint8_t)((b & PAD_A ? 0x01 : 0) | (b & PAD_B ? 0x02 : 0) | (b & PAD_X ? 0x04 : 0) | (b & PAD_Y ? 0x08 : 0) |
                      (b & PAD_LEFT ? 0x10 : 0) | (b & PAD_RIGHT ? 0x20 : 0) | (b & PAD_DOWN ? 0x40 : 0) | (b & PAD_UP ? 0x80 : 0));
@@ -962,7 +984,8 @@ void test_script_thread(std::vector<ScriptStep> steps) {
     const auto now = std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> lk(g_mutex);
-      if (!g_origin[0].set) { g_origin[0].set = true; g_origin[0].sx = g_origin[0].sy = g_origin[0].cx = g_origin[0].cy = 128; }
+      // Neutral points come from the reports through take_origin, as on a real adapter.
+      if (!(rep[1] & 0x30)) g_origin[0].set = false; else if (!g_origin[0].set) take_origin(0, rep + 1);
       std::memcpy(g_report, rep, 37);
       g_report_time = now;
       g_have_report = true;
@@ -1000,7 +1023,7 @@ void gcadapter_test_script_start() {
       if (b == "A") s.buttons |= PAD_A; else if (b == "B") s.buttons |= PAD_B; else if (b == "X") s.buttons |= PAD_X;
       else if (b == "Y") s.buttons |= PAD_Y; else if (b == "Z") s.buttons |= PAD_Z; else if (b == "L") s.buttons |= PAD_L;
       else if (b == "R") s.buttons |= PAD_R; else if (b == "S") s.buttons |= PAD_START; else if (b == "DU") s.buttons |= PAD_UP;
-      else if (b == "DD") s.buttons |= PAD_DOWN; else if (b == "DL") s.buttons |= PAD_LEFT; else if (b == "DR") s.buttons |= PAD_RIGHT;
+      else if (b == "DD") s.buttons |= PAD_DOWN; else if (b == "DL") s.buttons |= PAD_LEFT; else if (b == "DR") s.buttons |= PAD_RIGHT; else if (b == "U") s.unplugged = true;
     }
     steps.push_back(s);
   }

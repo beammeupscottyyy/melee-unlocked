@@ -422,7 +422,9 @@ static HSD_Text* text_create(MuRankedWidgets* w, float x, float y, float scale)
         return NULL;
     }
     t->pos_x=x; t->pos_y=y; t->pos_z=0; t->box_size_x=t->box_size_y=20;
-    t->default_kerning=1; t->x34.x=t->x34.y=scale;
+    t->default_kerning=1; t->x34.y=scale;
+    /* True widescreen stretches this flat layer: glyphs keep their shape (header_text). */
+    { float mu_picture_widen(void); t->x34.x=scale/mu_picture_widen(); }
     HSD_SisLib_803A6B98(t,0,0,"%s","");
     return t;
 }
@@ -430,7 +432,12 @@ static void text_set(HSD_Text* t, unsigned sub, const char* value)
 {
     if (t) HSD_SisLib_803A70A0(t,sub,"%s",value);
 }
-/* This scene owns a pixel-space canvas, unlike CSS/HUD world-space text. */
+/* This scene owns a pixel-space canvas, unlike CSS/HUD world-space text. True widescreen widens the
+ * perspective scene (the timer bar) but not this flat layer, so a pixel x is brought toward the centre
+ * by the picture's widening (above 1 in True widescreen: 16:9 over 4:3): the names and badges stay over the bar, not at the
+ * screen edges. 1 in 4:3 and with Slippi's widescreen code. */
+float mu_picture_widen(void);
+static float widen_x(float x) { return 320.f + (x - 320.f) / mu_picture_widen(); }
 static void header_text(MuRankedWidgets* w, const MuRankedSetupModel* m, const MuMatchState* ms)
 {
     unsigned i;
@@ -440,29 +447,33 @@ static void header_text(MuRankedWidgets* w, const MuRankedSetupModel* m, const M
     if (!HSD_SisLib_804D1124[0])
         HSD_SisLib_803A62A0(0,"SdSlChr.usd","SIS_SelCharData");
     w->canvas=HSD_SisLib_803A611C(0,NULL,9,18,0,3,0,19);
-    w->text=text_create(w,320,45,.7f);
+    /* The timer (line 0) centred on the turn arrows (y 57: captured 8 below them at y 45, 11-25); the
+     * other lines keep their pixel places through T (their offsets were measured from y 45). */
+#define T 8.0f
+    w->text=text_create(w,320,45-T,.7f);
     if (w->text) {
         w->text->default_alignment=1;
-        HSD_SisLib_803A6B98(w->text,0,130,"%s","");
-        HSD_SisLib_803A6B98(w->text,0,190,"%s","");
-        HSD_SisLib_803A6B98(w->text,0,240,"%s","");
-        HSD_SisLib_803A6B98(w->text,0,295,"%s","");
-        for (i=1; i<5; ++i) HSD_SisLib_803A7548(w->text,i,.5f,.5f);
+        HSD_SisLib_803A6B98(w->text,0,130+T,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,190+T,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,240+T,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,295+T,"%s","");
+        for (i=1; i<5; ++i) HSD_SisLib_803A7548(w->text,i,.5f/mu_picture_widen(),.5f);
         /* Pips are at pixel y 25.5, turn arrows at y 61; score sits below. */
-        HSD_SisLib_803A6B98(w->text,0,92.0f-45.0f,"%s","");
-        HSD_SisLib_803A7548(w->text,5,.45f,.45f);
+        HSD_SisLib_803A6B98(w->text,0,92.0f-45.0f+T,"%s","");
+        HSD_SisLib_803A7548(w->text,5,.45f/mu_picture_widen(),.45f);
         /* 6-8: the winner's lines in DISCONNECTED's place when the opponent left (CTO 11-01).
          * Glyph tops at about y 165, 195 and 218, above "Press A" at about y 262 (build 31). */
-        HSD_SisLib_803A6B98(w->text,0,101,"%s","");
-        HSD_SisLib_803A6B98(w->text,0,135,"%s","");
-        HSD_SisLib_803A6B98(w->text,0,158,"%s","");
-        HSD_SisLib_803A7548(w->text,6,.55f,.55f);
-        for (i=7; i<9; ++i) HSD_SisLib_803A7548(w->text,i,.45f,.45f);
+        HSD_SisLib_803A6B98(w->text,0,101+T,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,135+T,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,158+T,"%s","");
+        HSD_SisLib_803A7548(w->text,6,.55f/mu_picture_widen(),.55f);
+        for (i=7; i<9; ++i) HSD_SisLib_803A7548(w->text,i,.45f/mu_picture_widen(),.45f);
     }
+#undef T
     for (i=0; i<2; ++i) {
         /* Slippi GameSetup.c InitPlayerInfo: the name at scale 5 and the code 2 units under it at scale 3,
          * gray, both 3.55 units in from x 28 to leave room for the rank icon (10 px a unit here). */
-        w->names[i]=text_create(w,i ? 564.5f : 75.5f,39,.7f*5.f/6.f);
+        w->names[i]=text_create(w,widen_x(i ? 564.5f : 75.5f),39,.7f*5.f/6.f);
         if (w->names[i]) {
             unsigned player=i ? !m->local_player : m->local_player;
             char name[31], code[10];
@@ -473,7 +484,7 @@ static void header_text(MuRankedWidgets* w, const MuRankedSetupModel* m, const M
             {
                 const GXColor code_gray={128,128,128,255};
                 const int sub=HSD_SisLib_803A6B98(w->names[i],0,20.f/(.7f*5.f/6.f),"%s",code);
-                HSD_SisLib_803A7548(w->names[i],sub,.6f,.6f);
+                HSD_SisLib_803A7548(w->names[i],sub,.6f/mu_picture_widen(),.6f);
                 HSD_SisLib_803A74F0(w->names[i],sub,(GXColor*)&code_gray);
             }
         }
@@ -501,7 +512,7 @@ static void header_ranks(MuRankedWidgets* w, const MuRankedSetupModel* m)
         unsigned side=seat == m->local_player ? 0 : 1;
         /* Slippi's rank icon spot (x +-27.5, y 17.85 world: pixel 320 -+ 275, 54.5), art only as its icons. */
         if (!w->badges[seat]) {
-            w->badges[seat]=mu_rank_badge_create(NULL,side ? 595.f : 45.f,54.5f,1.4f,r[seat]);
+            w->badges[seat]=mu_rank_badge_create(NULL,widen_x(side ? 595.f : 45.f),54.5f,1.4f,r[seat]);
             mu_rank_badge_art_only(w->badges[seat]);
         } else mu_rank_badge_set(w->badges[seat],r[seat]);
     }
@@ -667,6 +678,11 @@ void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, con
         int visible=active && local && v->confirming && !v->dialog && (i == 0 || s->type != MU_SETUP_COLOR);
         visibility(&w->buttons[i],visible);
         state(&w->buttons[i],visible && v->button == i ? 1 : 0,0);
+        /* The button's child joint is its yellow highlight frame: the selected button's blink fades it in and
+         * out, but the static pose holds it solid, so the unselected button looked selected (OK and Redo
+         * seemed swapped). Only the selected button shows it, as in Slippi. */
+        if (visible && v->button != i && w->buttons[i].root && w->buttons[i].root->child && w->buttons[i].root->child->child)
+            HSD_JObjSetFlagsAll(w->buttons[i].root->child->child,JOBJ_HIDDEN);
         if (!i) position(&w->buttons[i],s && s->type == MU_SETUP_COLOR ? 0 : -4.8f,-3);
         state(&w->turn[i],active && s->player == (i ? !m->local_player : m->local_player) ? local ? 3 : 1 : 0,0);
     }

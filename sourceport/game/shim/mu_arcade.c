@@ -10,11 +10,13 @@
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/wobj.h>
 #include <melee/lb/lbcollision.h>
+#include <mu_gxpipe.h>
 
 int mu_option2_offline(unsigned int bit);
 unsigned int mu_display_options(void);
 unsigned int mu_grid_color(void);
 int mu_online_active(void);
+int mu_native_owner_tracking(void);
 int mu_online_pending(void);
 int mu_widescreen(void);
 float mu_picture_widen(void);
@@ -92,6 +94,10 @@ void mu_arcade_grid(void)
         return;
     }
     v0.z = v1.z = -30.0F;
+    /* Tag 0x7F (gx_core.h kStageMapGrid): the renderer never takes these lines for hidden scenery. Owner
+     * tracking is always on while the Arcade look's background is. */
+    const int tag = mu_native_owner_tracking();
+    if (tag) { GXW_u8(0xF7); GXW_u8(0x7F); }
     for (x = left; x <= right; x += 5.0F) {
         v0.x = x - 0.12F; v1.x = x + 0.12F; v0.y = bottom; v1.y = top;
         lbColl_80009DD4(&v0, &v1, &color);
@@ -100,4 +106,5 @@ void mu_arcade_grid(void)
         v0.y = y - 0.12F; v1.y = y + 0.12F; v0.x = left; v1.x = right;
         lbColl_80009DD4(&v0, &v1, &color);
     }
+    if (tag) { GXW_u8(0xF7); GXW_u8(0xFF); }
 }

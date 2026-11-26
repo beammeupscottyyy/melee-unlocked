@@ -566,6 +566,8 @@ inline std::atomic<uint8_t>& arcade_backdrop_slot() { static std::atomic<uint8_t
 // farthest fighter. Melee plays on the z = 0 plane: platforms, ledges and walls sit within a few
 // units of it, scenery is tens to thousands of units back.
 constexpr float kLightweightBackgroundDepth = 60.0f;
+// The Arcade look's grid (mu_arcade.c, stage map tag 0x7F, which no real map gets): never hidden.
+constexpr uint8_t kStageMapGrid = 0x7F;
 
 // The view-space z of a vertex: row 2 of its position matrix (GX keeps model-view matrices).
 inline float lightweight_view_z(const DrawCall& d, const Vertex& v) {
@@ -649,6 +651,7 @@ inline LightweightFilter lightweight_filter(const Frame& f, int level) {
 // (they have an owner or are skinned) never count, nor does anything off the world camera. With no
 // fighter in view (a cut-in, the results walk-off) nothing is skipped.
 inline bool lightweight_background(const LightweightFilter& e, const Frame& f, const DrawCall& d) {
+  if (d.stage_map == kStageMapGrid) return false;
   // Scenery the game itself names (Whispy, Fountain of Dreams' trees, Yoshi's Story's clouds): off
   // whatever its depth, which on those stages is the fighters' own.
   if (e.backdrop_off && e.have_fighters && d.stage_map != 0xFF && (d.stage_map & 0x80) && lightweight_world_draw(e, d)) return true;
