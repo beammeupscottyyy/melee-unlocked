@@ -2422,6 +2422,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
     while (!value.empty() && (value.back() == '\r' || value.back() == ' ' || value.back() == '\t')) value.pop_back();
     if (key == "truewsfit") { truewsfit_seen = true; continue; }
     // Read outside the long else-if chain below: one more branch there is past MSVC's nesting limit (C1061).
+    if (key == "triples") { options.triples_flags = std::atoi(value.c_str()) & 7; continue; }   // five and six players
     if (key == "proaireaction") { options.pro_ai_extra_delay = std::clamp(std::atoi(value.c_str()), 0, phillip_ai::kMaxExtraDelay); continue; }
     if (key == "practicechord") {
       const int chord = (int)std::strtol(value.c_str(), nullptr, 16);
@@ -5185,8 +5186,13 @@ static void draw_arena_panel(RenderOptions& options, const host::PadState* pads,
   // Ranked and Unranked have no rooms: no ARENA tab or "Push the hand here" box on their selects.
   // The YouGame Friends lobby's select too: its ARENA card takes the player to the arena (FromFriends).
   const bool friends_lobby = slippi::arena::css_friends_lobby() && slippi::online::friends_lobby_armed() && yougame::session();
+  // Not once the online scene has left its select (08/04 the splash and loading, 08/02 the match): the select's
+  // last match-state poll and hand report outlive it by a few frames, so the WARM UP and ARENA cards stayed up into
+  // the match's start and flickered on the loading screen (owner 11-27).
+  const auto scene_now = slippi::native_practice::snapshot();
+  const bool select_left = scene_now.scene_major == 0x08 && scene_now.scene_minor != 0;
   f.on_online_menus = ((slippi::online::in_online_menus() || friends_lobby) && slippi::arena::css_hand(&hand_x, &hand_y) &&
-                       !slippi::arena::css_ranked_or_unranked()) ||
+                       !slippi::arena::css_ranked_or_unranked() && !select_left) ||
                       slippi::arena::test_fixture_active();
   {
     // Logged on a change: whether the room panel is offered on this select, and what decided it.
@@ -5379,6 +5385,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nlab_colour_background " << lab_colour_text(options.lab_colour_background)
        << "\nlab_colour_stage " << lab_colour_text(options.lab_colour_stage)
        << "\nplayertags " << options.player_tags_always
+       << "\ntriples " << options.triples_flags
        << "\narcade_hitboxes " << (options.arcade_hitboxes ? 1 : 0)
        << "\narcade_projectile_hitboxes " << (options.arcade_projectile_hitboxes ? 1 : 0)
        << "\narcade_hitboxes_behind " << (options.arcade_hitboxes_behind ? 1 : 0)
@@ -6372,6 +6379,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   set_fod_reflections(options.fod_reflections);
   set_css_background_free(options.css_background_free);
   set_player_tags_always(options.player_tags_always != 0);
+  set_triples_flags((uint32_t)options.triples_flags);
   set_arcade_display(ArcadeSource::Settings, arcade_settings_bits(options)); set_shield_colors(options.shield_color, options.shield_color_online);
   static bool test_tab_set = false;
   if (!test_tab_set) {
@@ -11408,6 +11416,29 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("The P1, P2, P3 and P4 markers over the fighters stay up for the whole match.\n"
                           "Display only, so it is yours alone online. Takes effect immediately.");
+    }
+    // Five and six players (Triples, shim/mu_triples.c): the 5-6 player match helpers. Display only.
+    {
+      struct Tri { uint32_t bit; const char* name; const char* tip; };
+      static const Tri kTri[] = {
+        {MU_TRIPLES_OPTION_TAGS, "5-6 players: markers stay up",
+         "With five or six players alive, the P1-P6 markers stay over every fighter. When four are left\n"
+         "they flicker for two seconds and the game's own rules take over. Display only."},
+        {MU_TRIPLES_OPTION_HUD_FADE, "5-6 players: see-through HUD",
+         "In five- and six-player matches a player's damage and stocks turn see-through while a fighter\n"
+         "is behind them (UnclePunch's HUD Transparency). Display only."},
+        {MU_TRIPLES_OPTION_WIDE_CAMERA, "5-6 players: wider camera",
+         "Offline five- and six-player matches: the camera may pull further out, so the whole fight fits.\n"
+         "Takes effect immediately."},
+      };
+      for (const Tri& t : kTri) {
+        bool on = ((uint32_t)options.triples_flags & t.bit) != 0;
+        if (settings_toggle(t.name, &on)) {
+          options.triples_flags = (int)(on ? ((uint32_t)options.triples_flags | t.bit) : ((uint32_t)options.triples_flags & ~t.bit));
+          changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", t.tip);
+      }
     }
     {
       // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=screenshake): bring the shake settings into view once.

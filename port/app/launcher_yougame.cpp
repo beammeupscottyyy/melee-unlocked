@@ -889,12 +889,18 @@ std::string native_build_from_listing(const std::string& page, const std::string
   std::string b;
   for (char c : page) if (c != '\\') b += c;
   static const std::string kLatest = "\"latest\":{", kTitle = "\"title\":\"Melee Unlocked ";
-  const size_t latest = b.find(kLatest);
-  if (latest == std::string::npos) return found;
-  const size_t close = b.find('}', latest), title = b.find(kTitle, latest);
-  if (title == std::string::npos || (close != std::string::npos && title > close)) return found;
-  const size_t v = title + kTitle.size(), v_end = b.find('"', v);
-  if (v_end == std::string::npos || b.compare(v, v_end - v, version) != 0) return found;
+  // 11-27: the page says "latest":null and names its current release as the game's version instead
+  // ("version":"v1.0.34", the release tag); its numbered builds are still that release's records. Read only the
+  // old way, every launcher Doubles home was refused as "not listed yet" (a player's 1.0.34 log, 11-27).
+  const bool named_as_version = b.find("\"version\":\"v" + version + "\"") != std::string::npos;
+  if (!named_as_version) {
+    const size_t latest = b.find(kLatest);
+    if (latest == std::string::npos) return found;
+    const size_t close = b.find('}', latest), title = b.find(kTitle, latest);
+    if (title == std::string::npos || (close != std::string::npos && title > close)) return found;
+    const size_t v = title + kTitle.size(), v_end = b.find('"', v);
+    if (v_end == std::string::npos || b.compare(v, v_end - v, version) != 0) return found;
+  }
   long best = -1;
   for (const ListedBuild& r : builds) {
     if (r.platform != platform || r.version.empty() || r.version.size() > 9 ||
@@ -1237,6 +1243,8 @@ BridgeReply handle(const HttpRequest& request, const std::vector<std::string>& t
                 {"build", parse_or_empty(build_json)}};
       if (const std::string nb = listed_build_id(parse_or_empty(build_json).value("version", std::string())); !nb.empty())
         body["native_build"] = nb;
+      // Six seats (Triples, yougame_friends.h lobby_hold): passed on in the room's lobby for YouGame to grant or refuse.
+      if (players == 4 && q.value("seats", 0) == 6) body["lobby"]["seats"] = 6;
       // Launcher copies have no YouGame links of their own (the app's): said on the ticket for YouGame, and by
       // the game to the other seats (its word), so every seat of its match connects over direct UDP.
       body["links"] = false;
@@ -1327,6 +1335,11 @@ std::string sdk_request(const std::string& request_json, const std::string& vers
     const auto response = app::social(staging_env(), version, {request}, timeout_ms);
     const auto found = response.answers.find(request.value("type", std::string()));
     if (found == response.answers.end()) throw std::runtime_error("Open YouGame to invite a friend, or use Copy code to share this room.");
+    // A room's Invite is YouGame's friend picker, which only the YouGame app has; its refusal ("the player didn't
+    // approve this") was all the player saw (owner 11-27). The way that always works is said with it.
+    if (!found->second.value("ok", false) && request.value("type", std::string()) == "mpFriend")
+      throw std::runtime_error(found->second.value("error", std::string("YouGame refused the invite.")) +
+                               " Or share the room code (Copy code): your friend types it in Join.");
     if (!found->second.value("ok", false))
       throw std::runtime_error(found->second.value("error", std::string("YouGame refused the room request.")));
     return found->second.value("result", json::object()).dump();

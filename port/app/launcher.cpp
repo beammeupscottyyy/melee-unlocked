@@ -1434,14 +1434,20 @@ void show_look_menu() {
   // The pointer in the Melee looks (owner 11-25): the 3D hand, the first flat hand, or the Windows pointer;
   // the hand can point left as a mouse pointer does. The Classic look always has the Windows pointer.
   const int ptr = launcher::melee_look::pointer();
-  const UINT melee_only = now == 0 ? MF_GRAYED : 0;
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-  AppendMenuW(m, MF_STRING | MF_GRAYED, 0, launcher::lang::txw(L"Pointer").c_str());
-  AppendMenuW(m, MF_STRING | melee_only | (ptr == 0 ? MF_CHECKED : 0), 5, launcher::lang::txw(L"Melee hand").c_str());
-  AppendMenuW(m, MF_STRING | melee_only | (ptr == 1 ? MF_CHECKED : 0), 6, launcher::lang::txw(L"Melee hand, flat").c_str());
-  AppendMenuW(m, MF_STRING | melee_only | (ptr == 2 ? MF_CHECKED : 0), 7, launcher::lang::txw(L"Windows pointer").c_str());
-  AppendMenuW(m, MF_STRING | (now == 0 || ptr == 2 ? MF_GRAYED : 0) | (launcher::melee_look::pointer_left() ? MF_CHECKED : 0), 8,
-              launcher::lang::txw(L"Hand points left").c_str());
+  if (now == 0) {
+    // Classic: one plain line, not four grayed choices with old checks on them (owner 11-27: "i broke it", the
+    // Windows pointer and Hand points left both checked and nothing pickable). The hand comes with the Melee looks.
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, launcher::lang::txw(L"Pointer: Windows (pick a Melee look for the hand)").c_str());
+  } else {
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, launcher::lang::txw(L"Pointer").c_str());
+    AppendMenuW(m, MF_STRING | (ptr == 0 ? MF_CHECKED : 0), 5, launcher::lang::txw(L"Melee hand").c_str());
+    AppendMenuW(m, MF_STRING | (ptr == 1 ? MF_CHECKED : 0), 6, launcher::lang::txw(L"Melee hand, flat").c_str());
+    AppendMenuW(m, MF_STRING | (ptr == 2 ? MF_CHECKED : 0), 7, launcher::lang::txw(L"Windows pointer").c_str());
+    // Pointing left is the hand's: with the Windows pointer it is neither offered nor shown as on.
+    AppendMenuW(m, MF_STRING | (ptr == 2 ? MF_GRAYED : (launcher::melee_look::pointer_left() ? MF_CHECKED : 0)), 8,
+                launcher::lang::txw(L"Hand points left").c_str());
+  }
   AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(m, MF_STRING, 4, launcher::lang::txw(L"Launcher color").c_str());
   RECT b{}; GetWindowRect(GetDlgItem(g_main, ID_THEME), &b);
@@ -2469,11 +2475,15 @@ void refresh_updater() {
     g_version_line = line; g_version_dot = d;
     if (g_tab == 0) { invalidate(version_text_rect()); invalidate(LR(CX, play_layout().version_y + 3, 8, 8)); }
   }
-  ShowWindow(g_update_btn, (st == State::UpdateAvailable || st == State::Failed) && g_tab == 0 ? SW_SHOW : SW_HIDE);
-  set_text(g_update_btn, st == State::Failed ? "Retry" : "Update and restart");
+  // Always on the Play page (owner 11-27): Check for updates asks GitHub again, so a release published while the
+  // launcher is open shows without restarting it; with one found it is the Update button.
+  ShowWindow(g_update_btn, g_tab == 0 ? SW_SHOW : SW_HIDE);
+  set_text(g_update_btn, st == State::Failed ? "Retry" : st == State::UpdateAvailable ? "Update and restart"
+                         : st == State::Checking ? "Checking..." : st == State::Downloading || st == State::ReadyToInstall ? "Updating..."
+                         : "Check for updates");
   const bool choosing = host::updater::rollback_state() == host::updater::RollbackState::Downloading;
   EnableWindow(g_versions_btn, !choosing);
-  EnableWindow(g_update_btn, !choosing);
+  EnableWindow(g_update_btn, !choosing && st != State::Checking && st != State::Downloading && st != State::ReadyToInstall);
 }
 
 // What's new: the release notes from GitHub, the same text as each release page there, newest
@@ -3006,8 +3016,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           break;   // no update source for this build (see the check at start)
 #endif
           if (host::updater::rollback_state() == host::updater::RollbackState::Downloading) break;
-          if (host::updater::state() == host::updater::State::Failed) host::updater::check(MELEE_PORT_VERSION);
-          else { settings_standby_stop(); host::updater::download_and_install(); }
+          if (host::updater::state() == host::updater::State::UpdateAvailable) { settings_standby_stop(); host::updater::download_and_install(); }
+          else if (host::updater::state() == host::updater::State::Idle || host::updater::state() == host::updater::State::UpToDate ||
+                   host::updater::state() == host::updater::State::Failed) {
+            // Check for updates (or Retry): a release found now asks its yes/no again.
+            g_update_prompted = false;
+            host::updater::check(MELEE_PORT_VERSION);
+          }
           refresh_updater();
           break;
         case ID_VERSIONS: choose_version(); break;
@@ -3549,6 +3564,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
                                 s.version = widen(MELEE_PORT_VERSION);
                                 s.extension = launcher::yougame::extension();
                                 if (host::updater::state() == host::updater::State::UpdateAvailable) s.update = launcher::lang::txw(L"Update to") + L" " + widen(host::updater::latest_version());
+                                else if (host::updater::state() == host::updater::State::Checking) s.update = launcher::lang::txw(L"Checking for updates...");
+                                else if (host::updater::state() == host::updater::State::Downloading || host::updater::state() == host::updater::State::ReadyToInstall) s.update = launcher::lang::txw(L"Updating...");
+                                else s.update = launcher::lang::txw(L"Check for updates");   // owner 11-27: no relaunch to see a new release
                                 const auto* cur = launcher::lang::find(launcher::lang::current()); s.language = cur ? cur->native : L"English";
                                 return s;
                               },

@@ -50,7 +50,7 @@ bool g_tracking = false;
 std::wstring g_toast; ULONGLONG g_toast_until = 0;
 ULONG_PTR g_gdiplus = 0;
 
-enum Act { A_BUILD_MENU, A_PLAYER_MENU, A_ADD_TYPED, A_SIGN_IN, A_STATUS, A_RAIL_ART, A_WATCH_PLAYER, A_NAV, A_PLAY_OFFLINE, A_QUEUE, A_JOIN_CODE, A_CREATE, A_ROOM, A_WATCH, A_RAIL_TAB, A_ELO, A_TOOL, A_ME, A_MY_MAIN };
+enum Act { A_BUILD_MENU, A_PLAYER_MENU, A_ADD_TYPED, A_SIGN_IN, A_STATUS, A_RAIL_ART, A_WATCH_PLAYER, A_NAV, A_PLAY_OFFLINE, A_QUEUE, A_JOIN_CODE, A_CREATE, A_ROOM, A_WATCH, A_RAIL_TAB, A_ELO, A_TOOL, A_ME, A_MY_MAIN, A_LEAVE_ROOM };
 struct Hit { RECT r; int act, arg; };
 std::vector<Hit> g_hits;
 
@@ -375,8 +375,12 @@ void play_page(HDC dc, const launcher::yglobby::Data& d, double bottom) {
   const double rt = 226, rb = bottom - (g_cb.status ? 50 : 18);   // room for the status line
   line_box(dc, 244, rt, 720, rb - rt, 10, P.line_strong);
   mt(dc, L"Public rooms", 261, 247, 23, RGB(255, 255, 255));
-  const double cw = mw(dc, L"Create room", 20) * 96.0 / dpi() + 32, cx = 947 - cw;
-  frame_button(dc, cx, 239, cw, 34, L"Create room", 20, A_CREATE);
+  // In a room (made here or joined): the button leaves it, so a host can always close their room (owner 11-27: a
+  // friend's room stayed listed with no way out of it short of closing the launcher).
+  const bool in_room = !launcher::room::current().code.empty();
+  const wchar_t* room_label = in_room ? L"Leave room" : L"Create room";
+  const double cw = mw(dc, room_label, 20) * 96.0 / dpi() + 32, cx = 947 - cw;
+  frame_button(dc, cx, 239, cw, 34, room_label, 20, in_room ? A_LEAVE_ROOM : A_CREATE);
   const double kx = cx - 10 - 200;
   line_box(dc, kx, 239, 200, 34, 7, P.line_strong);
   { const double jw = text_w(dc, g_f13b, L"Join") * 96.0 / dpi() + 20, jx = kx + 200 - 5 - jw; const RECT j = R(jx, 243, jw, 26); hit(j, A_JOIN_CODE);
@@ -463,7 +467,9 @@ void status_line_bar(HDC dc, double bottom) {
   const size_t prefix = mods.find(L": ");
   if (prefix != std::wstring::npos) mods.erase(0,prefix+2);
   const double version_width = (g_status_style == 1 ? text_w(dc,g_f13b,s.version) : mw(dc,s.version,17))*96.0/dpi()+12;
-  part(2, true, s.mods_on ? kOk : P.dim, L"Mods", mods, P.text2, std::max(45.0, content_right-x-version_width));
+  // Check for updates (or Update to X) always has its room: the mods' list shortens for it.
+  const double update_width = s.update.empty() ? 0.0 : (g_status_style == 1 ? text_w(dc,g_f13b,s.update) : mw(dc,s.update,17))*96.0/dpi()+12;
+  part(2, true, s.mods_on ? kOk : P.dim, L"Mods", mods, P.text2, std::max(45.0, content_right-x-version_width-update_width));
   part(3, false, 0, L"", s.version, P.text2);
   if (!s.update.empty()) part(4, false, 0, L"", s.update, P.accent);
   const bool extension_hot = is_hot(A_STATUS, 6);
@@ -573,7 +579,7 @@ void rail(HDC dc, const launcher::yglobby::Data& d, int W, int H) {
     const bool build = pl.build > 0 && pl.build < 4;
     const double block = 13.26 + 3 + 16 + (build ? 16 : 0), content = std::max({33.0, block, g_elo ? 40.0 : 0.0}), h = content + 12;
     if (y + h > bottom - 4) return false;
-    hit(R(x0, y, 247, h), A_PLAYER_MENU, (int)(&pl - &d.players[0]));   // the player: friend menu (the eye, added later, wins)
+    if (!pl.you) hit(R(x0, y, 247, h), A_PLAYER_MENU, (int)(&pl - &d.players[0]));   // the player: friend menu (the eye, added later, wins)
     if (is_hot(A_PLAYER_MENU, (int)(&pl - &d.players[0]))) fill_box(dc, x0, y + 1, 247, h - 2, 7, P.raised);
     const double ay = y + (h - 33) / 2;
     avatar(dc, pl.main, x0 + 6, ay, 30, pl.avatar);
@@ -581,13 +587,13 @@ void rail(HDC dc, const launcher::yglobby::Data& d, int W, int H) {
     const double ty = y + 6 + (content - block) / 2;
     double nx = x0 + 42;
     if (pl.friend_) { icon(dc, I_FRIEND, nx, ty + 0.6, 12, P.accent); nx += 18; }
-    mt(dc, pl.name, nx, ty, 17, RGB(240, 240, 240), x0 + 177 - nx);
+    mt(dc, pl.you ? pl.name + L" (you)" : pl.name, nx, ty, 17, RGB(240, 240, 240), x0 + 177 - nx);
     const int t = launcher::yglobby::tier_of_rating(pl.rating);
     double sx = x0 + 42; const double sy = ty + 16.26;
     sx += tx(dc, pl.in_match ? L"In match" : L"Online", sx, sy, g_f12, pl.in_match ? kAmber : P.dim) * 96.0 / dpi();
-    if (!g_elo || t < 0) { sx += tx(dc, kDot, sx, sy, g_f12, P.dim) * 96.0 / dpi(); tx(dc, t >= 0 ? kTierName[t] : L"Unranked", sx, sy, g_f12, t >= 0 ? kTier[t] : P.dim); }   // no rating: say Unranked, Elo on or off
+    if (!g_elo || t < 0) { sx += tx(dc, kDot, sx, sy, g_f12, P.dim) * 96.0 / dpi(); tx(dc, t >= 0 ? kTierName[t] : L"No rank yet", sx, sy, g_f12, t >= 0 ? kTier[t] : P.dim); }   // no rating: "No rank yet" (owner 11-27: "Unranked" beside "In match" read as the queue), Elo on or off
     if (build) tx(dc, kBuild[pl.build], x0 + 42, sy + 16, g_f12, kBuildCol[pl.build], 135);
-    if (pl.in_match) { icon(dc, I_EYE, x0 + 184, y + (h - 16) / 2, 16, P.accent); hit(R(x0 + 180, y + (h - 24) / 2, 24, 24), A_WATCH_PLAYER); }
+    if (pl.in_match && !pl.you) { icon(dc, I_EYE, x0 + 184, y + (h - 16) / 2, 16, P.accent); hit(R(x0 + 180, y + (h - 24) / 2, 24, 24), A_WATCH_PLAYER); }
     const double by = g_elo ? y + 6 + (content - 40) / 2 : y + (h - 22) / 2;
     launcher::yglobby::draw_badge(dc, pl.rating, X(x0 + 213), X(by), X(22));
     if (g_elo) tx(dc, pl.rating >= 0 ? std::to_wstring(pl.rating) : L"\u2013", x0 + 207, by + 23, g_f11b, t >= 0 ? kTier[t] : P.dim, 34, DT_CENTER);
@@ -686,6 +692,7 @@ void act(int a, int arg) {
     case A_PLAY_OFFLINE: if (launcher::yglobby::repeat_press()) return; if (g_cb.play_offline) g_cb.play_offline(); return;
     case A_QUEUE: if (launcher::yglobby::repeat_press()) return; launcher::yglobby::play(arg); toast(L"Starting the game..."); return;
     case A_CREATE: if (launcher::yglobby::repeat_press()) return; launcher::yglobby::create_room(true); return;
+    case A_LEAVE_ROOM: launcher::room::leave(); toast(L"You left the room."); InvalidateRect(g_window, nullptr, FALSE); return;
     case A_JOIN_CODE: { wchar_t b[32] = {}; if (g_code) GetWindowTextW(g_code, b, 31); if (!b[0]) { toast(L"Type a room code first."); return; }
       const std::wstring code = launcher::yglobby::room_code(b);
       if (code.empty()) { toast(L"A room code is 6 to 12 letters or numbers."); return; }

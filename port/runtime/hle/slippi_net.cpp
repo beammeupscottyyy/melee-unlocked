@@ -33,6 +33,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <cerrno>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -3028,7 +3029,16 @@ std::string Matchmaking::openSlippiTicket(const UserInfo& me, const std::functio
     });
     if (forced_port && host_port_ == forced_port)
       host::log(client_ ? "slippi: forced port %d bound" : "slippi: forced port %d bind failed", host_port_);
-    if (!client_) return "Failed to create mm client";
+    if (!client_) {
+      // Every try failed: the last port and the socket error say why (11-27: an Arena search failed this way between
+      // two linked members and the log could not tell a busy port from a refused socket).
+#ifdef _WIN32
+      host::log("slippi: the search could not open its network port (last tried %d, socket error %d)", host_port_, WSAGetLastError());
+#else
+      host::log("slippi: the search could not open its network port (last tried %d, errno %d)", host_port_, errno);
+#endif
+      return "Failed to create mm client";
+    }
     std::vector<ENetAddress> stun_addrs;
     native([&] {
       for (const auto& server : kStunServers) {
@@ -3309,12 +3319,13 @@ void Matchmaking::handleMatchmaking() {
 // reach each remote (LAN when on the same external IP), decider, stages and items. Everything is
 // read type-checked and the player list is checked against the fixed per-player arrays (see
 // ParsedTicket); a ticket that fails is refused whole.
-static Matchmaking::ParsedTicket parse_ticket(const json& resp) {
+// max_players: Slippi's server names at most four; a local test peering (local_peer_ticket) up to six (Triples).
+static Matchmaking::ParsedTicket parse_ticket(const json& resp, int max_players = SLIPPI_PLAYER_MAX) {
   Matchmaking::ParsedTicket t;
   t.match_id = str_or(resp, "matchId", "");
   const json* queue = json_member(resp, "players");
   if (!queue || !queue->is_array()) { t.error = "no player list"; return t; }
-  if (queue->size() < 2 || queue->size() > (size_t)PLAYER_COUNT_MAX) { t.error = std::to_string(queue->size()) + " players"; return t; }
+  if (queue->size() < 2 || queue->size() > (size_t)max_players) { t.error = std::to_string(queue->size()) + " players"; return t; }
   std::string local_external_ip;
   bool have_local = false, port_used[PLAYER_COUNT_MAX] = {};
   for (const auto& el : *queue) {
@@ -3335,7 +3346,7 @@ static Matchmaking::ParsedTicket parse_ticket(const json& resp) {
         p.ranked_regional_placement = (int)number("regionalPlacement");
         p.ranked_mmr = (float)number("mmr");
       }
-    if (p.port < 1 || p.port > PLAYER_COUNT_MAX) { t.error = "player port " + std::to_string(p.port); return t; }
+    if (p.port < 1 || p.port > max_players) { t.error = "player port " + std::to_string(p.port); return t; }
     if (port_used[p.port - 1]) { t.error = "port " + std::to_string(p.port) + " used twice"; return t; }
     port_used[p.port - 1] = true;
     if (const json* cm = json_member(el, "chatMessages"))
@@ -3384,7 +3395,9 @@ Matchmaking::ParsedTicket Matchmaking::ParseTicket(const std::string& json_text)
 }
 
 bool Matchmaking::ingest_ticket(const Ticket& ticket) {
-  ParsedTicket t = parse_ticket(ticket.resp);
+  // Slippi's server seats four; a local test peering, or a YouGame match (a six-seat Friends room: Triples), six.
+  const bool six = local_peer.enabled || display_provider_ == display::Provider::YouGame;
+  ParsedTicket t = parse_ticket(ticket.resp, six ? PLAYER_COUNT_MAX : SLIPPI_PLAYER_MAX);
   host::log("slippi: match id %s", t.match_id.c_str());
   remote_ips_.clear();
   public_fallbacks_.clear();
@@ -3648,7 +3661,7 @@ void Matchmaking::blendMatchmaking() {
         continue;
       }
       // Read whole before anything is decided: a refused or blocked ticket is not an opponent.
-      const ParsedTicket ticket = parse_ticket(resp);
+      const ParsedTicket ticket = parse_ticket(resp, local_peer.enabled ? PLAYER_COUNT_MAX : SLIPPI_PLAYER_MAX);
       if (!ticket.ok) {
         host::log("slippi: matchmaking ticket refused: %s", ticket.error.c_str());
         slippi_failed("Invalid match details from the mm server");
